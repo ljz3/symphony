@@ -1147,7 +1147,10 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_event(:turn_ended_with_error, message, _payload), do: "turn ended with error: #{format_reason(message)}"
   defp humanize_codex_event(:startup_failed, message, _payload), do: "startup failed: #{format_reason(message)}"
-  defp humanize_codex_event(:turn_failed, _message, payload), do: humanize_codex_method("turn/failed", payload)
+  defp humanize_codex_event(:turn_error, message, payload), do: humanize_turn_error(message, payload)
+  defp humanize_codex_event(:turn_failed, message, payload), do: humanize_turn_failure(message, payload)
+  defp humanize_codex_event(:turn_interrupted, _message, _payload), do: "turn interrupted"
+  defp humanize_codex_event(:turn_protocol_error, _message, payload), do: humanize_turn_protocol_error(payload)
   defp humanize_codex_event(:turn_cancelled, _message, _payload), do: "turn cancelled"
   defp humanize_codex_event(:malformed, _message, _payload), do: "malformed JSON event from codex"
   defp humanize_codex_event(_event, _message, _payload), do: nil
@@ -1407,6 +1410,54 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       method
     end
+  end
+
+  defp humanize_turn_error(message, payload) do
+    error =
+      map_path(payload, ["params", "error"]) ||
+        map_path(message, [:details, :error]) ||
+        map_value(message, ["error", :error])
+
+    error_text = error |> format_error_value() |> inline_text()
+
+    retry_suffix =
+      case turn_error_will_retry(message, payload) do
+        true -> " (Codex is retrying internally)"
+        false -> " (Codex is not retrying internally)"
+        nil -> ""
+      end
+
+    "turn error: #{error_text}#{retry_suffix}"
+  end
+
+  defp humanize_turn_failure(message, payload) do
+    error =
+      map_path(payload, ["params", "turn", "error"]) ||
+        map_path(payload, ["params", "error"]) ||
+        map_path(message, [:details, :error]) ||
+        map_value(message, ["error", :error])
+
+    if is_nil(error), do: "turn failed", else: "turn failed: #{format_error_value(error)}"
+  end
+
+  defp humanize_turn_protocol_error(payload) do
+    case map_path(payload, ["params", "turn", "status"]) do
+      nil -> "turn protocol error: missing completion status"
+      status -> "turn protocol error: invalid completion status #{inspect(status)}"
+    end
+  end
+
+  defp turn_error_will_retry(message, payload) do
+    first_boolean([
+      map_path(payload, ["params", "willRetry"]),
+      map_path(message, [:details, :will_retry]),
+      map_path(message, [:details, :willRetry]),
+      map_value(message, ["will_retry", :will_retry, "willRetry", :willRetry])
+    ])
+  end
+
+  defp first_boolean(values) when is_list(values) do
+    Enum.find(values, &is_boolean/1)
   end
 
   defp humanize_dynamic_tool_event(base, payload) do

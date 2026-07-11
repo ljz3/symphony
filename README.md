@@ -34,6 +34,12 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+The reference implementation supports optional per-issue Codex overrides through Linear labels such
+as `model:gpt-5.5` and `effort:xhigh`. Each workflow declares the permitted model/effort
+combinations in `codex.allowed_model_efforts`; empty, conflicting, disallowed, or unavailable
+selections are explained in a Linear comment and moved to `Failed Need Assistance` before Codex
+begins work. Missing labels preserve the configured Codex settings.
+
 ---
 
 ## License

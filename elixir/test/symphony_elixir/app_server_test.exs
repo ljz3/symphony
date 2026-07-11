@@ -1131,6 +1131,172 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "retryable turn errors remain observable when the final turn completes" do
+    upstream_error = %{
+      "message" => "stream disconnected; retrying",
+      "codexErrorInfo" => %{"responseStreamDisconnected" => %{"httpStatusCode" => nil}},
+      "additionalDetails" => "request-id=req-retry"
+    }
+
+    assert {:ok, %{result: :turn_completed}} =
+             run_fake_turn([
+               %{
+                 "method" => "error",
+                 "params" => %{
+                   "error" => upstream_error,
+                   "willRetry" => true,
+                   "threadId" => "thread-status",
+                   "turnId" => "turn-status"
+                 }
+               },
+               turn_completed_payload("completed")
+             ])
+
+    assert_received {:app_server_message,
+                     %{
+                       event: :turn_error,
+                       error: ^upstream_error,
+                       will_retry: true,
+                       thread_id: "thread-status",
+                       turn_id: "turn-status"
+                     }}
+
+    assert_received {:app_server_message, %{event: :turn_completed}}
+  end
+
+  test "failed completion returns the final turn error without an earlier error notification" do
+    upstream_error = %{
+      "message" => "Your account does not have enough credits",
+      "codexErrorInfo" => "usageLimitExceeded",
+      "additionalDetails" => "reset at 2026-07-11T00:00:00Z"
+    }
+
+    assert {:error, {:turn_failed, ^upstream_error}} =
+             run_fake_turn([turn_completed_payload("failed", upstream_error)])
+
+    assert_received {:app_server_message,
+                     %{
+                       event: :turn_failed,
+                       details: %{"status" => "failed", "error" => ^upstream_error}
+                     }}
+  end
+
+  test "failed completion falls back to the most recent top-level turn error" do
+    stale_error = %{
+      "message" => "first transient connection failure",
+      "codexErrorInfo" => nil,
+      "additionalDetails" => "request-id=req-initial"
+    }
+
+    earlier_error = %{
+      "message" => "connection failed after internal retries",
+      "codexErrorInfo" => nil,
+      "additionalDetails" => "request-id=req-final"
+    }
+
+    assert {:error, {:turn_failed, ^earlier_error}} =
+             run_fake_turn([
+               %{
+                 "method" => "error",
+                 "params" => %{
+                   "error" => stale_error,
+                   "willRetry" => true,
+                   "threadId" => "thread-status",
+                   "turnId" => "turn-status"
+                 }
+               },
+               %{
+                 "method" => "error",
+                 "params" => %{
+                   "error" => earlier_error,
+                   "willRetry" => false,
+                   "threadId" => "thread-status",
+                   "turnId" => "turn-status"
+                 }
+               },
+               turn_completed_payload("failed", nil)
+             ])
+  end
+
+  test "failed completion ignores fallback errors from other threads and turns" do
+    thread_mismatch = %{
+      "message" => "error from another thread",
+      "codexErrorInfo" => nil,
+      "additionalDetails" => nil
+    }
+
+    turn_mismatch = %{
+      "message" => "error from another turn",
+      "codexErrorInfo" => nil,
+      "additionalDetails" => nil
+    }
+
+    assert {:error, {:turn_failed, nil}} =
+             run_fake_turn([
+               %{
+                 "method" => "error",
+                 "params" => %{
+                   "error" => thread_mismatch,
+                   "willRetry" => false,
+                   "threadId" => "thread-other",
+                   "turnId" => "turn-status"
+                 }
+               },
+               %{
+                 "method" => "error",
+                 "params" => %{
+                   "error" => turn_mismatch,
+                   "willRetry" => false,
+                   "threadId" => "thread-status",
+                   "turnId" => "turn-other"
+                 }
+               },
+               turn_completed_payload("failed", nil)
+             ])
+
+    assert_received {:app_server_message, %{event: :turn_error, error: ^thread_mismatch}}
+    assert_received {:app_server_message, %{event: :turn_error, error: ^turn_mismatch}}
+  end
+
+  test "interrupted completion returns an interruption error and emits a distinct event" do
+    turn = %{
+      "id" => "turn-status",
+      "status" => "interrupted",
+      "error" => nil
+    }
+
+    assert {:error, {:turn_interrupted, ^turn}} =
+             run_fake_turn([turn_completed_payload(turn)])
+
+    assert_received {:app_server_message, %{event: :turn_interrupted, details: ^turn}}
+  end
+
+  test "in-progress, unknown, and missing completion statuses are protocol errors" do
+    for status <- ["inProgress", "futureStatus"] do
+      assert {:error, {:invalid_turn_status, ^status}} =
+               run_fake_turn([turn_completed_payload(status)])
+
+      assert_received {:app_server_message, %{event: :turn_protocol_error}}
+    end
+
+    assert {:error, {:invalid_turn_status, nil}} =
+             run_fake_turn([
+               %{
+                 "method" => "turn/completed",
+                 "params" => %{"turn" => %{"id" => "turn-status"}}
+               }
+             ])
+
+    assert_received {:app_server_message, %{event: :turn_protocol_error}}
+  end
+
+  test "legacy bare turn completion remains supported" do
+    assert {:ok, %{result: :turn_completed}} =
+             run_fake_turn([%{"method" => "turn/completed"}])
+
+    assert_received {:app_server_message, %{event: :turn_completed}}
+  end
+
   test "app server buffers partial JSON lines until newline terminator" do
     test_root =
       Path.join(
@@ -1270,6 +1436,238 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server validates a selected model across all catalog pages and starts the thread with it" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-model-selection-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-MODEL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-model.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-model.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          3)
+            printf '%s\n' '{"id":4,"result":{"data":[{"model":"gpt-other","hidden":true}],"nextCursor":"page-2"}}'
+            ;;
+          4)
+            printf '%s\n' '{"id":4,"result":{"data":[{"model":"gpt-5.5","hidden":true}],"nextCursor":null}}'
+            ;;
+          5)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-model"}}}'
+            ;;
+          6)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-model"}}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-model",
+        identifier: "MT-MODEL",
+        title: "Select a model",
+        state: "In Progress",
+        labels: ["model:gpt-5.5"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:ok, %{model: "gpt-5.5", effort: "xhigh"}} =
+               AppServer.run(workspace, "Use the selected model", issue,
+                 model: "gpt-5.5",
+                 effort: "xhigh",
+                 on_message: on_message
+               )
+
+      assert_received {:app_server_message, %{event: :session_started, model: "gpt-5.5", effort: "xhigh"}}
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert [first_page, second_page] = Enum.filter(payloads, &(&1["method"] == "model/list"))
+      assert first_page["params"] == %{"includeHidden" => true}
+      assert second_page["params"] == %{"includeHidden" => true, "cursor" => "page-2"}
+
+      assert thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      assert get_in(thread_start, ["params", "model"]) == "gpt-5.5"
+
+      assert turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+      assert get_in(turn_start, ["params", "effort"]) == "xhigh"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server sends an effort-only override on turn start without listing models" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-effort-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-EFFORT")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-effort.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-effort.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          3)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-effort"}}}'
+            ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-effort"}}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-effort", identifier: "MT-EFFORT", title: "Select effort"}
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:ok, %{model: nil, effort: "experimental-2027"}} =
+               AppServer.run(workspace, "Use the selected effort", issue,
+                 effort: "experimental-2027",
+                 on_message: on_message
+               )
+
+      assert_received {:app_server_message, %{event: :session_started, model: nil, effort: "experimental-2027"}}
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      refute Enum.any?(payloads, &(&1["method"] == "model/list"))
+
+      assert thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      refute Map.has_key?(thread_start["params"], "model")
+      refute Map.has_key?(thread_start["params"], "effort")
+
+      assert turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+      assert turn_start["params"]["effort"] == "experimental-2027"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server distinguishes an unavailable model from model-list infrastructure failures" do
+    for {name, model_list_response, expected_error} <- [
+          {"unavailable", ~s({"id":4,"result":{"data":[{"model":"gpt-other"}],"nextCursor":null}}), {:model_unavailable, "gpt-missing"}},
+          {"catalog-error", ~s({"id":4,"error":{"code":-32000,"message":"catalog offline"}}), {:response_error, %{"code" => -32_000, "message" => "catalog offline"}}}
+        ] do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-elixir-app-server-model-#{name}-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        workspace_root = Path.join(test_root, "workspaces")
+        workspace = Path.join(workspace_root, "MT-MODEL-ERROR")
+        codex_binary = Path.join(test_root, "fake-codex")
+        trace_file = Path.join(test_root, "codex-model-error.trace")
+        previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+        on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+        System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+        File.mkdir_p!(workspace)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-model-error.trace}"
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          printf 'JSON:%s\n' "$line" >> "$trace_file"
+          case "$count" in
+            1) printf '%s\n' '{"id":1,"result":{}}' ;;
+            3) printf '%s\n' '#{model_list_response}' ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server"
+        )
+
+        issue = %Issue{id: "issue-model-error", identifier: "MT-MODEL-ERROR", title: "Bad model"}
+
+        assert {:error, ^expected_error} =
+                 AppServer.run(workspace, "Validate model", issue, model: "gpt-missing")
+
+        refute File.read!(trace_file) =~ ~s("method":"thread/start")
+      after
+        File.rm_rf(test_root)
+      end
+    end
+  end
+
   test "app server emits malformed events for JSON-like protocol lines that fail to decode" do
     test_root =
       Path.join(
@@ -1380,12 +1778,15 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}'
+            printf '%s\\n' '{"id":4,"result":{"data":[{"model":"gpt-5.5"}],"nextCursor":null}}'
             ;;
           4)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1418,7 +1819,9 @@ defmodule SymphonyElixir.AppServerTest do
                  remote_workspace,
                  "Run remote worker",
                  issue,
-                 worker_host: "worker-01:2200"
+                 worker_host: "worker-01:2200",
+                 model: "gpt-5.5",
+                 effort: "xhigh"
                )
 
       trace = File.read!(trace_file)
@@ -1447,7 +1850,8 @@ defmodule SymphonyElixir.AppServerTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    payload["method"] == "thread/start" &&
-                     get_in(payload, ["params", "cwd"]) == remote_workspace
+                     get_in(payload, ["params", "cwd"]) == remote_workspace &&
+                     get_in(payload, ["params", "model"]) == "gpt-5.5"
                  end)
                else
                  false
@@ -1462,7 +1866,8 @@ defmodule SymphonyElixir.AppServerTest do
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "cwd"]) == remote_workspace &&
-                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
+                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy &&
+                     get_in(payload, ["params", "effort"]) == "xhigh"
                  end)
                else
                  false
@@ -1471,5 +1876,93 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp run_fake_turn(notifications) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-turn-status-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STATUS")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      notification_commands =
+        Enum.map_join(notifications, "\n", fn notification ->
+          "        printf '%s\\n' '#{Jason.encode!(notification)}'"
+        end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          3)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-status"}}}'
+            ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-status"}}}'
+      #{notification_commands}
+            exit 0
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-turn-status",
+        identifier: "MT-STATUS",
+        title: "Validate final turn status",
+        description: "Ensure app-server uses the final turn status",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-STATUS",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      AppServer.run(workspace, "Validate final turn status", issue, on_message: on_message)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp turn_completed_payload(status) when is_binary(status), do: turn_completed_payload(status, nil)
+
+  defp turn_completed_payload(turn) when is_map(turn) do
+    %{
+      "method" => "turn/completed",
+      "params" => %{
+        "threadId" => "thread-status",
+        "turn" => turn
+      }
+    }
+  end
+
+  defp turn_completed_payload(status, error) do
+    turn_completed_payload(%{
+      "id" => "turn-status",
+      "status" => status,
+      "error" => error
+    })
   end
 end

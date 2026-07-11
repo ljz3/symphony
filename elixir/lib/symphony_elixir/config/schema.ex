@@ -164,6 +164,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:allowed_model_efforts, :map)
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -189,6 +190,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :allowed_model_efforts,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -198,11 +200,54 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
-      |> validate_required([:command])
+      |> validate_required([:command, :allowed_model_efforts])
+      |> validate_change(:allowed_model_efforts, &validate_allowed_model_efforts/2)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
+
+    defp validate_allowed_model_efforts(:allowed_model_efforts, model_efforts)
+         when is_map(model_efforts) do
+      if map_size(model_efforts) == 0,
+        do: [allowed_model_efforts: "must contain at least one model"],
+        else: Enum.flat_map(model_efforts, &validate_model_efforts/1)
+    end
+
+    defp validate_model_efforts({model, efforts}) do
+      validate_model_id(model) ++ validate_efforts(efforts)
+    end
+
+    defp validate_model_id(model) when is_binary(model) do
+      if model != "" and String.trim(model) == model do
+        []
+      else
+        [allowed_model_efforts: "model IDs must be non-blank strings without surrounding whitespace"]
+      end
+    end
+
+    defp validate_efforts(efforts) when is_list(efforts) do
+      cond do
+        efforts == [] ->
+          [allowed_model_efforts: "each model must allow at least one effort"]
+
+        Enum.any?(efforts, &invalid_effort?/1) ->
+          [allowed_model_efforts: "efforts must be non-blank strings without surrounding whitespace"]
+
+        length(efforts) != length(Enum.uniq(efforts)) ->
+          [allowed_model_efforts: "efforts for a model must be unique"]
+
+        true ->
+          []
+      end
+    end
+
+    defp validate_efforts(_efforts) do
+      [allowed_model_efforts: "each model must allow at least one effort"]
+    end
+
+    defp invalid_effort?(effort) when is_binary(effort), do: effort == "" or String.trim(effort) != effort
+    defp invalid_effort?(_effort), do: true
   end
 
   defmodule Hooks do

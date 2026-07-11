@@ -26,6 +26,13 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
+  @type codex_selection :: %{model: String.t() | nil, effort: String.t() | nil}
+
+  @type codex_selection_error ::
+          {:model_not_permitted, String.t()}
+          | {:effort_not_permitted, String.t()}
+          | {:model_effort_not_permitted, String.t(), String.t()}
+
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
     case Workflow.current() do
@@ -60,6 +67,27 @@ defmodule SymphonyElixir.Config do
   end
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
+
+  @spec allowed_codex_model_efforts() :: %{required(String.t()) => [String.t()]}
+  def allowed_codex_model_efforts do
+    settings!().codex.allowed_model_efforts
+  end
+
+  @spec validate_codex_selection(codex_selection()) :: :ok | {:error, [codex_selection_error()]}
+  def validate_codex_selection(%{model: model, effort: effort}) do
+    allowed_model_efforts = allowed_codex_model_efforts()
+
+    errors =
+      []
+      |> maybe_add_model_error(model, allowed_model_efforts)
+      |> maybe_add_effort_error(effort, allowed_model_efforts)
+      |> maybe_add_pair_error(model, effort, allowed_model_efforts)
+
+    case errors do
+      [] -> :ok
+      _ -> {:error, errors}
+    end
+  end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
@@ -130,6 +158,37 @@ defmodule SymphonyElixir.Config do
 
       true ->
         :ok
+    end
+  end
+
+  defp maybe_add_model_error(errors, nil, _allowed_model_efforts), do: errors
+
+  defp maybe_add_model_error(errors, model, allowed_model_efforts) do
+    if Map.has_key?(allowed_model_efforts, model) do
+      errors
+    else
+      [{:model_not_permitted, model} | errors]
+    end
+  end
+
+  defp maybe_add_effort_error(errors, nil, _allowed_model_efforts), do: errors
+
+  defp maybe_add_effort_error(errors, effort, allowed_model_efforts) do
+    if Enum.any?(allowed_model_efforts, fn {_model, efforts} -> effort in efforts end) do
+      errors
+    else
+      [{:effort_not_permitted, effort} | errors]
+    end
+  end
+
+  defp maybe_add_pair_error(errors, nil, _effort, _allowed_model_efforts), do: errors
+  defp maybe_add_pair_error(errors, _model, nil, _allowed_model_efforts), do: errors
+
+  defp maybe_add_pair_error(errors, model, effort, allowed_model_efforts) do
+    if errors == [] and effort in Map.fetch!(allowed_model_efforts, model) do
+      errors
+    else
+      [{:model_effort_not_permitted, model, effort} | errors]
     end
   end
 

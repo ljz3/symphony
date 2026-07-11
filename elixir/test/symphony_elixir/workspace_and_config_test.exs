@@ -307,6 +307,42 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.assigned_to_worker
   end
 
+  test "linear issue extracts optional exact Codex model and effort labels" do
+    assert {:ok, nil} = Issue.codex_model(%Issue{labels: ["backend"]})
+    assert {:ok, nil} = Issue.codex_model(%Issue{labels: [nil, :invalid]})
+
+    assert {:ok, "gpt-5.5"} =
+             Issue.codex_model(%Issue{labels: ["backend", "model:gpt-5.5"]})
+
+    assert {:ok, "GPT-EXACT"} =
+             Issue.codex_model(%Issue{labels: [" Model:GPT-EXACT "]})
+
+    assert {:error, {:empty_model_label, "model:"}} =
+             Issue.codex_model(%Issue{labels: ["model:"]})
+
+    assert {:error, {:multiple_model_labels, ["model:gpt-5.4", "model:gpt-5.5"]}} =
+             Issue.codex_model(%Issue{labels: ["model:gpt-5.4", "model:gpt-5.5"]})
+
+    assert {:ok, nil} = Issue.codex_effort(%Issue{labels: ["backend"]})
+    assert {:ok, nil} = Issue.codex_effort(%Issue{labels: [nil, :invalid, 42]})
+    assert {:ok, nil} = Issue.codex_effort(%Issue{labels: nil})
+
+    assert {:ok, "xhigh"} =
+             Issue.codex_effort(%Issue{labels: ["backend", "effort:xhigh"]})
+
+    assert {:ok, "XHigh"} =
+             Issue.codex_effort(%Issue{labels: [" Effort: XHigh "]})
+
+    assert {:error, {:empty_effort_label, "effort:"}} =
+             Issue.codex_effort(%Issue{labels: ["effort:"]})
+
+    assert {:error, {:multiple_effort_labels, ["effort:low", "effort:xhigh"]}} =
+             Issue.codex_effort(%Issue{labels: ["effort:low", "effort:xhigh"]})
+
+    assert {:ok, %{model: "gpt-5.5", effort: "xhigh"}} =
+             Issue.codex_selection(%Issue{labels: ["model:gpt-5.5", "effort:xhigh"]})
+  end
+
   test "linear issue routing requires every configured label" do
     issue = %Issue{labels: [" Symphony ", "JavaScript"], assigned_to_worker: true}
 
@@ -801,6 +837,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
+    assert config.codex.allowed_model_efforts == %{"gpt-5.5" => ["xhigh"]}
 
     assert config.codex.approval_policy == %{
              "reject" => %{
@@ -952,6 +989,47 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
+  test "codex model effort policy must be a non-empty map of exact model effort combinations" do
+    write_workflow_file!(Workflow.workflow_file_path(), codex_allowed_model_efforts: nil)
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.allowed_model_efforts"
+    assert message =~ "can't be blank"
+
+    for {policy, expected_message} <- [
+          {%{}, "must contain at least one model"},
+          {%{"gpt-5.5" => []}, "each model must allow at least one effort"},
+          {%{" gpt-5.5" => ["xhigh"]}, "model IDs must be non-blank strings"},
+          {%{"gpt-5.5" => [" xhigh"]}, "efforts must be non-blank strings"},
+          {%{"gpt-5.5" => [123]}, "efforts must be non-blank strings"},
+          {%{"gpt-5.5" => ["xhigh", "xhigh"]}, "efforts for a model must be unique"},
+          {%{"gpt-5.5" => "xhigh"}, "each model must allow at least one effort"}
+        ] do
+      write_workflow_file!(Workflow.workflow_file_path(), codex_allowed_model_efforts: policy)
+
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ "codex.allowed_model_efforts"
+      assert message =~ expected_message
+    end
+
+    policy = %{"GPT-5.5" => ["XHigh"], "gpt-5.4" => ["low", "medium"]}
+    write_workflow_file!(Workflow.workflow_file_path(), codex_allowed_model_efforts: policy)
+
+    assert Config.allowed_codex_model_efforts() == policy
+    assert :ok = Config.validate_codex_selection(%{model: "GPT-5.5", effort: "XHigh"})
+    assert :ok = Config.validate_codex_selection(%{model: "gpt-5.4", effort: nil})
+    assert :ok = Config.validate_codex_selection(%{model: nil, effort: "medium"})
+
+    assert {:error, [{:model_not_permitted, "gpt-5.5"}]} =
+             Config.validate_codex_selection(%{model: "gpt-5.5", effort: nil})
+
+    assert {:error, [{:effort_not_permitted, "xhigh"}]} =
+             Config.validate_codex_selection(%{model: nil, effort: "xhigh"})
+
+    assert {:error, [{:model_effort_not_permitted, "gpt-5.4", "XHigh"}]} =
+             Config.validate_codex_selection(%{model: "gpt-5.4", effort: "XHigh"})
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
@@ -1095,7 +1173,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{api_key: "$#{empty_secret_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
-               codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
+               codex: %{
+                 allowed_model_efforts: %{"gpt-5.5" => ["xhigh"]},
+                 approval_policy: %{reject: %{sandbox_approval: true}}
+               }
              })
 
     assert settings.tracker.api_key == nil
@@ -1108,7 +1189,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, settings} =
              Schema.parse(%{
                tracker: %{api_key: "$#{missing_secret_env}"},
-               workspace: %{root: ""}
+               workspace: %{root: ""},
+               codex: %{allowed_model_efforts: %{"gpt-5.5" => ["xhigh"]}}
              })
 
     assert settings.tracker.api_key == "fallback-linear-token"
@@ -1155,7 +1237,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, settings} =
              Schema.parse(%{
                workspace: %{root: "~/.symphony-workspaces"},
-               codex: %{}
+               codex: %{allowed_model_efforts: %{"gpt-5.5" => ["xhigh"]}}
              })
 
     assert settings.workspace.root == "~/.symphony-workspaces"

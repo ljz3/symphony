@@ -7,6 +7,8 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
+  @codex_selection_assistance_state "Failed Need Assistance"
+
   @type worker_host :: String.t() | nil
 
   @doc false
@@ -17,21 +19,46 @@ defmodule SymphonyElixir.AgentRunner do
     continue_with_issue?(issue, issue_state_fetcher)
   end
 
-  @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
+  @spec run(Issue.t(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    case Issue.codex_selection(issue) do
+      {:ok, %{model: model, effort: effort} = selection} ->
+        case Config.validate_codex_selection(selection) do
+          :ok ->
+            run_with_codex_selection(issue, model, effort, codex_update_recipient, opts)
+
+          {:error, reasons} ->
+            hand_off_or_fail_codex_selection(issue, reasons, opts)
+        end
+
+      {:error, reasons} ->
+        hand_off_or_fail_codex_selection(issue, reasons, opts)
+    end
+  end
+
+  defp hand_off_or_fail_codex_selection(issue, reasons, opts) do
+    case hand_off_codex_selection_error(issue, reasons, opts) do
+      :ok -> :ok
+      {:error, handoff_reason} -> fail_agent_run(issue, handoff_reason)
+    end
+  end
+
+  defp run_with_codex_selection(issue, model, effort, codex_update_recipient, opts) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    opts = opts |> Keyword.put(:codex_model, model) |> Keyword.put(:codex_effort, effort)
 
-    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)} model=#{model_for_log(model)} effort=#{effort_for_log(effort)}")
 
     case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+      :ok -> :ok
+      {:error, reason} -> fail_agent_run(issue, reason)
     end
+  end
+
+  defp fail_agent_run(issue, reason) do
+    Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+    raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
@@ -87,15 +114,112 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    model = Keyword.get(opts, :codex_model)
+    effort = Keyword.get(opts, :codex_effort)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
+    case AppServer.start_session(workspace, worker_host: worker_host, model: model, effort: effort) do
+      {:ok, session} ->
+        try do
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        after
+          AppServer.stop_session(session)
+        end
+
+      {:error, {:model_unavailable, ^model} = reason} ->
+        hand_off_codex_selection_error(issue, reason, opts)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp hand_off_codex_selection_error(%Issue{id: issue_id} = issue, reason, opts)
+       when is_binary(issue_id) do
+    comment = codex_selection_comment(reason)
+    create_comment = Keyword.get(opts, :tracker_commenter, &Tracker.create_comment/2)
+    update_issue_state = Keyword.get(opts, :tracker_state_updater, &Tracker.update_issue_state/2)
+
+    with :ok <- create_comment.(issue_id, comment),
+         :ok <- update_issue_state.(issue_id, @codex_selection_assistance_state) do
+      Logger.warning("Codex selection failed for #{issue_context(issue)}; moved issue to #{@codex_selection_assistance_state}: #{inspect(reason)}")
+
+      :ok
+    else
+      {:error, handoff_reason} ->
+        {:error, {:codex_selection_handoff_failed, reason, handoff_reason}}
+
+      handoff_result ->
+        {:error, {:codex_selection_handoff_failed, reason, handoff_result}}
+    end
+  end
+
+  defp hand_off_codex_selection_error(issue, reason, _opts) do
+    {:error, {:codex_selection_handoff_failed, reason, {:invalid_issue_id, Map.get(issue, :id)}}}
+  end
+
+  defp codex_selection_comment(reason) do
+    """
+    Symphony could not start this task because one or more Codex selection labels are invalid.
+
+    #{codex_selection_reason(reason)}
+
+    Use at most one label of each form: `model:<model-id>` and `effort:<reasoning-effort>`. Label values must match the `codex.allowed_model_efforts` policy in `WORKFLOW.md` exactly. Remove either label to retain the matching setting from `codex.command` or normal Codex configuration.
+
+    #{allowed_codex_model_efforts()}
+    """
+    |> String.trim()
+  end
+
+  defp codex_selection_reason(reasons) when is_list(reasons) do
+    Enum.map_join(reasons, "\n", &codex_selection_reason/1)
+  end
+
+  defp codex_selection_reason({:empty_model_label, label}) do
+    "The model label `#{escape_markdown_code(label)}` does not contain a model ID."
+  end
+
+  defp codex_selection_reason({:multiple_model_labels, labels}) do
+    rendered_labels = Enum.map_join(labels, ", ", &"`#{escape_markdown_code(&1)}`")
+    "The task has multiple model labels: #{rendered_labels}."
+  end
+
+  defp codex_selection_reason({:empty_effort_label, label}) do
+    "The reasoning-effort label `#{escape_markdown_code(label)}` does not contain an effort value."
+  end
+
+  defp codex_selection_reason({:multiple_effort_labels, labels}) do
+    rendered_labels = Enum.map_join(labels, ", ", &"`#{escape_markdown_code(&1)}`")
+    "The task has multiple reasoning-effort labels: #{rendered_labels}."
+  end
+
+  defp codex_selection_reason({:model_unavailable, model}) do
+    "The model label `model:#{escape_markdown_code(model)}` selects a model Codex did not report as available."
+  end
+
+  defp codex_selection_reason({:model_not_permitted, model}) do
+    "The model label `model:#{escape_markdown_code(model)}` is not permitted by `codex.allowed_model_efforts`."
+  end
+
+  defp codex_selection_reason({:effort_not_permitted, effort}) do
+    "The reasoning-effort label `effort:#{escape_markdown_code(effort)}` is not permitted by `codex.allowed_model_efforts`."
+  end
+
+  defp codex_selection_reason({:model_effort_not_permitted, model, effort}) do
+    "The combination `model:#{escape_markdown_code(model)}` and `effort:#{escape_markdown_code(effort)}` is not permitted by `codex.allowed_model_efforts`."
+  end
+
+  defp allowed_codex_model_efforts do
+    combinations =
+      Config.allowed_codex_model_efforts()
+      |> Enum.sort_by(fn {model, _efforts} -> model end)
+      |> Enum.flat_map(fn {model, efforts} ->
+        Enum.map(efforts, fn effort -> "- `model:#{escape_markdown_code(model)}` + `effort:#{escape_markdown_code(effort)}`" end)
+      end)
+
+    "Allowed combinations from `codex.allowed_model_efforts`:\n" <> Enum.join(combinations, "\n")
+  end
+
+  defp escape_markdown_code(value), do: value |> to_string() |> String.replace("`", "\\`")
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
@@ -202,6 +326,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
+
+  defp model_for_log(nil), do: "default"
+  defp model_for_log(model), do: model
+
+  defp effort_for_log(nil), do: "default"
+  defp effort_for_log(effort), do: effort
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     state_name

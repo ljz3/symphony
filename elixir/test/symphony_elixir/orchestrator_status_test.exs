@@ -1630,6 +1630,81 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              "unsupported dynamic tool call rejected (unknown_tool)"
   end
 
+  test "status dashboard exposes codex turn errors and internal retry disposition" do
+    retrying = %{
+      event: :turn_error,
+      message: %{
+        payload: %{
+          "method" => "error",
+          "params" => %{
+            "error" => %{"message" => "upstream connection reset"},
+            "threadId" => "thread-1",
+            "turnId" => "turn-1",
+            "willRetry" => true
+          }
+        }
+      }
+    }
+
+    terminal =
+      put_in(retrying, [:message, :payload, "params"], %{
+        "error" => %{"message" => "model quota exhausted"},
+        "threadId" => "thread-1",
+        "turnId" => "turn-1",
+        "willRetry" => false
+      })
+
+    assert StatusDashboard.humanize_codex_message(retrying) ==
+             "turn error: upstream connection reset (Codex is retrying internally)"
+
+    assert StatusDashboard.humanize_codex_message(terminal) ==
+             "turn error: model quota exhausted (Codex is not retrying internally)"
+
+    long_message = String.duplicate("retryable upstream failure ", 10)
+    long_retrying = put_in(retrying, [:message, :payload, "params", "error", "message"], long_message)
+    long_humanized = StatusDashboard.humanize_codex_message(long_retrying)
+
+    assert long_humanized =~ "retryable upstream failure"
+    assert long_humanized =~ "Codex is retrying internally"
+  end
+
+  test "status dashboard humanizes authoritative failed and interrupted completions" do
+    failed = %{
+      event: :turn_failed,
+      message: %{
+        payload: %{
+          "method" => "turn/completed",
+          "params" => %{
+            "turn" => %{
+              "status" => "failed",
+              "error" => %{"message" => "sandbox denied write"}
+            }
+          }
+        }
+      }
+    }
+
+    interrupted = %{event: :turn_interrupted, message: %{}}
+
+    invalid = %{
+      event: :turn_protocol_error,
+      message: %{
+        payload: %{
+          "method" => "turn/completed",
+          "params" => %{"turn" => %{"status" => "inProgress"}}
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_codex_message(failed) ==
+             "turn failed: sandbox denied write"
+
+    assert StatusDashboard.humanize_codex_message(interrupted) == "turn interrupted"
+
+    assert StatusDashboard.humanize_codex_message(invalid) ==
+             ~s(turn protocol error: invalid completion status "inProgress")
+  end
+
   test "status dashboard unwraps nested codex payload envelopes" do
     wrapped = %{
       event: :notification,

@@ -167,7 +167,10 @@ Fields:
   - Tracker-provided branch metadata if available.
 - `url` (string or null)
 - `labels` (list of strings)
-  - Normalized to lowercase.
+  - Matched case-insensitively where the implementation documents case-insensitive behavior.
+  - Implementations supporting per-issue Codex selection reserve labels beginning with `model:` or
+    `effort:` as described in Section 10.2. A selected suffix is retained exactly apart from
+    surrounding whitespace.
 - `blocked_by` (list of blocker refs)
   - Each blocker ref contains:
     - `id` (string or null)
@@ -594,6 +597,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
+- `codex.allowed_model_efforts`: required non-empty map of exact model IDs to non-empty, unique
+  reasoning-effort lists
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
@@ -632,7 +637,8 @@ Important nuance:
 
 - A successful worker exit does not mean the issue is done forever.
 - The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
-- After each normal turn completion, the worker re-checks the tracker issue state.
+- After each successful turn completion (`turn.status == completed` for the Codex v2 app-server
+  protocol), the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.
@@ -967,6 +973,36 @@ client to:
   protocol supports turn or session titles.
 - Advertise implemented client-side tools using the targeted protocol.
 
+Per-issue model and reasoning-effort selection:
+
+- An implementation MAY reserve Linear labels in the exact forms `model:<model-id>` and
+  `effort:<reasoning-effort>`. Either label MAY be used independently or together.
+- Implementations that support these labels MUST require `codex.allowed_model_efforts`: a
+  workflow-owned, non-empty map of model IDs to permitted effort values. The map is the sole
+  allowlist source; implementations MUST NOT embed model IDs or effort values in source code.
+- No matching label preserves the corresponding model or reasoning-effort setting selected by
+  `codex.command` or Codex configuration.
+- Exactly one non-empty label of each kind selects its trimmed suffix. Empty or multiple labels of
+  either kind are invalid. The suffix is otherwise case-preserved and passed exactly as selected.
+  A model-only label must name a configured model, an effort-only label must name a configured
+  effort, and both labels together must be a configured pair.
+- For a selected model, the client MUST call the targeted protocol's `model/list` method with hidden
+  models included, follow pagination to completion, and require an exact match against a returned
+  `model` value before starting the thread. An effort-only override MUST NOT call `model/list`.
+- A validated model MUST be sent in `thread/start`. A selected effort MUST be sent in
+  `turn/start.params.effort` for the first and every continuation turn. Each selected value remains
+  fixed for all continuation turns in that worker session; a later worker attempt re-reads current
+  issue labels.
+- A successfully loaded catalog that lacks the selected model is a selection error. Catalog request
+  or protocol failures remain ordinary retryable worker failures. An app-server rejection of a
+  locally permitted effort remains an ordinary retryable turn-start failure.
+- Malformed or policy-disallowed model or effort labels, and an unavailable selected model, MUST
+  prevent thread/turn creation, create a tracker comment identifying the offending labels, allowed
+  combinations, and required `model:<model-id>` and `effort:<reasoning-effort>` syntax, then
+  transition the issue to `Failed Need Assistance`. Commenting happens before the state transition.
+  If either tracker write fails, the worker attempt fails for normal orchestrator retry and MUST NOT
+  fall back to another model or effort.
+
 Session identifiers:
 
 - Extract `thread_id` from the thread identity returned by the targeted Codex app-server protocol.
@@ -981,9 +1017,22 @@ the active turn terminates.
 
 Completion conditions:
 
-- Targeted-protocol turn completion signal -> success
-- Targeted-protocol turn failure signal -> failure
-- Targeted-protocol turn cancellation signal -> failure
+- A Codex v2 `turn/completed` notification succeeds only when `params.turn.status == "completed"`.
+- A Codex v2 `turn/completed` notification with `params.turn.status == "failed"` fails with the
+  complete upstream `params.turn.error`. If that field is absent, the client MAY use the most recent
+  top-level error notification for the same thread and turn as fallback error context.
+- A Codex v2 `turn/completed` notification with `params.turn.status == "interrupted"` fails as an
+  interruption.
+- A Codex v2 `turn/completed` notification with `params.turn.status == "inProgress"` or an unknown
+  status is a protocol error.
+- Implementations MAY treat a legacy bare `turn/completed` notification with no turn payload as a
+  successful completion for compatibility with older app-server versions.
+- A top-level Codex `error` notification is not itself terminal when `willRetry == true`; the client
+  continues streaming until the authoritative final turn status arrives. The client SHOULD retain
+  its complete `error`, `willRetry`, `threadId`, and `turnId` fields for observability and failure
+  fallback context.
+- Targeted-protocol legacy turn failure signal -> failure
+- Targeted-protocol legacy turn cancellation signal -> failure
 - turn timeout (`turn_timeout_ms`) -> failure
 - subprocess exit -> failure
 
@@ -1016,7 +1065,10 @@ Important emitted events include, for example:
 - `session_started`
 - `startup_failed`
 - `turn_completed`
+- `turn_error`
 - `turn_failed`
+- `turn_interrupted`
+- `turn_protocol_error`
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
@@ -1118,7 +1170,10 @@ Error mapping (RECOMMENDED normalized categories):
 - `turn_timeout`
 - `port_exit`
 - `response_error`
+- `model_unavailable`
 - `turn_failed`
+- `turn_interrupted`
+- `invalid_turn_status`
 - `turn_cancelled`
 - `turn_input_required`
 
@@ -1128,11 +1183,13 @@ The `Agent Runner` wraps workspace + prompt + app-server client.
 
 Behavior:
 
-1. Create/reuse workspace for issue.
-2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
-5. On any error, fail the worker attempt (the orchestrator will retry).
+1. Parse and validate any per-issue model label.
+2. Create/reuse workspace for issue.
+3. Build prompt from workflow template.
+4. Start app-server session and validate any selected model before thread creation.
+5. Forward app-server events to orchestrator.
+6. On any error, immediately fail the worker attempt without starting a continuation turn (the
+   orchestrator will schedule a failure-driven exponential-backoff retry).
 
 Note:
 
@@ -1152,6 +1209,12 @@ An implementation MUST support these tracker adapter operations:
 
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
+
+4. `create_comment(issue_id, body)`
+   - Used for model-selection failure handoff and MAY be used by other orchestrator extensions.
+
+5. `update_issue_state(issue_id, state_name)`
+   - Used for model-selection failure handoff and MAY be used by other orchestrator extensions.
 
 ### 11.2 Query Semantics (Linear)
 
@@ -1212,11 +1275,12 @@ Orchestrator behavior on tracker errors:
 
 ### 11.5 Tracker Writes (Important Boundary)
 
-Symphony does not require first-class tracker write APIs in the orchestrator.
-
 - Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
   agent using tools defined by the workflow prompt.
-- The service remains a scheduler/runner and tracker reader.
+- The per-issue model-selection extension is an exception: invalid or unavailable selections are
+  commented and transitioned by the runner before a Codex thread starts.
+- The service remains primarily a scheduler/runner; tracker writes are limited to explicit
+  orchestration features such as model-selection handoff.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
 - If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent
@@ -1988,6 +2052,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Pagination preserves order across multiple pages
 - Blockers are normalized from inverse relations of type `blocks`
 - Labels are normalized to lowercase
+- No `model:` or `effort:` label preserves the corresponding configured default
+- `codex.allowed_model_efforts` is required and rejects invalid maps at workflow load time
+- Empty, multiple, or policy-disallowed `model:` or `effort:` labels are rejected before Codex starts
+- Comment and state-transition writes surface Linear lookup/mutation failures
 - Issue state refresh by ID returns minimal normalized issues
 - Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
 - Error mapping for request errors, non-200, GraphQL errors, malformed payloads
@@ -2018,6 +2086,13 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
   them.
 - Policy-related startup payloads use the implementation's documented approval/sandbox settings
+- A selected model is validated against every page of `model/list` (including hidden entries) and
+  passed to `thread/start`; unavailable models prevent thread/turn creation. Effort-only overrides
+  do not call `model/list`.
+- A selected model, effort, or pair is validated against `codex.allowed_model_efforts` before
+  workspace creation. A locally permitted effort is passed to every `turn/start`; an app-server
+  rejection remains retryable. Selected model and effort values remain fixed across continuation
+  turns in one worker session
 - Thread and turn identities exposed by the targeted protocol are extracted and used to emit
   `session_started`
 - Request/response read timeout is enforced
@@ -2031,6 +2106,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Usage and rate-limit telemetry exposed by the targeted protocol is extracted
 - Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
   targeted protocol
+- A Codex v2 `turn/completed` succeeds only for `params.turn.status == "completed"`; failed,
+  interrupted, in-progress, and unknown statuses fail according to Section 10.3
+- Retryable top-level `error` notifications remain observable and non-terminal until the final turn
+  status arrives
 - If client-side tools are implemented, session startup advertises the supported tool specs
   using the targeted app-server protocol
 - If the `linear_graphql` client-side tool extension is implemented:
@@ -2088,7 +2167,7 @@ Use the same validation profiles as Section 17:
 - Typed config layer with defaults and `$` resolution
 - Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
 - Polling orchestrator with single-authority mutable state
-- Issue tracker client with candidate fetch + state refresh + terminal fetch
+- Issue tracker client with candidate/state/terminal reads plus comment and state-transition writes
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
@@ -2111,8 +2190,6 @@ Use the same validation profiles as Section 17:
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
 - TODO: Add pluggable issue tracker adapters beyond Linear.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)

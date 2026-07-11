@@ -23,6 +23,13 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
 skills can make raw Linear GraphQL calls.
 
+Symphony considers a Codex v2 turn successful only when the `turn/completed` notification reports
+`params.turn.status == "completed"`. Failed, interrupted, in-progress, and unknown final statuses
+fail the worker immediately and use the orchestrator's exponential retry backoff; they never enter
+the normal continuation-turn path. Retryable top-level Codex errors remain observable while Codex
+retries internally, and a legacy bare `turn/completed` notification remains supported for older
+app-server compatibility.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -30,6 +37,43 @@ If Codex reports that operator input, approval, or MCP elicitation is required, 
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 Linear issue can become a dispatch candidate again after restart.
+
+### Per-task model and reasoning-effort selection
+
+Use either or both of these optional Linear labels to override the configured Codex defaults for
+one issue:
+
+- `model:<model-id>`, for example `model:gpt-5.5`, selects an exact Codex model.
+- `effort:<reasoning-effort>`, for example `effort:xhigh`, selects the reasoning effort.
+
+Every workflow must define its permitted combinations under `codex.allowed_model_efforts`. This map
+is the sole policy source; Symphony does not embed a model or effort allowlist.
+
+```yaml
+codex:
+  allowed_model_efforts:
+    gpt-5.5: [high, xhigh]
+```
+
+Each label type may appear at most once. Label values are trimmed and matched to that map
+case-sensitively. A model-only label must be a map key; an effort-only label must occur in at least
+one list; and labels supplied together must be an allowed pair. Symphony asks app-server for every
+available model, including hidden and paginated entries, only when a `model:` label is present; it
+starts the issue thread only when that suffix exactly matches a reported `model` value. It does not
+call `model/list` for an effort-only override.
+
+The model is sent in `thread/start`; the effort is sent on every initial and continuation
+`turn/start`. Both remain fixed for the worker session, even if the issue labels change while it is
+running. A later worker retry re-reads the current labels. Missing labels retain the model and
+reasoning-effort settings from `codex.command` or normal Codex configuration.
+
+An empty, duplicate, or policy-disallowed `model:` or `effort:` label prevents Codex from starting.
+A model absent from a successfully loaded catalog does the same. Symphony comments with the
+offending labels and allowed combinations, then moves the issue to the hard-coded `Failed Need
+Assistance` state. Teams using either label must create a Linear workflow state with that exact
+name. Catalog request failures, unsupported effort errors returned by app-server, and failed tracker
+writes remain ordinary worker failures handled by Symphony's existing retry policy; Symphony never
+silently substitutes another model or effort.
 
 ## How to use it
 
@@ -45,8 +89,9 @@ Linear issue can become a dispatch candidate again after restart.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
+     issue statuses: "Rework", "Human Review", "Merging", and—when per-task Codex selection labels
+     are used—"Failed Need Assistance". Create the required statuses in Team Settings → Workflow in
+     Linear.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
@@ -105,6 +150,8 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  allowed_model_efforts:
+    gpt-5.5: [xhigh]
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -114,10 +161,17 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 
 Notes:
 
-- If a value is missing, defaults are used.
+- If an optional value is missing, defaults are used. `codex.allowed_model_efforts` is required.
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- A single `model:<model-id>` issue label overrides the configured Codex model, and a single
+  `effort:<reasoning-effort>` label overrides the configured reasoning effort, for that issue.
+  Either label may be used independently or together. `codex.allowed_model_efforts` is required:
+  it maps each allowed model ID to its allowed effort values. A model-only or effort-only label must
+  name an allowed value; both labels must be a configured pair. Matching is case-sensitive after
+  surrounding whitespace is trimmed. Missing labels keep the current settings from `codex.command`
+  or Codex configuration.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

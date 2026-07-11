@@ -103,6 +103,9 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
+    codex = Map.get(config, "codex", %{})
+    assert Map.get(codex, "allowed_model_efforts") == %{"gpt-5.5" => ["xhigh"]}
+
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
@@ -667,6 +670,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    exit_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -675,7 +679,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_scheduled_delay_in_range(due_at_ms, exit_sent_at_ms, 1_000, 3_000)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -708,6 +712,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    exit_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -715,7 +720,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_scheduled_delay_in_range(due_at_ms, exit_sent_at_ms, 40_000, 42_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -747,6 +752,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    exit_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -754,7 +760,109 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_scheduled_delay_in_range(due_at_ms, exit_sent_at_ms, 10_000, 12_000)
+  end
+
+  test "failed codex turn stops continuations and enters exponential retry backoff" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-failed-turn-backoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    codex_binary = Path.join(test_root, "fake-codex")
+    trace_file = Path.join(test_root, "codex.trace")
+    issue_id = "issue-failed-turn-backoff"
+    orchestrator_name = Module.concat(__MODULE__, :FailedTurnBackoffOrchestrator)
+    default_orchestrator_pid = Process.whereis(Orchestrator)
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+    try do
+      if is_pid(default_orchestrator_pid) do
+        assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, Orchestrator)
+      end
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-failed"}}}'
+            ;;
+          *)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-failed"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-failed","turn":{"id":"turn-failed","status":"failed","error":{"message":"permanent upstream failure"}}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-FAILED-TURN",
+        title: "Retry a failed Codex turn",
+        description: "Remain active while the failed worker enters backoff",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-FAILED-TURN"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        poll_interval_ms: 30_000,
+        max_turns: 20
+      )
+
+      {:ok, orchestrator_pid} = Orchestrator.start_link(name: orchestrator_name)
+      retry_entry = wait_for_retry_entry(orchestrator_pid, issue_id, 2_000)
+      state = :sys.get_state(orchestrator_pid)
+
+      assert %{attempt: 1, due_at_ms: due_at_ms, error: error} = retry_entry
+      assert error =~ "permanent upstream failure"
+      assert_due_in_range(due_at_ms, 8_000, 10_500)
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.completed, issue_id)
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      case Process.whereis(orchestrator_name) do
+        pid when is_pid(pid) -> GenServer.stop(pid)
+        _ -> :ok
+      end
+
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+      File.rm_rf(test_root)
+
+      if is_pid(default_orchestrator_pid) and is_nil(Process.whereis(Orchestrator)) do
+        case Supervisor.restart_child(SymphonyElixir.Supervisor, Orchestrator) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
+      end
+    end
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -879,6 +987,35 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp assert_scheduled_delay_in_range(due_at_ms, scheduled_after_ms, min_delay_ms, max_delay_ms) do
+    scheduled_delay_ms = due_at_ms - scheduled_after_ms
+
+    assert scheduled_delay_ms >= min_delay_ms
+    assert scheduled_delay_ms <= max_delay_ms
+  end
+
+  defp wait_for_retry_entry(pid, issue_id, timeout_ms) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_retry_entry(pid, issue_id, deadline_ms)
+  end
+
+  defp do_wait_for_retry_entry(pid, issue_id, deadline_ms) do
+    state = :sys.get_state(pid)
+
+    case Map.get(state.retry_attempts, issue_id) do
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          flunk("timed out waiting for failed turn retry: #{inspect(state)}")
+        else
+          Process.sleep(5)
+          do_wait_for_retry_entry(pid, issue_id, deadline_ms)
+        end
+
+      retry_entry ->
+        retry_entry
+    end
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1393,16 +1530,17 @@ defmodule SymphonyElixir.CoreTest do
           1)
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
-          2)
-            ;;
           3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
+            printf '%s\\n' '{"id":4,"result":{"data":[{"model":"gpt-5.5"}],"nextCursor":null}}'
             ;;
           4)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
+            ;;
+          5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
-          5)
+          6)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
@@ -1443,7 +1581,8 @@ defmodule SymphonyElixir.CoreTest do
              identifier: "MT-247",
              title: "Continue until done",
              description: "Still active after first turn",
-             state: state
+             state: state,
+             labels: ["model:gpt-other", "effort:low"]
            }
          ]}
       end
@@ -1455,7 +1594,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Still active after first turn",
         state: "In Progress",
         url: "https://example.org/issues/MT-247",
-        labels: []
+        labels: ["model:gpt-5.5", "effort:xhigh"]
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
@@ -1465,7 +1604,27 @@ defmodule SymphonyElixir.CoreTest do
       lines = File.read!(trace_file) |> String.split("\n", trim: true)
 
       assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
+      assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"model/list\""))) == 1
       assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
+
+      thread_start =
+        lines
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "thread/start"))
+
+      assert get_in(thread_start, ["params", "model"]) == "gpt-5.5"
+
+      turn_efforts =
+        lines
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(&get_in(&1, ["params", "effort"]))
+
+      assert turn_efforts == ["xhigh", "xhigh"]
 
       turn_texts =
         lines
@@ -1487,6 +1646,330 @@ defmodule SymphonyElixir.CoreTest do
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
+  end
+
+  test "agent runner comments and hands malformed model labels to Failed Need Assistance without starting Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-malformed-model-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root
+      )
+
+      issue = %Issue{
+        id: "issue-malformed-model",
+        identifier: "MT-MALFORMED-MODEL",
+        title: "Reject an empty model label",
+        state: "In Progress",
+        labels: ["model:"]
+      }
+
+      assert :ok = AgentRunner.run(issue)
+
+      assert_receive {:memory_tracker_comment, "issue-malformed-model", comment}
+      assert comment =~ "does not contain a model ID"
+      assert comment =~ "model:<model-id>"
+
+      assert_receive {:memory_tracker_state_update, "issue-malformed-model", "Failed Need Assistance"}
+
+      refute File.exists?(workspace_root)
+    after
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner comments and hands malformed effort labels to Failed Need Assistance without starting Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-malformed-effort-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root
+      )
+
+      issue = %Issue{
+        id: "issue-malformed-effort",
+        identifier: "MT-MALFORMED-EFFORT",
+        title: "Reject an empty effort label",
+        state: "In Progress",
+        labels: ["effort:"]
+      }
+
+      assert :ok = AgentRunner.run(issue)
+
+      assert_receive {:memory_tracker_comment, "issue-malformed-effort", comment}
+      assert comment =~ "does not contain an effort value"
+      assert comment =~ "effort:"
+      assert comment =~ "effort:<reasoning-effort>"
+
+      assert_receive {:memory_tracker_state_update, "issue-malformed-effort", "Failed Need Assistance"}
+
+      refute File.exists?(workspace_root)
+    after
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner treats an app-server effort rejection as a retryable turn-start failure" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-effort-rejection-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    codex_binary = Path.join(test_root, "fake-codex")
+    trace_file = Path.join(test_root, "codex.trace")
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+    parent = self()
+
+    try do
+      File.mkdir_p!(test_root)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\n' "$line" >> "$trace_file"
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-effort-rejection"}}}' ;;
+          4) printf '%s\n' '{"id":3,"error":{"code":-32602,"message":"unsupported effort"}}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_allowed_model_efforts: %{"gpt-5.5" => ["xhigh", "future-tier"]}
+      )
+
+      issue = %Issue{
+        id: "issue-effort-rejection",
+        identifier: "MT-EFFORT-REJECTION",
+        title: "Retry an unsupported effort",
+        state: "In Progress",
+        labels: ["effort:future-tier"]
+      }
+
+      assert_raise RuntimeError, ~r/response_error.*unsupported effort/, fn ->
+        AgentRunner.run(issue, nil,
+          tracker_commenter: fn _issue_id, _comment ->
+            send(parent, :unexpected_effort_handoff_comment)
+            :ok
+          end,
+          tracker_state_updater: fn _issue_id, _state ->
+            send(parent, :unexpected_effort_handoff_state)
+            :ok
+          end
+        )
+      end
+
+      refute_received :unexpected_effort_handoff_comment
+      refute_received :unexpected_effort_handoff_state
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      refute Enum.any?(payloads, &(&1["method"] == "model/list"))
+      assert get_in(Enum.find(payloads, &(&1["method"] == "turn/start")), ["params", "effort"]) == "future-tier"
+    after
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner hands an unavailable model to assistance before thread creation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-unavailable-model-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    codex_binary = Path.join(test_root, "fake-codex")
+    trace_file = Path.join(test_root, "codex.trace")
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+    try do
+      File.mkdir_p!(test_root)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="\${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          3) printf '%s\\n' '{"id":4,"result":{"data":[{"model":"gpt-other"}],"nextCursor":null}}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_allowed_model_efforts: %{"gpt-missing" => ["xhigh"]}
+      )
+
+      issue = %Issue{
+        id: "issue-unavailable-model",
+        identifier: "MT-UNAVAILABLE-MODEL",
+        title: "Reject an unavailable model",
+        state: "In Progress",
+        labels: ["model:gpt-missing"]
+      }
+
+      assert :ok = AgentRunner.run(issue)
+
+      assert_receive {:memory_tracker_comment, "issue-unavailable-model", comment}
+      assert comment =~ "did not report"
+      assert comment =~ "gpt-missing"
+
+      assert_receive {:memory_tracker_state_update, "issue-unavailable-model", "Failed Need Assistance"}
+
+      trace = File.read!(trace_file)
+      assert trace =~ ~s("method":"model/list")
+      refute trace =~ ~s("method":"thread/start")
+      refute trace =~ ~s("method":"turn/start")
+    after
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner hands unsupported workflow model, effort, and pair selections to assistance before workspace creation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-disallowed-selection-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        codex_allowed_model_efforts: %{"gpt-allowed" => ["low"], "gpt-other" => ["high"]}
+      )
+
+      for {suffix, labels, expected_message} <- [
+            {"model", ["model:gpt-unknown"], "is not permitted"},
+            {"effort", ["effort:xhigh"], "is not permitted"},
+            {"pair", ["model:gpt-allowed", "effort:high"], "combination"}
+          ] do
+        issue_id = "issue-disallowed-#{suffix}"
+
+        issue = %Issue{
+          id: issue_id,
+          identifier: "MT-DISALLOWED-#{String.upcase(suffix)}",
+          title: "Reject a disallowed #{suffix} selection",
+          state: "In Progress",
+          labels: labels
+        }
+
+        assert :ok = AgentRunner.run(issue)
+
+        assert_receive {:memory_tracker_comment, ^issue_id, comment}
+        assert comment =~ expected_message
+        assert comment =~ "Allowed combinations"
+        assert comment =~ "model:gpt-allowed"
+        assert comment =~ "effort:low"
+
+        assert_receive {:memory_tracker_state_update, ^issue_id, "Failed Need Assistance"}
+      end
+
+      refute File.exists?(workspace_root)
+    after
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Codex selection handoff mutation failures fail the worker for orchestrator retry" do
+    issue = %Issue{
+      id: "issue-model-handoff-failure",
+      identifier: "MT-MODEL-HANDOFF-FAILURE",
+      title: "Retry failed model handoff",
+      state: "In Progress",
+      labels: ["model:"]
+    }
+
+    parent = self()
+
+    assert_raise RuntimeError, ~r/codex_selection_handoff_failed.*comment_failed/, fn ->
+      AgentRunner.run(issue, nil,
+        tracker_commenter: fn issue_id, _comment ->
+          send(parent, {:comment_attempted, issue_id})
+          {:error, :comment_failed}
+        end,
+        tracker_state_updater: fn _issue_id, _state ->
+          flunk("state transition must not run after comment failure")
+        end
+      )
+    end
+
+    assert_receive {:comment_attempted, "issue-model-handoff-failure"}
+
+    assert_raise RuntimeError, ~r/codex_selection_handoff_failed.*state_failed/, fn ->
+      AgentRunner.run(issue, nil,
+        tracker_commenter: fn issue_id, _comment ->
+          send(parent, {:comment_created, issue_id})
+          :ok
+        end,
+        tracker_state_updater: fn issue_id, state ->
+          send(parent, {:state_attempted, issue_id, state})
+          {:error, :state_failed}
+        end
+      )
+    end
+
+    assert_receive {:comment_created, "issue-model-handoff-failure"}
+    assert_receive {:state_attempted, "issue-model-handoff-failure", "Failed Need Assistance"}
   end
 
   test "agent runner stops continuing once agent.max_turns is reached" do
@@ -1688,7 +2171,9 @@ defmodule SymphonyElixir.CoreTest do
                    payload["method"] == "thread/start" &&
                      get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
                      get_in(payload, ["params", "sandbox"]) == "workspace-write" &&
-                     get_in(payload, ["params", "cwd"]) == canonical_workspace
+                     get_in(payload, ["params", "cwd"]) == canonical_workspace &&
+                     not Map.has_key?(payload["params"], "model") &&
+                     not Map.has_key?(payload["params"], "effort")
                  end)
                else
                  false
@@ -1721,7 +2206,8 @@ defmodule SymphonyElixir.CoreTest do
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "cwd"]) == canonical_workspace &&
                      get_in(payload, ["params", "approvalPolicy"]) == expected_approval_policy &&
-                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_sandbox_policy
+                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_sandbox_policy &&
+                     not Map.has_key?(payload["params"], "effort")
                  end)
                else
                  false
@@ -1810,6 +2296,7 @@ defmodule SymphonyElixir.CoreTest do
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
       assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")
+      refute String.contains?(trace, "\"method\":\"model/list\"")
       refute String.contains?(argv_line, "--ask-for-approval never")
       refute String.contains?(argv_line, "--sandbox danger-full-access")
     after
