@@ -29,10 +29,10 @@ defmodule SymphonyElixir.Codex.AppServer do
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def run(workspace, prompt, issue, opts \\ []) do
+  def run(workspace, prompt, task, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
       try do
-        run_turn(session, prompt, issue, opts)
+        run_turn(session, prompt, task, opts)
       after
         stop_session(session)
       end
@@ -73,6 +73,24 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @spec catalog(Path.t()) :: {:ok, [map()]} | {:error, term()}
+  def catalog(workspace) when is_binary(workspace) do
+    :ok = File.mkdir_p(workspace)
+
+    with {:ok, expanded_workspace} <- validate_catalog_cwd(workspace),
+         {:ok, port} <- start_port(expanded_workspace, nil) do
+      try do
+        with :ok <- send_initialize(port),
+             {:ok, models} <- list_models(port),
+             :ok <- validate_model_entries(models) do
+          {:ok, models}
+        end
+      after
+        stop_port(port)
+      end
+    end
+  end
+
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
         %{
@@ -87,20 +105,22 @@ defmodule SymphonyElixir.Codex.AppServer do
           workspace: workspace
         },
         prompt,
-        issue,
+        task,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    dynamic_tool_opts = Keyword.get(opts, :dynamic_tool_opts, [])
 
     tool_executor =
-      Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
+      Keyword.get(opts, :tool_executor, fn tool, arguments, call_metadata ->
+        tool_opts = Keyword.put(dynamic_tool_opts, :call_id, to_string(call_metadata.call_id))
+        DynamicTool.execute(tool, arguments, tool_opts)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, effort) do
+    case start_turn(port, thread_id, prompt, task, workspace, approval_policy, turn_sandbox_policy, effort) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id} model=#{model_for_log(model)} effort=#{effort_for_log(effort)}")
+        Logger.info("Codex session started for #{task_context(task)} session_id=#{session_id} model=#{model_for_log(model)} effort=#{effort_for_log(effort)}")
 
         emit_message(
           on_message,
@@ -124,7 +144,7 @@ defmodule SymphonyElixir.Codex.AppServer do
                auto_approve_requests
              ) do
           {:ok, result} ->
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+            Logger.info("Codex session completed for #{task_context(task)} session_id=#{session_id}")
 
             {:ok,
              %{
@@ -137,7 +157,7 @@ defmodule SymphonyElixir.Codex.AppServer do
              }}
 
           {:error, reason} ->
-            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+            Logger.warning("Codex session ended with error for #{task_context(task)} session_id=#{session_id}: #{inspect(reason)}")
 
             emit_message(
               on_message,
@@ -153,7 +173,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
       {:error, reason} ->
-        Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
+        Logger.error("Codex session failed for #{task_context(task)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
     end
@@ -203,6 +223,21 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       true ->
         {:ok, workspace}
+    end
+  end
+
+  defp validate_catalog_cwd(workspace) do
+    bundle = Config.bundle!()
+    expanded = Path.expand(workspace)
+    runtime_root = Path.expand(SymphonyElixir.Paths.runtime_root(bundle.project.id))
+
+    with {:ok, canonical} <- PathSafety.canonicalize(expanded),
+         {:ok, canonical_runtime_root} <- PathSafety.canonicalize(runtime_root),
+         true <- String.starts_with?(canonical <> "/", canonical_runtime_root <> "/") do
+      {:ok, canonical}
+    else
+      false -> {:error, {:invalid_catalog_cwd, expanded}}
+      {:error, reason} -> {:error, {:invalid_catalog_cwd, reason}}
     end
   end
 
@@ -407,7 +442,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          port,
          thread_id,
          prompt,
-         issue,
+         task,
          workspace,
          approval_policy,
          turn_sandbox_policy,
@@ -423,7 +458,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           }
         ],
         "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
+        "title" => "#{task.identifier}: #{task.title}",
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
@@ -814,9 +849,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
 
+    call_metadata = %{call_id: id, method: "item/tool/call", params: params}
+
     result =
-      tool_name
-      |> tool_executor.(arguments)
+      tool_executor
+      |> execute_dynamic_tool(tool_name, arguments, call_metadata)
       |> normalize_dynamic_tool_result()
 
     send_message(port, %{
@@ -935,6 +972,14 @@ defmodule SymphonyElixir.Codex.AppServer do
          _auto_approve_requests
        ) do
     :unhandled
+  end
+
+  defp execute_dynamic_tool(executor, tool_name, arguments, metadata) when is_function(executor, 3) do
+    executor.(tool_name, arguments, metadata)
+  end
+
+  defp execute_dynamic_tool(executor, tool_name, arguments, _metadata) when is_function(executor, 2) do
+    executor.(tool_name, arguments)
   end
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
@@ -1242,8 +1287,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> String.starts_with?("{")
   end
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
-    "issue_id=#{issue_id} issue_identifier=#{identifier}"
+  defp task_context(%{id: task_id, identifier: identifier}) do
+    "task_id=#{task_id} task_identifier=#{identifier}"
   end
 
   defp model_for_log(nil), do: "default"

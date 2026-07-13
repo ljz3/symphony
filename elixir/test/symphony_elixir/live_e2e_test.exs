@@ -1,802 +1,537 @@
 defmodule SymphonyElixir.LiveE2ETest do
-  use SymphonyElixir.TestSupport
+  use ExUnit.Case, async: false
 
-  require Logger
-  alias SymphonyElixir.SSH
+  alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.Board
+  alias SymphonyElixir.Board.{Commands, History, Projection, Sync, Writer}
+  alias SymphonyElixir.BoardFactory
+  alias SymphonyElixir.GitHub
+  alias SymphonyElixir.Task
+  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.Workflow.Store
+  alias SymphonyElixir.Worktree
 
-  @moduletag :live_e2e
-  @moduletag timeout: 300_000
+  @moduletag :live
+  @acknowledged_timeout 600_000
 
-  @default_team_key "SYME2E"
-  @default_docker_auth_json Path.join(System.user_home!(), ".codex/auth.json")
-  @docker_worker_count 2
-  @docker_support_dir Path.expand("../support/live_e2e_docker", __DIR__)
-  @docker_compose_file Path.join(@docker_support_dir, "docker-compose.yml")
-  @result_file "LIVE_E2E_RESULT.txt"
-  @live_e2e_skip_reason if(System.get_env("SYMPHONY_RUN_LIVE_E2E") != "1",
-                          do: "set SYMPHONY_RUN_LIVE_E2E=1 to enable the real Linear/Codex end-to-end test"
-                        )
-
-  @team_query """
-  query SymphonyLiveE2ETeam($key: String!) {
-    teams(filter: {key: {eq: $key}}, first: 1) {
-      nodes {
-        id
-        key
-        name
-        states(first: 50) {
-          nodes {
-            id
-            name
-            type
-          }
-        }
-      }
-    }
-  }
-  """
-
-  @create_project_mutation """
-  mutation SymphonyLiveE2ECreateProject($name: String!, $teamIds: [String!]!) {
-    projectCreate(input: {name: $name, teamIds: $teamIds}) {
-      success
-      project {
-        id
-        name
-        slugId
-        url
-      }
-    }
-  }
-  """
-
-  @create_issue_mutation """
-  mutation SymphonyLiveE2ECreateIssue(
-    $teamId: String!
-    $projectId: String!
-    $title: String!
-    $description: String!
-    $stateId: String
-  ) {
-    issueCreate(
-      input: {
-        teamId: $teamId
-        projectId: $projectId
-        title: $title
-        description: $description
-        stateId: $stateId
-      }
-    ) {
-      success
-      issue {
-        id
-        identifier
-        title
-        description
-        url
-        state {
-          name
-        }
-      }
-    }
-  }
-  """
-
-  @project_statuses_query """
-  query SymphonyLiveE2EProjectStatuses {
-    projectStatuses(first: 50) {
-      nodes {
-        id
-        name
-        type
-      }
-    }
-  }
-  """
-
-  @issue_details_query """
-  query SymphonyLiveE2EIssueDetails($id: String!) {
-    issue(id: $id) {
-      id
-      identifier
-      state {
-        name
-        type
-      }
-      comments(first: 20) {
-        nodes {
-          body
-        }
-      }
-    }
-  }
-  """
-
-  @complete_project_mutation """
-  mutation SymphonyLiveE2ECompleteProject($id: String!, $statusId: String!, $completedAt: DateTime!) {
-    projectUpdate(id: $id, input: {statusId: $statusId, completedAt: $completedAt}) {
-      success
-    }
-  }
-  """
-
-  @tag skip: @live_e2e_skip_reason
-  test "creates a real Linear project and issue with a local worker" do
-    run_live_issue_flow!(:local)
-  end
-
-  @tag skip: @live_e2e_skip_reason
-  test "creates a real Linear project and issue with an ssh worker" do
-    run_live_issue_flow!(:ssh)
-  end
-
-  defp fetch_team!(team_key) do
-    @team_query
-    |> graphql_data!(%{key: team_key})
-    |> get_in(["teams", "nodes"])
-    |> case do
-      [team | _] ->
-        team
-
-      _ ->
-        flunk("expected Linear team #{inspect(team_key)} to exist")
+  @tag timeout: @acknowledged_timeout
+  test "disposable board and source remotes survive implementation, review, rework, merge, cleanup, and replay" do
+    unless System.get_env("SYMPHONY_RUN_LIVE_E2E") == "1" do
+      flunk("set SYMPHONY_RUN_LIVE_E2E=1 to run the Git-backed Kanban live test")
     end
-  end
 
-  defp active_state!(%{"states" => %{"nodes" => states}}) when is_list(states) do
-    Enum.find(states, &(&1["type"] == "started")) ||
-      Enum.find(states, &(&1["type"] == "unstarted")) ||
-      Enum.find(states, &(&1["type"] not in ["completed", "canceled"])) ||
-      flunk("expected team to expose at least one non-terminal workflow state")
-  end
+    original_path = System.get_env("PATH")
+    original_state = System.get_env("FAKE_GH_STATE")
+    original_workflow = Workflow.workflow_file_path()
+    fixture = configure_fixture(original_path)
 
-  defp terminal_state_names(%{"states" => %{"nodes" => states}}) when is_list(states) do
-    states
-    |> Enum.filter(&(&1["type"] in ["completed", "canceled"]))
-    |> Enum.map(& &1["name"])
-    |> case do
-      [] -> ["Done", "Canceled", "Cancelled"]
-      names -> names
-    end
-  end
+    on_exit(fn ->
+      restore_env("PATH", original_path)
+      restore_env("FAKE_GH_STATE", original_state)
+      Workflow.set_workflow_file_path(original_workflow)
+      Store.force_reload()
+    end)
 
-  defp active_state_names(%{"states" => %{"nodes" => states}}) when is_list(states) do
-    states
-    |> Enum.reject(&(&1["type"] in ["completed", "canceled"]))
-    |> Enum.map(& &1["name"])
-    |> case do
-      [] -> ["Todo", "In Progress", "In Review"]
-      names -> names
-    end
-  end
+    Workflow.set_workflow_file_path(fixture.source.workflow)
+    assert :ok = Store.force_reload()
+    assert {:ok, %{source: %{root: source_root}, board: %{remote: board_remote}}} = Workflow.current()
+    assert source_root == fixture.source.root
+    assert board_remote == fixture.board_remote
 
-  defp completed_project_status! do
-    @project_statuses_query
-    |> graphql_data!(%{})
-    |> get_in(["projectStatuses", "nodes"])
-    |> case do
-      statuses when is_list(statuses) ->
-        Enum.find(statuses, &(&1["type"] == "completed")) ||
-          flunk("expected workspace to expose a completed project status")
+    eventually(fn -> Sync.status()[:state] not in [:unknown, :not_started, :local_only] end)
 
-      payload ->
-        flunk("expected project statuses list, got: #{inspect(payload)}")
-    end
-  end
-
-  defp create_project!(team_id, name) do
-    @create_project_mutation
-    |> graphql_data!(%{teamIds: [team_id], name: name})
-    |> fetch_successful_entity!("projectCreate", "project")
-  end
-
-  defp create_issue!(team_id, project_id, state_id, title) do
-    issue =
-      @create_issue_mutation
-      |> graphql_data!(%{
-        teamId: team_id,
-        projectId: project_id,
-        title: title,
-        description: title,
-        stateId: state_id
+    {backlog, _key} =
+      BoardFactory.create_task(%{
+        title: "Exercise the complete Git-backed workflow",
+        brief: "Create a substantive source change and carry it through every standard automated stage.",
+        acceptance_criteria: ["The source change is committed, reviewed, merged, and replayable."]
       })
-      |> fetch_successful_entity!("issueCreate", "issue")
 
-    %Issue{
-      id: issue["id"],
-      identifier: issue["identifier"],
-      title: issue["title"],
-      description: issue["description"],
-      state: get_in(issue, ["state", "name"]),
-      url: issue["url"],
-      labels: [],
-      blocked_by: []
-    }
+    {todo, _result} = BoardFactory.move(backlog, "todo")
+
+    implementation = run_stage(todo, "automated_review")
+    worktree = Worktree.path(implementation)
+    assert File.regular?(Path.join(worktree, "lib/live_e2e.ex"))
+    assert implementation.github["number"] == 1
+    assert implementation.github["draft"] == true
+    assert implementation.github["url"] == "https://github.test/owner/repo/pull/1"
+
+    first_review = run_stage(implementation, "human_review")
+    assert get_in(first_review.github, ["ready", "completed"]) == true
+    assert comment_count(fixture.gh_state) == 1
+    refute File.exists?(Path.join(fixture.gh_state, "draft"))
+
+    assert :ok = GitHub.convert_to_draft(first_review, worktree)
+    assert File.regular?(Path.join(fixture.gh_state, "draft"))
+    {rework, _result} = BoardFactory.move(Task.to_map(first_review), "rework")
+
+    reviewed_again = rework |> run_stage("automated_review") |> run_stage("human_review")
+    assert comment_count(fixture.gh_state) == 2
+    refute File.exists?(Path.join(fixture.gh_state, "draft"))
+
+    {merging, _result} = BoardFactory.move(Task.to_map(reviewed_again), "merging")
+    done = run_stage(merging, "done")
+    assert get_in(done.github, ["merged", "merged"]) == true
+    assert get_in(done.github, ["merged", "merge_reachable"]) == true
+
+    eventually(fn ->
+      done.id
+      |> Board.runs()
+      |> Enum.count(&is_map(&1["stats_publication"]))
+      |> Kernel.==(4)
+    end)
+
+    runs = Board.runs(done.id)
+    assert length(runs) == 5
+    assert Enum.all?(runs, &(get_in(&1, ["stats", "turn_count"]) == 1))
+    assert Enum.all?(runs, &(get_in(&1, ["stats", "token_usage", "total_tokens"]) == 1_250))
+    assert Enum.count(runs, &(get_in(&1, ["stats_publication", "destination"]) == "pr_body")) == 1
+    assert Enum.count(runs, &(get_in(&1, ["stats_publication", "destination"]) == "workpad_comment")) == 3
+    assert Enum.count(runs, &is_nil(&1["stats_publication"])) == 1
+
+    eventually(fn -> not File.exists?(worktree) end)
+    assert {:ok, _checkpoint} = Board.handoff()
+    assert :ok = History.verify_remote("symphony", fixture.board_remote)
+
+    snapshot = Task.to_map(done)
+    event_types = Board.events(done.id) |> Enum.map(& &1["type"])
+    assert "pull_request_linked" in event_types
+    assert "github_ready_recorded" in event_types
+    assert "github_merged_recorded" in event_types
+    assert "task_transitioned" in event_types
+    assert "run_finished" in event_types
+
+    assert :ok = Projection.rebuild([])
+    assert {:error, :not_found} = Board.task(done.id)
+
+    previous_writer = Process.whereis(Writer)
+    Process.exit(previous_writer, :kill)
+    eventually(fn -> is_pid(Process.whereis(Writer)) and Process.whereis(Writer) != previous_writer end)
+
+    eventually(fn ->
+      case Board.task(done.id) do
+        {:ok, task} -> task.column_id == "done" and task.revision == snapshot["revision"]
+        {:error, :not_found} -> false
+      end
+    end)
+
+    assert {:ok, replayed} = Board.task(done.id)
+    assert Task.to_map(replayed) == snapshot
   end
 
-  defp complete_project(project_id, completed_status_id)
-       when is_binary(project_id) and is_binary(completed_status_id) do
-    update_entity(
-      @complete_project_mutation,
-      %{
-        id: project_id,
-        statusId: completed_status_id,
-        completedAt: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-      },
-      "projectUpdate",
-      "project"
-    )
+  defp configure_fixture(original_path) do
+    root = Path.join(System.tmp_dir!(), BoardFactory.unique("git-kanban-live"))
+    gh_bin = Path.join(root, "bin")
+    gh_state = Path.join(root, "gh-state")
+    fake_codex = Path.join(root, "fake_codex.exs")
+    board_remote = Path.join(root, "board.git")
+    File.mkdir_p!(gh_bin)
+    File.mkdir_p!(gh_state)
+    File.write!(Path.join(gh_state, "comments_count"), "0\n")
+    File.write!(Path.join(gh_bin, "gh"), fake_gh_script())
+    File.chmod!(Path.join(gh_bin, "gh"), 0o755)
+    File.write!(fake_codex, fake_codex_script())
+
+    source = BoardFactory.workflow_source()
+    github_url = "https://github.test/owner/repo.git"
+    rewrite_key = "url.file://#{source.remote}.insteadOf"
+    BoardFactory.git!(source.root, ["config", rewrite_key, github_url])
+    BoardFactory.git!(source.root, ["remote", "set-url", "origin", github_url])
+    BoardFactory.git!(source.root, ["ls-remote", "origin", "refs/heads/main"])
+
+    {_output, 0} =
+      System.cmd("git", ["init", "--bare", "--initial-branch=main", board_remote], stderr_to_stdout: true)
+
+    codex_command =
+      "cd #{shell_escape(File.cwd!())} && mise exec -- mix run --no-start #{shell_escape(fake_codex)}"
+
+    workflow =
+      source.workflow
+      |> File.read!()
+      |> then(&Regex.replace(~r/^  command:.*$/m, &1, "  command: #{Jason.encode!(codex_command)}"))
+      |> then(
+        &Regex.replace(
+          ~r/^board:\n  remote:.*$/m,
+          &1,
+          "board:\n  remote: #{Jason.encode!(board_remote)}"
+        )
+      )
+
+    File.write!(source.workflow, workflow)
+
+    System.put_env("PATH", gh_bin <> ":" <> original_path)
+    System.put_env("FAKE_GH_STATE", gh_state)
+
+    %{root: root, source: source, gh_state: gh_state, board_remote: board_remote}
   end
 
-  defp fetch_issue_details!(issue_id) when is_binary(issue_id) do
-    @issue_details_query
-    |> graphql_data!(%{id: issue_id})
-    |> get_in(["issue"])
-    |> case do
-      %{} = issue -> issue
-      payload -> flunk("expected issue details payload, got: #{inspect(payload)}")
+  defp run_stage(task, expected_column) do
+    assert {:ok, %{"task" => claimed, "run" => run}} =
+             Board.execute(%Commands.ClaimRun{task_id: task_id(task)},
+               actor: %{type: :system, identity: "live-e2e"},
+               expected_revision: task_revision(task),
+               idempotency_key: BoardFactory.unique("live-claim")
+             )
+
+    assert claimed["runtime_state"] == "starting"
+    assert :ok = AgentRunner.run(claimed["id"], run["id"], nil, max_turns: 1)
+    assert {:ok, updated} = Board.task(claimed["id"])
+    assert updated.column_id == expected_column
+    assert updated.active_run_id == nil
+    assert updated.runtime_state == nil
+    updated
+  end
+
+  defp task_id(%Task{id: id}), do: id
+  defp task_id(%{"id" => id}), do: id
+  defp task_revision(%Task{revision: revision}), do: revision
+  defp task_revision(%{"revision" => revision}), do: revision
+
+  defp comment_count(root) do
+    root
+    |> Path.join("comments_count")
+    |> File.read!()
+    |> String.trim()
+    |> String.to_integer()
+  end
+
+  defp eventually(predicate, attempts \\ 100)
+  defp eventually(predicate, 0), do: assert(predicate.())
+
+  defp eventually(predicate, attempts) do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(50)
+      eventually(predicate, attempts - 1)
     end
   end
 
-  defp issue_completed?(%{"state" => %{"type" => type}}), do: type in ["completed", "canceled"]
-  defp issue_completed?(_issue), do: false
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
 
-  defp issue_has_comment?(%{"comments" => %{"nodes" => comments}}, expected_body) when is_list(comments) do
-    Enum.any?(comments, &(&1["body"] == expected_body))
+  defp shell_escape(value) do
+    "'" <> String.replace(to_string(value), "'", "'\"'\"'") <> "'"
   end
 
-  defp issue_has_comment?(_issue, _expected_body), do: false
+  defp fake_gh_script do
+    ~S"""
+    #!/bin/sh
+    set -eu
+    state=${FAKE_GH_STATE:?}
+    mkdir -p "$state"
 
-  defp update_entity(mutation, variables, mutation_name, entity_name) do
-    case Client.graphql(mutation, variables) do
-      {:ok, %{"data" => %{^mutation_name => %{"success" => true}}}} ->
-        :ok
+    head_oid() { git rev-parse HEAD; }
+    draft_value() { if [ -f "$state/draft" ]; then printf 'true'; else printf 'false'; fi; }
+    pr_state() { if [ -f "$state/merged" ]; then printf 'MERGED'; elif [ -f "$state/closed" ]; then printf 'CLOSED'; else printf 'OPEN'; fi; }
 
-      {:ok, %{"errors" => errors}} ->
-        Logger.warning("Live e2e finalization failed for #{entity_name}: #{inspect(errors)}")
-        :ok
-
-      {:ok, payload} ->
-        Logger.warning("Live e2e finalization failed for #{entity_name}: #{inspect(payload)}")
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Live e2e finalization failed for #{entity_name}: #{inspect(reason)}")
-        :ok
-    end
-  end
-
-  defp graphql_data!(query, variables) when is_binary(query) and is_map(variables) do
-    case Client.graphql(query, variables) do
-      {:ok, %{"data" => data, "errors" => errors}} when is_map(data) and is_list(errors) ->
-        flunk("Linear GraphQL returned partial errors: #{inspect(errors)}")
-
-      {:ok, %{"errors" => errors}} when is_list(errors) ->
-        flunk("Linear GraphQL failed: #{inspect(errors)}")
-
-      {:ok, %{"data" => data}} when is_map(data) ->
-        data
-
-      {:ok, payload} ->
-        flunk("Linear GraphQL returned unexpected payload: #{inspect(payload)}")
-
-      {:error, reason} ->
-        flunk("Linear GraphQL request failed: #{inspect(reason)}")
-    end
-  end
-
-  defp fetch_successful_entity!(data, mutation_name, entity_name)
-       when is_map(data) and is_binary(mutation_name) and is_binary(entity_name) do
-    case data do
-      %{^mutation_name => %{"success" => true, ^entity_name => %{} = entity}} ->
-        entity
-
-      _ ->
-        flunk("expected successful #{mutation_name} response, got: #{inspect(data)}")
-    end
-  end
-
-  defp live_prompt(project_slug) do
+    case "${1:-}" in
+      auth)
+        exit 0
+        ;;
+      repo)
+        printf '%s' '{"nameWithOwner":"owner/repo"}'
+        ;;
+      api)
+        case "$*" in
+          *rate_limit*) printf '%s' '{}' ;;
+          *graphql*) printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
+          *issues/comments/*)
+            comment_id=""
+            body_file=""
+            for argument in "$@"; do
+              case "$argument" in
+                repos/*/issues/comments/*) comment_id=${argument##*/} ;;
+                body=@*) body_file=${argument#body=@} ;;
+              esac
+            done
+            cp "$body_file" "$state/comment_$comment_id"
+            printf '%s' '{}'
+            ;;
+          *issues/*/comments*)
+            count=$(cat "$state/comments_count")
+            printf '['
+            index=1
+            while [ "$index" -le "$count" ]; do
+              if [ "$index" -gt 1 ]; then printf ','; fi
+              markers=$(grep -o '<!-- symphony-[^>]* -->' "$state/comment_$index" | tr '\n' ' ')
+              printf '{"id":%s,"body":"%s"}' "$index" "$markers"
+              index=$((index + 1))
+            done
+            printf ']'
+            ;;
+          *) printf '%s' '{}' ;;
+        esac
+        ;;
+      pr)
+        case "${2:-}" in
+          list)
+            if [ -f "$state/pr_created" ]; then
+              markers=$(grep -o '<!-- symphony-[^>]* -->' "$state/pr_body" | tr '\n' ' ')
+              printf '[{"number":1,"url":"https://github.test/owner/repo/pull/1","isDraft":%s,"headRefOid":"%s","state":"%s","body":"%s"}]' "$(draft_value)" "$(head_oid)" "$(pr_state)" "$markers"
+            else
+              printf '%s' '[]'
+            fi
+            ;;
+          create)
+            previous=""
+            for argument in "$@"; do
+              if [ "$previous" = "--body-file" ]; then cp "$argument" "$state/pr_body"; fi
+              previous="$argument"
+            done
+            : > "$state/pr_created"
+            : > "$state/draft"
+            printf '%s\n' 'https://github.test/owner/repo/pull/1'
+            ;;
+          edit)
+            previous=""
+            for argument in "$@"; do
+              if [ "$previous" = "--body-file" ]; then cp "$argument" "$state/pr_body"; fi
+              previous="$argument"
+            done
+            ;;
+          view)
+            case "$*" in
+              *--json\ body*)
+                markers=$(grep -o '<!-- symphony-[^>]* -->' "$state/pr_body" | tr '\n' ' ')
+                printf '{"body":"%s"}' "$markers"
+                ;;
+              *mergeCommit*)
+                merge_sha=$(cat "$state/merge_sha")
+                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","state":"MERGED","mergeCommit":{"oid":"%s"}}' "$merge_sha"
+                ;;
+              *statusCheckRollup*)
+                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","isDraft":%s,"headRefOid":"%s","state":"%s","reviewDecision":"APPROVED","statusCheckRollup":[]}' "$(draft_value)" "$(head_oid)" "$(pr_state)"
+                ;;
+              *)
+                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","isDraft":%s,"headRefOid":"%s","state":"%s"}' "$(draft_value)" "$(head_oid)" "$(pr_state)"
+                ;;
+            esac
+            ;;
+          checks)
+            printf '%s' '[]'
+            ;;
+          ready)
+            if [ "${3:-}" = "--undo" ]; then : > "$state/draft"; else rm -f "$state/draft"; fi
+            ;;
+          comment)
+            count=$(cat "$state/comments_count")
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$state/comments_count"
+            previous=""
+            for argument in "$@"; do
+              if [ "$previous" = "--body-file" ]; then cp "$argument" "$state/comment_$count"; fi
+              previous="$argument"
+            done
+            ;;
+          close)
+            : > "$state/closed"
+            ;;
+          *)
+            printf '%s\n' "unsupported fake gh pr command: $*" >&2
+            exit 2
+            ;;
+        esac
+        ;;
+      *)
+        printf '%s\n' "unsupported fake gh command: $*" >&2
+        exit 2
+        ;;
+    esac
     """
-    You are running a real Symphony end-to-end test.
+  end
 
-    The current working directory is the workspace root.
+  defp fake_codex_script do
+    ~S"""
+    defmodule SymphonyLiveFakeCodex do
+      def main, do: loop(%{})
 
-    Step 1:
-    Create a file named #{@result_file} in the current working directory by running exactly:
+      defp loop(state) do
+        case IO.read(:stdio, :line) do
+          :eof ->
+            :ok
 
-    ```sh
-    cat > #{@result_file} <<'EOF'
-    identifier={{ issue.identifier }}
-    project_slug=#{project_slug}
-    EOF
-    ```
+          line ->
+            message = Jason.decode!(line)
+            {next, outgoing} = handle(message, state)
+            outgoing |> List.wrap() |> Enum.each(&IO.puts(Jason.encode!(&1)))
+            loop(next)
+        end
+      end
 
-    Then verify it by running:
+      defp handle(%{"method" => "initialize", "id" => id}, state) do
+        {state, %{"id" => id, "result" => %{}}}
+      end
 
-    ```sh
-    cat #{@result_file}
-    ```
+      defp handle(%{"method" => "initialized"}, state), do: {state, []}
 
-    The file content must be exactly:
-    identifier={{ issue.identifier }}
-    project_slug=#{project_slug}
+      defp handle(%{"method" => "model/list", "id" => id}, state) do
+        {state, %{"id" => id, "result" => %{"data" => [%{"model" => "gpt-5.5"}]}}}
+      end
 
-    Step 2:
-    You must use the `linear_graphql` tool to query the current issue by `{{ issue.id }}` and read:
-    - existing comments
-    - team workflow states
+      defp handle(%{"method" => "thread/start", "id" => id, "params" => params}, state) do
+        thread = "fake-thread-#{System.system_time(:nanosecond)}"
 
-    A turn that only creates the file is incomplete. Do not stop after Step 1.
+        {Map.merge(state, %{cwd: params["cwd"], thread: thread}),
+         %{"id" => id, "result" => %{"thread" => %{"id" => thread}}}}
+      end
 
-    If the exact comment body below is not already present, post exactly one comment on the current issue with this exact body:
-    #{expected_comment("{{ issue.identifier }}", project_slug)}
+      defp handle(%{"method" => "turn/start", "id" => id, "params" => params}, state) do
+        prompt = get_in(params, ["input", Access.at(0), "text"])
+        [_, stage] = Regex.run(~r/Stage: ([^\n]+)/, prompt)
+        turn = "fake-turn-#{System.system_time(:nanosecond)}"
+        context_id = "#{turn}:context"
 
-    Use these exact GraphQL operations:
+        next = Map.merge(state, %{stage: stage, turn: turn, phase: :initial_context})
 
-    ```graphql
-    query IssueContext($id: String!) {
-      issue(id: $id) {
-        comments(first: 20) {
-          nodes {
-            body
+        {next,
+         [
+           %{"id" => id, "result" => %{"turn" => %{"id" => turn}}},
+           tool_call(context_id, "symphony_task_context", %{})
+         ]}
+      end
+
+      defp handle(%{"id" => _id, "result" => result}, %{phase: :initial_context} = state) do
+        payload = successful_output!(result)
+        task = payload["task"]
+        apply_source_effect(state.stage, state.cwd)
+        run_id = task["active_run_id"]
+
+        next = Map.merge(state, %{phase: :workpad, task: task, run_id: run_id})
+        args = %{"content" => "#{state.stage} workpad for #{task["identifier"]}"}
+        {next, tool_call("#{run_id}:workpad", "symphony_workpad_write", args)}
+      end
+
+      defp handle(%{"id" => _id, "result" => result}, %{phase: :workpad} = state) do
+        successful_output!(result)
+        context_id = "#{state.run_id}:refreshed-context"
+        {%{state | phase: :refreshed_context}, tool_call(context_id, "symphony_task_context", %{})}
+      end
+
+      defp handle(%{"id" => _id, "result" => result}, %{phase: :refreshed_context} = state) do
+        task = successful_output!(result)["task"]
+
+        if state.stage == "implementation" do
+          criterion = hd(task["acceptance_criteria"])
+
+          args = %{
+            "criterion_id" => criterion["id"],
+            "evidence" => [%{"command" => "fake live validation", "result" => "passed"}],
+            "expected_revision" => task["revision"]
           }
-        }
-        team {
-          states(first: 50) {
-            nodes {
-              id
-              name
-              type
+
+          {%{state | phase: :acceptance},
+           tool_call("#{state.run_id}:acceptance", "symphony_acceptance_complete", args)}
+        else
+          transition(state, task["revision"])
+        end
+      end
+
+      defp handle(%{"id" => _id, "result" => result}, %{phase: :acceptance} = state) do
+        task = successful_output!(result)["task"]
+        transition(state, task["revision"])
+      end
+
+      defp handle(%{"id" => _id, "result" => result}, %{phase: :transition} = state) do
+        successful_output!(result)
+
+        usage = %{
+          "method" => "thread/tokenUsage/updated",
+          "params" => %{
+            "tokenUsage" => %{
+              "total" => %{
+                "inputTokens" => 1_000,
+                "cachedInputTokens" => 700,
+                "outputTokens" => 250,
+                "totalTokens" => 1_250
+              }
             }
           }
         }
-      }
-    }
-    ```
 
-    ```graphql
-    mutation AddComment($issueId: String!, $body: String!) {
-      commentCreate(input: {issueId: $issueId, body: $body}) {
-        success
-      }
-    }
-    ```
-
-    Step 3:
-    Use the same issue-context query result to choose a workflow state whose `type` is `completed`.
-    Then move the current issue to that state with this exact mutation:
-
-    ```graphql
-    mutation CompleteIssue($id: String!, $stateId: String!) {
-      issueUpdate(id: $id, input: {stateId: $stateId}) {
-        success
-      }
-    }
-    ```
-
-    Step 4:
-    Verify all outcomes with one final `linear_graphql` query against `{{ issue.id }}`:
-    - the exact comment body is present
-    - the issue state type is `completed`
-
-    Do not ask for approval.
-    Stop only after all three conditions are true:
-    1. the file exists with the exact contents above
-    2. the Linear comment exists with the exact body above
-    3. the Linear issue is in a completed terminal state
-    """
-  end
-
-  defp expected_result(issue_identifier, project_slug) do
-    "identifier=#{issue_identifier}\nproject_slug=#{project_slug}\n"
-  end
-
-  defp expected_comment(issue_identifier, project_slug) do
-    "Symphony live e2e comment\nidentifier=#{issue_identifier}\nproject_slug=#{project_slug}"
-  end
-
-  defp receive_runtime_info!(issue_id) do
-    receive do
-      {:worker_runtime_info, ^issue_id, %{workspace_path: workspace_path} = runtime_info}
-      when is_binary(workspace_path) ->
-        runtime_info
-
-      {:codex_worker_update, ^issue_id, _message} ->
-        receive_runtime_info!(issue_id)
-    after
-      5_000 ->
-        flunk("timed out waiting for worker runtime info for #{inspect(issue_id)}")
-    end
-  end
-
-  defp read_worker_result!(%{worker_host: nil, workspace_path: workspace_path}, result_file)
-       when is_binary(workspace_path) and is_binary(result_file) do
-    File.read!(Path.join(workspace_path, result_file))
-  end
-
-  defp read_worker_result!(%{worker_host: worker_host, workspace_path: workspace_path}, result_file)
-       when is_binary(worker_host) and is_binary(workspace_path) and is_binary(result_file) do
-    remote_result_path = Path.join(workspace_path, result_file)
-
-    case SSH.run(worker_host, "cat #{shell_escape(remote_result_path)}", stderr_to_stdout: true) do
-      {:ok, {output, 0}} ->
-        output
-
-      {:ok, {output, status}} ->
-        flunk("failed to read remote result from #{worker_host}:#{remote_result_path} (status #{status}): #{inspect(output)}")
-
-      {:error, reason} ->
-        flunk("failed to read remote result from #{worker_host}:#{remote_result_path}: #{inspect(reason)}")
-    end
-  end
-
-  defp shell_escape(value) when is_binary(value) do
-    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
-  end
-
-  defp run_live_issue_flow!(backend) when backend in [:local, :ssh] do
-    run_id = "symphony-live-e2e-#{backend}-#{System.unique_integer([:positive])}"
-    test_root = Path.join(System.tmp_dir!(), run_id)
-    workflow_root = Path.join(test_root, "workflow")
-    workflow_file = Path.join(workflow_root, "WORKFLOW.md")
-    worker_setup = live_worker_setup!(backend, run_id, test_root)
-    team_key = System.get_env("SYMPHONY_LIVE_LINEAR_TEAM_KEY") || @default_team_key
-    original_workflow_path = Workflow.workflow_file_path()
-    orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
-
-    File.mkdir_p!(workflow_root)
-
-    try do
-      if is_pid(orchestrator_pid) do
-        assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
-      end
-
-      Workflow.set_workflow_file_path(workflow_file)
-
-      write_workflow_file!(workflow_file,
-        tracker_api_token: "$LINEAR_API_KEY",
-        tracker_project_slug: "bootstrap",
-        workspace_root: worker_setup.workspace_root,
-        worker_ssh_hosts: worker_setup.ssh_worker_hosts,
-        codex_command: worker_setup.codex_command,
-        codex_approval_policy: "never",
-        observability_enabled: false
-      )
-
-      team = fetch_team!(team_key)
-      active_state = active_state!(team)
-      completed_project_status = completed_project_status!()
-      terminal_states = terminal_state_names(team)
-
-      project =
-        create_project!(
-          team["id"],
-          "Symphony Live E2E #{backend} #{System.unique_integer([:positive])}"
-        )
-
-      issue =
-        create_issue!(
-          team["id"],
-          project["id"],
-          active_state["id"],
-          "Symphony live e2e #{backend} issue for #{project["name"]}"
-        )
-
-      write_workflow_file!(workflow_file,
-        tracker_api_token: "$LINEAR_API_KEY",
-        tracker_project_slug: project["slugId"],
-        tracker_active_states: active_state_names(team),
-        tracker_terminal_states: terminal_states,
-        workspace_root: worker_setup.workspace_root,
-        worker_ssh_hosts: worker_setup.ssh_worker_hosts,
-        codex_command: worker_setup.codex_command,
-        codex_approval_policy: "never",
-        codex_turn_timeout_ms: 600_000,
-        codex_stall_timeout_ms: 600_000,
-        observability_enabled: false,
-        prompt: live_prompt(project["slugId"])
-      )
-
-      assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
-
-      runtime_info = receive_runtime_info!(issue.id)
-
-      assert read_worker_result!(runtime_info, @result_file) ==
-               expected_result(issue.identifier, project["slugId"])
-
-      issue_snapshot = fetch_issue_details!(issue.id)
-      assert issue_completed?(issue_snapshot)
-      assert issue_has_comment?(issue_snapshot, expected_comment(issue.identifier, project["slugId"]))
-
-      assert :ok = complete_project(project["id"], completed_project_status["id"])
-    after
-      restart_orchestrator_if_needed()
-      cleanup_live_worker_setup(worker_setup)
-      Workflow.set_workflow_file_path(original_workflow_path)
-      File.rm_rf(test_root)
-    end
-  end
-
-  defp live_worker_setup!(:local, _run_id, test_root) when is_binary(test_root) do
-    %{
-      cleanup: fn -> :ok end,
-      codex_command: "codex app-server",
-      ssh_worker_hosts: [],
-      workspace_root: Path.join(test_root, "workspaces")
-    }
-  end
-
-  defp live_worker_setup!(:ssh, run_id, test_root) when is_binary(run_id) and is_binary(test_root) do
-    case live_ssh_worker_hosts() do
-      [] ->
-        live_docker_worker_setup!(run_id, test_root)
-
-      _hosts ->
-        live_ssh_worker_setup!(run_id)
-    end
-  end
-
-  defp cleanup_live_worker_setup(%{cleanup: cleanup}) when is_function(cleanup, 0) do
-    cleanup.()
-  end
-
-  defp cleanup_live_worker_setup(_worker_setup), do: :ok
-
-  defp restart_orchestrator_if_needed do
-    if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
-      case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
-        {:ok, _pid} -> :ok
-        {:error, {:already_started, _pid}} -> :ok
-      end
-    end
-  end
-
-  defp live_ssh_worker_setup!(run_id) when is_binary(run_id) do
-    ssh_worker_hosts = live_ssh_worker_hosts()
-    remote_test_root = Path.join(shared_remote_home!(ssh_worker_hosts), ".#{run_id}")
-    remote_workspace_root = "~/.#{run_id}/workspaces"
-
-    %{
-      cleanup: fn -> cleanup_remote_test_root(remote_test_root, ssh_worker_hosts) end,
-      codex_command: "codex app-server",
-      ssh_worker_hosts: ssh_worker_hosts,
-      workspace_root: remote_workspace_root
-    }
-  end
-
-  defp live_docker_worker_setup!(run_id, test_root) when is_binary(run_id) and is_binary(test_root) do
-    ssh_root = Path.join(test_root, "live-docker-ssh")
-    key_path = Path.join(ssh_root, "id_ed25519")
-    config_path = Path.join(ssh_root, "config")
-    auth_json_path = @default_docker_auth_json
-    worker_ports = reserve_tcp_ports(@docker_worker_count)
-    worker_hosts = Enum.map(worker_ports, &"localhost:#{&1}")
-    project_name = docker_project_name(run_id)
-    previous_ssh_config = System.get_env("SYMPHONY_SSH_CONFIG")
-
-    base_cleanup = fn ->
-      restore_env("SYMPHONY_SSH_CONFIG", previous_ssh_config)
-      docker_compose_down(project_name, docker_compose_env(worker_ports, auth_json_path, key_path <> ".pub"))
-    end
-
-    result =
-      try do
-        File.mkdir_p!(ssh_root)
-        generate_ssh_keypair!(key_path)
-        write_docker_ssh_config!(config_path, key_path)
-        System.put_env("SYMPHONY_SSH_CONFIG", config_path)
-
-        docker_compose_up!(project_name, docker_compose_env(worker_ports, auth_json_path, key_path <> ".pub"))
-        wait_for_ssh_hosts!(worker_hosts)
-        remote_test_root = Path.join(shared_remote_home!(worker_hosts), ".#{run_id}")
-        remote_workspace_root = "~/.#{run_id}/workspaces"
-
-        %{
-          cleanup: fn ->
-            cleanup_remote_test_root(remote_test_root, worker_hosts)
-            base_cleanup.()
-          end,
-          codex_command: "codex app-server",
-          ssh_worker_hosts: worker_hosts,
-          workspace_root: remote_workspace_root
+        completed = %{
+          "method" => "turn/completed",
+          "params" => %{"turn" => %{"id" => state.turn, "status" => "completed"}}
         }
-      rescue
-        error ->
-          {:error, error, __STACKTRACE__}
-      catch
-        kind, reason ->
-          {:caught, kind, reason, __STACKTRACE__}
+
+        {%{state | phase: :completed}, [usage, completed]}
       end
 
-    case result do
-      %{ssh_worker_hosts: _hosts} = worker_setup ->
-        worker_setup
+      defp handle(_message, state), do: {state, []}
 
-      {:error, error, stacktrace} ->
-        base_cleanup.()
-        reraise(error, stacktrace)
+      defp transition(state, revision) do
+        target =
+          Map.fetch!(
+            %{
+              "implementation" => "automated_review",
+              "automated_review" => "human_review",
+              "rework" => "automated_review",
+              "merging" => "done"
+            },
+            state.stage
+          )
 
-      {:caught, kind, reason, stacktrace} ->
-        base_cleanup.()
-        :erlang.raise(kind, reason, stacktrace)
-    end
-  end
+        args = %{"column_id" => target, "expected_revision" => revision}
+        {%{state | phase: :transition}, tool_call("#{state.run_id}:transition", "symphony_task_transition", args)}
+      end
 
-  defp live_ssh_worker_hosts do
-    System.get_env("SYMPHONY_LIVE_SSH_WORKER_HOSTS", "")
-    |> String.split(",", trim: true)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-  end
+      defp tool_call(id, tool, arguments) do
+        %{"id" => id, "method" => "item/tool/call", "params" => %{"tool" => tool, "arguments" => arguments}}
+      end
 
-  defp cleanup_remote_test_root(test_root, ssh_worker_hosts)
-       when is_binary(test_root) and is_list(ssh_worker_hosts) do
-    Enum.each(ssh_worker_hosts, fn worker_host ->
-      _ = SSH.run(worker_host, "rm -rf #{shell_escape(test_root)}", stderr_to_stdout: true)
-    end)
-  end
+      defp successful_output!(%{"success" => true, "output" => output}), do: Jason.decode!(output)
+      defp successful_output!(result), do: raise("fake Codex tool failed: #{inspect(result)}")
 
-  defp shared_remote_home!([first_host | rest] = worker_hosts) when is_binary(first_host) and rest != [] do
-    homes =
-      worker_hosts
-      |> Enum.map(fn worker_host -> {worker_host, remote_home!(worker_host)} end)
+      defp apply_source_effect("implementation", cwd), do: commit_change(cwd, 1, "implementation")
+      defp apply_source_effect("rework", cwd), do: commit_change(cwd, 2, "rework")
+      defp apply_source_effect("merging", cwd), do: merge_change(cwd)
+      defp apply_source_effect(_stage, _cwd), do: :ok
 
-    [{_host, home} | _remaining] = homes
+      defp commit_change(cwd, value, message) do
+        path = Path.join(cwd, "lib/live_e2e.ex")
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, "defmodule LiveE2E do\n  def value, do: #{value}\nend\n")
+        git!(cwd, ["config", "user.name", "Symphony Live E2E"])
+        git!(cwd, ["config", "user.email", "symphony-live@example.com"])
+        git!(cwd, ["add", "lib/live_e2e.ex"])
+        git!(cwd, ["commit", "-m", message])
+      end
 
-    if Enum.all?(homes, fn {_host, other_home} -> other_home == home end) do
-      home
-    else
-      flunk("expected all live SSH workers to share one home directory, got: #{inspect(homes)}")
-    end
-  end
+      defp merge_change(cwd) do
+        git!(cwd, ["fetch", "origin", "main"])
+        head = git!(cwd, ["rev-parse", "HEAD"])
+        base = git!(cwd, ["rev-parse", "origin/main"])
+        tree = git!(cwd, ["rev-parse", "HEAD^{tree}"])
 
-  defp shared_remote_home!([worker_host]) when is_binary(worker_host), do: remote_home!(worker_host)
-  defp shared_remote_home!(_worker_hosts), do: flunk("expected at least one live SSH worker host")
+        env = [
+          {"GIT_AUTHOR_NAME", "Symphony Live E2E"},
+          {"GIT_AUTHOR_EMAIL", "symphony-live@example.com"},
+          {"GIT_COMMITTER_NAME", "Symphony Live E2E"},
+          {"GIT_COMMITTER_EMAIL", "symphony-live@example.com"}
+        ]
 
-  defp remote_home!(worker_host) when is_binary(worker_host) do
-    case SSH.run(worker_host, "printf '%s\\n' \"$HOME\"", stderr_to_stdout: true) do
-      {:ok, {output, 0}} ->
-        output
-        |> String.trim()
-        |> case do
-          "" -> flunk("expected non-empty remote home for #{worker_host}")
-          home -> home
+        {merge_sha, 0} =
+          System.cmd("git", ["-C", cwd, "commit-tree", tree, "-p", base, "-p", head, "-m", "merge live E2E"],
+            env: env,
+            stderr_to_stdout: true
+          )
+
+        merge_sha = String.trim(merge_sha)
+        git!(cwd, ["push", "origin", "#{merge_sha}:refs/heads/main"])
+        state = System.fetch_env!("FAKE_GH_STATE")
+        File.write!(Path.join(state, "merge_sha"), merge_sha <> "\n")
+        File.touch!(Path.join(state, "merged"))
+      end
+
+      defp git!(cwd, args) do
+        case System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true) do
+          {output, 0} -> String.trim(output)
+          {output, status} -> raise("git failed #{status}: #{output}")
         end
-
-      {:ok, {output, status}} ->
-        flunk("failed to resolve remote home for #{worker_host} (status #{status}): #{inspect(output)}")
-
-      {:error, reason} ->
-        flunk("failed to resolve remote home for #{worker_host}: #{inspect(reason)}")
+      end
     end
-  end
 
-  defp reserve_tcp_ports(count) when is_integer(count) and count > 0 do
-    reserve_tcp_ports(count, MapSet.new(), [])
-  end
-
-  defp reserve_tcp_ports(0, _seen, ports), do: Enum.reverse(ports)
-
-  defp reserve_tcp_ports(remaining, seen, ports) do
-    port = reserve_tcp_port!()
-
-    if MapSet.member?(seen, port) do
-      reserve_tcp_ports(remaining, seen, ports)
-    else
-      reserve_tcp_ports(remaining - 1, MapSet.put(seen, port), [port | ports])
-    end
-  end
-
-  defp reserve_tcp_port! do
-    {:ok, socket} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}])
-    {:ok, port} = :inet.port(socket)
-    :ok = :gen_tcp.close(socket)
-    port
-  end
-
-  defp generate_ssh_keypair!(key_path) when is_binary(key_path) do
-    case System.find_executable("ssh-keygen") do
-      nil ->
-        flunk("docker worker mode requires `ssh-keygen` on PATH")
-
-      executable ->
-        key_dir = Path.dirname(key_path)
-        File.mkdir_p!(key_dir)
-        File.rm_rf(key_path)
-        File.rm_rf(key_path <> ".pub")
-
-        case System.cmd(executable, ["-q", "-t", "ed25519", "-N", "", "-f", key_path], stderr_to_stdout: true) do
-          {_output, 0} -> :ok
-          {output, status} -> flunk("failed to generate live docker ssh key (status #{status}): #{inspect(output)}")
-        end
-    end
-  end
-
-  defp write_docker_ssh_config!(config_path, key_path)
-       when is_binary(config_path) and is_binary(key_path) do
-    config_contents = """
-    Host localhost 127.0.0.1
-      User root
-      IdentityFile #{key_path}
-      IdentitiesOnly yes
-      StrictHostKeyChecking no
-      UserKnownHostsFile /dev/null
-      LogLevel ERROR
+    SymphonyLiveFakeCodex.main()
     """
-
-    File.mkdir_p!(Path.dirname(config_path))
-    File.write!(config_path, config_contents)
-  end
-
-  defp docker_project_name(run_id) when is_binary(run_id) do
-    run_id
-    |> String.downcase()
-    |> String.replace(~r/[^a-z0-9_-]/, "-")
-  end
-
-  defp docker_compose_env(worker_ports, auth_json_path, authorized_key_path)
-       when is_list(worker_ports) and is_binary(auth_json_path) and is_binary(authorized_key_path) do
-    [
-      {"SYMPHONY_LIVE_DOCKER_AUTH_JSON", auth_json_path},
-      {"SYMPHONY_LIVE_DOCKER_AUTHORIZED_KEY", authorized_key_path},
-      {"SYMPHONY_LIVE_DOCKER_WORKER_1_PORT", Integer.to_string(Enum.at(worker_ports, 0))},
-      {"SYMPHONY_LIVE_DOCKER_WORKER_2_PORT", Integer.to_string(Enum.at(worker_ports, 1))}
-    ]
-  end
-
-  defp docker_compose_up!(project_name, env) when is_binary(project_name) and is_list(env) do
-    args = ["compose", "-f", @docker_compose_file, "-p", project_name, "up", "-d", "--build"]
-
-    case System.cmd("docker", args, cd: @docker_support_dir, env: env, stderr_to_stdout: true) do
-      {_output, 0} ->
-        :ok
-
-      {output, status} ->
-        flunk("failed to start live docker workers (status #{status}): #{inspect(output)}")
-    end
-  end
-
-  defp docker_compose_down(project_name, env) when is_binary(project_name) and is_list(env) do
-    _ =
-      System.cmd(
-        "docker",
-        ["compose", "-f", @docker_compose_file, "-p", project_name, "down", "-v", "--remove-orphans"],
-        cd: @docker_support_dir,
-        env: env,
-        stderr_to_stdout: true
-      )
-
-    :ok
-  end
-
-  defp wait_for_ssh_hosts!(worker_hosts) when is_list(worker_hosts) do
-    deadline = System.monotonic_time(:millisecond) + 60_000
-
-    Enum.each(worker_hosts, fn worker_host ->
-      wait_for_ssh_host!(worker_host, deadline)
-    end)
-  end
-
-  defp wait_for_ssh_host!(worker_host, deadline_ms) when is_binary(worker_host) do
-    case SSH.run(worker_host, "printf ready", stderr_to_stdout: true) do
-      {:ok, {"ready", 0}} ->
-        :ok
-
-      {:ok, {_output, _status}} ->
-        retry_or_flunk_ssh_host(worker_host, deadline_ms)
-
-      {:error, _reason} ->
-        retry_or_flunk_ssh_host(worker_host, deadline_ms)
-    end
-  end
-
-  defp retry_or_flunk_ssh_host(worker_host, deadline_ms) do
-    if System.monotonic_time(:millisecond) < deadline_ms do
-      Process.sleep(1_000)
-      wait_for_ssh_host!(worker_host, deadline_ms)
-    else
-      flunk("timed out waiting for SSH worker #{worker_host} to accept connections")
-    end
   end
 end

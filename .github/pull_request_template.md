@@ -19,4 +19,6 @@
 #### Test Plan
 
 - [ ] `make -C elixir all`
-- [ ] <!-- Additional targeted checks (list below) -->
+- [ ] `cd elixir && mix specs.check`
+- [ ] Targeted Git history/projection, worktree, GitHub, and LiveView checks listed below
+- [ ] Opt-in live E2E, when external source/board remotes or Codex behavior changed

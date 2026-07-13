@@ -173,7 +173,7 @@ These are safe high-water-mark style counters:
 
 Use these when you want:
 
-- live dashboard totals
+- live board totals
 - stable per-thread accumulation
 - recovery after missed intermediate events
 
@@ -252,13 +252,13 @@ If you misclassify a per-turn `usage` payload as an absolute thread total, later
 
 - Prefer `thread/tokenUsage/updated` for live reporting.
 - Treat `tokenUsage.total` as authoritative for thread totals.
-- Key accounting by `thread_id`, not just issue id.
+- Key accounting by `thread_id`, not just task ID.
 - Expect one thread to span multiple turns when Symphony reuses a live Codex thread.
 
 ### Do not
 
 - Do not treat every `usage` map as absolute.
-- Do not count `tokenUsage.last` or `last_token_usage` into dashboard totals.
+- Do not count `tokenUsage.last` or `last_token_usage` into board totals.
 - Do not add turn-completed `usage` on top of already-counted live thread totals unless you can prove it represents missing spend.
 - Do not reset accounting just because a new turn starts on the same thread.
 
@@ -269,7 +269,7 @@ When reading raw app-server events:
 - `codex/event/token_count`
   - useful if you are inspecting nested `info.total_token_usage`
 - `thread/tokenUsage/updated`
-  - best source for live dashboard and API totals
+  - best source for live board and API totals
 - `turn/completed`
   - best used as end-of-turn state, not as an unconditional additive token event
 
@@ -285,14 +285,51 @@ That is a strong signal for Symphony:
 - use absolute totals as the main accounting surface
 - ignore last/delta values for totals
 
-## Recommended Symphony Documentation Contract
+## Symphony Persistence And Publication Contract
 
-If Symphony documents token reporting externally, the contract should be:
+Symphony implements the following accounting contract:
 
-- Live token totals come from Codex thread-scoped cumulative usage.
-- Incremental usage may also be emitted, but Symphony does not use it for totals.
-- Turn-completed usage is event-specific and should not be assumed to be a fresh additive increment.
-- Reporting is thread-based, and multiple turns can occur on one thread.
+- Accept only `thread/tokenUsage/updated.params.tokenUsage.total` as the primary live snapshot, with
+  nested `info.total_token_usage` as the compatibility fallback.
+- Normalize camel- and snake-case input, cached-input, output, and total token fields.
+- Replace the stored snapshot only when its cumulative total is greater than or equal to the current
+  high-water mark. Never add a delta to it.
+- Ignore generic `usage`, `tokenUsage.last`, `last_token_usage`, and turn-completion usage.
+- Count unique turn IDs while allowing one Codex thread to span multiple turns.
+- Persist the live high-water mark and turn IDs in SQLite so runner crashes and orphan recovery retain
+  them. Finalization copies the summary into the Git-backed `RunFinished` or `RunFailed` event and
+  removes the transient telemetry row.
+- Store `token_usage: null` when no authoritative cumulative total was observed. Zero is reserved for
+  an explicit zero reported by Codex.
+
+## Project Aggregation And Live Presentation
+
+The board builds effective run statistics without adding a second durable accounting source:
+
+- Terminal runs use canonical `run.stats`; active runs use the SQLite high-water mark and elapsed
+  time since `started_at`, falling back to `claimed_at`.
+- Task and project totals include every run, including archived tasks. Sum the authoritative input,
+  cached-input, output, and total fields independently; cached input is informational and is never
+  added to total again.
+- An aggregate with usage for every included run is `complete`. Some known and some missing runs is
+  `partial`; no authoritative usage from any included run is `unavailable`. A collection with no
+  runs is an exact zero. The UI renders partial totals as a lower bound (`≥`) and unavailable totals
+  as `—`.
+- Agent time is additive across runs and can exceed project age or service uptime when work overlaps.
+  Project age begins at the earliest run claim. Service uptime, safe latest activity, and rate-limit
+  snapshots are operational and reset when the orchestrator restarts.
+- Rate limits are retained per local/SSH worker. Activity summaries expose bounded lifecycle labels,
+  never raw prompts, reasoning, command output, workpads, or arbitrary protocol payloads.
+
+`GET /api/v1/state` exposes project/runtime/task summaries under `stats`. Task responses retain
+canonical run `stats` and add `effective_stats` plus optional safe `activity` for live display.
+
+Completed, stopped, and failed runs expose duration, turn count, and cumulative usage through the
+board/API. After termination, the run that created the PR is appended once to the managed PR body;
+other runs are appended once to the existing GitHub comment identified by their workpad publication
+marker. Runs without a published workpad remain local. Hidden per-run markers make GitHub retries
+idempotent, and a successful destination/publication ID/timestamp is recorded canonically. Symphony
+does not publish Codex thread IDs or pricing estimates.
 
 ## Implementation Checklist
 
@@ -302,3 +339,5 @@ If Symphony documents token reporting externally, the contract should be:
 - Key totals by `thread_id`
 - Do not classify generic `usage` by field name alone
 - Do not double-count turn-completed usage after live updates
+- Persist terminal usage as `null` when no authoritative snapshot arrived
+- Route creator stats to the PR body and other stats only to an existing published-workpad comment

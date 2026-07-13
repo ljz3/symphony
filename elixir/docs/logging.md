@@ -1,40 +1,67 @@
 # Logging Best Practices
 
-This guide defines logging conventions for Symphony so Codex can diagnose failures quickly.
+This guide defines stable, searchable logging conventions for the Git-backed Symphony runtime.
 
 ## Goals
 
-- Make logs searchable by issue and session.
-- Capture enough execution context to identify root cause without reruns.
-- Keep messages stable so dashboards/alerts are reliable.
+- Correlate one project, task, run, Codex session, and worker without reconstructing state manually.
+- Capture enough lifecycle and event-history context to diagnose failures after restart.
+- Keep recurring messages stable enough for operational searches and alerts.
+- Avoid leaking prompts, workpads, credentials, or large protocol payloads.
 
-## Required Context Fields
+## Context fields
 
-When logging issue-related work, include both identifiers:
+Include these fields whenever they apply:
 
-- `issue_id`: Linear internal UUID (stable foreign key).
-- `issue_identifier`: human ticket key (for example `MT-620`).
+- `project_id`: immutable workflow project ID.
+- `task_id`: internal task UUID.
+- `task_identifier`: human identifier such as `SYM-42`.
+- `run_id`: durable stage-run UUID.
+- `stage_id`: named workflow stage.
+- `session_id`: Codex thread ID, or the established thread/turn correlation value.
+- `mcp_request_key`: non-sensitive hash used to correlate one MCP JSON-RPC request and its idempotent replay.
+- `worker_host`: `local` or the selected SSH host.
 
-When logging Codex execution lifecycle events, include:
+For canonical board writes and recovery, also include:
 
-- `session_id`: combined Codex thread/turn identifier.
+- `event_sequence`: global event sequence.
+- `event_id`: immutable event UUID.
+- `event_oid`: Git commit OID when known.
+- `task_revision`: optimistic-concurrency revision.
 
-## Message Design
+For external effects, include the durable saga/effect identifier and PR number when available.
 
-- Use explicit `key=value` pairs in message text for high-signal fields.
-- Prefer deterministic wording for recurring lifecycle events.
-- Include the action outcome (`completed`, `failed`, `retrying`) and the reason/error when available.
-- Avoid logging large payloads unless required for debugging.
+## Message design
 
-## Scope Guidance
+- Use explicit `key=value` pairs for high-signal fields.
+- Use deterministic lifecycle wording and state the outcome: `completed`, `failed`, `blocked`,
+  `waiting`, or `recovered`.
+- Include one concise reason for failure or gating.
+- Distinguish desired board state from observed runtime state while an agent is stopping.
+- Describe optional board-remote and GitHub publication backoff as sync/publication retry, never as
+  an agent retry.
+- Never log GitHub tokens, Codex auth data, entire prompts, full workpads, or arbitrary tool payloads.
 
-- `AgentRunner`: log start/completion/failure with issue context, plus `session_id` when known.
-- `Orchestrator`: log dispatch, retry, terminal/non-active transitions, and worker exits with issue context. Include `session_id` whenever running-entry data has it.
-- `Codex.AppServer`: log session start/completion/error with issue context and `session_id`.
+## Module guidance
 
-## Checklist For New Logs
+- `Board.Writer` and `Board.History`: command acceptance, event commit/projection, CAS failure,
+  replay, checkpoint, divergence, and reconciliation with event and revision context.
+- `Orchestrator`: dispatch gates, claim, dependency/capacity decisions, stop requests, orphan
+  recovery, external-effect progress, worker exit, and terminal cleanup with task/run context.
+- `AgentRunner`: invocation start/completion/blocking with task/run/stage/worker context and
+  `session_id` once known.
+- `Codex.AppServer`: session/turn lifecycle and protocol errors with task/run/session context.
+- `MCP.Handler`: guarded task-creation completion/failure with MCP session/request correlation and
+  created task identifiers; never log tool arguments or task content.
+- `Worktree`: managed path, branch, source head, hook, cleanup, and safety rejection with task and
+  worker context.
+- `Board.Sync` and `GitHub`: remote/OID state, publication wait, readiness gates, and PR effects.
 
-- Is this event tied to a Linear issue? Include `issue_id` and `issue_identifier`.
-- Is this event tied to a Codex session? Include `session_id`.
-- Is the failure reason present and concise?
-- Is the message format consistent with existing lifecycle logs?
+## Checklist
+
+- Can this line be joined to `project_id`, `task_id`, and `task_identifier`?
+- For execution, are `run_id`, `stage_id`, `session_id`, and `worker_host` present when known?
+- For board durability, are sequence/event/OID/revision fields present when known?
+- Is the reason concise and safe to log?
+- Does the wording distinguish a blocked invocation from a remote publication wait?
+- Is the format consistent with nearby lifecycle logs?

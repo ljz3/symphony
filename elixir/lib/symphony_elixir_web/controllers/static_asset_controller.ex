@@ -1,6 +1,6 @@
 defmodule SymphonyElixirWeb.StaticAssetController do
   @moduledoc """
-  Serves the dashboard's embedded CSS and JavaScript assets.
+  Serves the board's embedded CSS and JavaScript assets.
   """
 
   use Phoenix.Controller, formats: []
@@ -8,8 +8,8 @@ defmodule SymphonyElixirWeb.StaticAssetController do
   alias Plug.Conn
   alias SymphonyElixirWeb.StaticAssets
 
-  @spec dashboard_css(Conn.t(), map()) :: Conn.t()
-  def dashboard_css(conn, _params), do: serve(conn, "/dashboard.css")
+  @spec board_css(Conn.t(), map()) :: Conn.t()
+  def board_css(conn, _params), do: serve(conn, "/board.css")
 
   @spec favicon(Conn.t(), map()) :: Conn.t()
   def favicon(conn, _params), do: serve(conn, "/favicon.png")

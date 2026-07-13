@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.HttpServer do
   @moduledoc """
-  Compatibility facade that starts the Phoenix observability endpoint when enabled.
+  Starts the loopback-only Phoenix Kanban endpoint when enabled.
   """
 
   alias SymphonyElixir.{Config, Orchestrator}
@@ -20,11 +20,12 @@ defmodule SymphonyElixir.HttpServer do
   def start_link(opts \\ []) do
     case Keyword.get(opts, :port, Config.server_port()) do
       port when is_integer(port) and port >= 0 ->
-        host = Keyword.get(opts, :host, Config.settings!().server.host)
+        host = Keyword.get(opts, :host, "127.0.0.1")
         orchestrator = Keyword.get(opts, :orchestrator, Orchestrator)
         snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
 
-        with {:ok, ip} <- parse_host(host) do
+        with {:ok, ip} <- parse_host(host),
+             true <- loopback?(ip) do
           endpoint_opts = [
             server: true,
             http: [ip: ip, port: port],
@@ -41,6 +42,9 @@ defmodule SymphonyElixir.HttpServer do
 
           Application.put_env(:symphony_elixir, Endpoint, endpoint_config)
           Endpoint.start_link()
+        else
+          false -> {:error, {:non_loopback_http_host, host}}
+          {:error, reason} -> {:error, reason}
         end
 
       _ ->
@@ -81,6 +85,10 @@ defmodule SymphonyElixir.HttpServer do
   defp normalize_host(host) when host in ["", nil], do: "127.0.0.1"
   defp normalize_host(host) when is_binary(host), do: host
   defp normalize_host(host), do: to_string(host)
+
+  defp loopback?({127, _second, _third, _fourth}), do: true
+  defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp loopback?(_ip), do: false
 
   defp secret_key_base do
     Base.encode64(:crypto.strong_rand_bytes(@secret_key_bytes), padding: false)

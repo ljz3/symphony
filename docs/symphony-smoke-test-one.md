@@ -1,3 +1,4 @@
 # Symphony Smoke Test
 
-Symphony picked up Jira issue SD-4 and handled it by adding this isolated smoke-test doc.
+Symphony created a local Kanban task and completed this isolated documentation change in its managed
+task worktree.

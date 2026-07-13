@@ -1,11 +1,11 @@
 defmodule SymphonyElixir.Workflow do
   @moduledoc """
-  Loads workflow configuration and prompt from WORKFLOW.md.
+  Loads the strict `WORKFLOW.yml` configuration and referenced Solid templates.
   """
 
-  alias SymphonyElixir.WorkflowStore
+  alias SymphonyElixir.Workflow.{Bundle, Store}
 
-  @workflow_file_name "WORKFLOW.md"
+  @workflow_file_name "WORKFLOW.yml"
 
   @spec workflow_file_path() :: Path.t()
   def workflow_file_path do
@@ -15,7 +15,7 @@ defmodule SymphonyElixir.Workflow do
 
   @spec set_workflow_file_path(Path.t()) :: :ok
   def set_workflow_file_path(path) when is_binary(path) do
-    Application.put_env(:symphony_elixir, :workflow_file_path, path)
+    Application.put_env(:symphony_elixir, :workflow_file_path, Path.expand(path))
     maybe_reload_store()
     :ok
   end
@@ -27,97 +27,82 @@ defmodule SymphonyElixir.Workflow do
     :ok
   end
 
-  @type loaded_workflow :: %{
-          config: map(),
-          prompt: String.t(),
-          prompt_template: String.t()
-        }
-
-  @spec current() :: {:ok, loaded_workflow()} | {:error, term()}
+  @spec current() :: {:ok, Bundle.t()} | {:error, term()}
   def current do
-    case Process.whereis(WorkflowStore) do
-      pid when is_pid(pid) ->
-        WorkflowStore.current()
-
-      _ ->
-        load()
+    case Process.whereis(Store) do
+      pid when is_pid(pid) -> Store.current()
+      _ -> load()
     end
   end
 
-  @spec load() :: {:ok, loaded_workflow()} | {:error, term()}
-  def load do
-    load(workflow_file_path())
-  end
+  @spec load() :: {:ok, Bundle.t()} | {:error, term()}
+  def load, do: load(workflow_file_path())
 
-  @spec load(Path.t()) :: {:ok, loaded_workflow()} | {:error, term()}
+  @spec load(Path.t()) :: {:ok, Bundle.t()} | {:error, term()}
   def load(path) when is_binary(path) do
-    case File.read(path) do
-      {:ok, content} ->
-        parse(content)
+    expanded_path = Path.expand(path)
 
-      {:error, reason} ->
-        {:error, {:missing_workflow_file, path, reason}}
+    with {:ok, content} <- read_workflow(expanded_path),
+         {:ok, decoded} <- decode_yaml(content) do
+      Bundle.load(decoded, expanded_path)
     end
   end
 
-  defp parse(content) do
-    {front_matter_lines, prompt_lines} = split_front_matter(content)
+  @spec project_identity() :: {:ok, %{id: String.t(), key: String.t()}} | {:error, term()}
+  def project_identity do
+    path = workflow_file_path()
 
-    case front_matter_yaml_to_map(front_matter_lines) do
-      {:ok, front_matter} ->
-        prompt = Enum.join(prompt_lines, "\n") |> String.trim()
-
-        {:ok,
-         %{
-           config: front_matter,
-           prompt: prompt,
-           prompt_template: prompt
-         }}
-
-      {:error, :workflow_front_matter_not_a_map} ->
-        {:error, :workflow_front_matter_not_a_map}
-
-      {:error, reason} ->
-        {:error, {:workflow_parse_error, reason}}
-    end
-  end
-
-  defp split_front_matter(content) do
-    lines = String.split(content, ~r/\R/, trim: false)
-
-    case lines do
-      ["---" | tail] ->
-        {front, rest} = Enum.split_while(tail, &(&1 != "---"))
-
-        case rest do
-          ["---" | prompt_lines] -> {front, prompt_lines}
-          _ -> {front, []}
-        end
-
-      _ ->
-        {[], lines}
-    end
-  end
-
-  defp front_matter_yaml_to_map(lines) do
-    yaml = Enum.join(lines, "\n")
-
-    if String.trim(yaml) == "" do
-      {:ok, %{}}
+    with {:ok, content} <- read_workflow(path),
+         {:ok, decoded} <- decode_yaml(content),
+         %{} = project <- Map.get(decoded, "project"),
+         id when is_binary(id) <- Map.get(project, "id"),
+         key when is_binary(key) <- Map.get(project, "key"),
+         :ok <- validate_identity(id, key) do
+      {:ok, %{id: id, key: key}}
     else
-      case YamlElixir.read_from_string(yaml) do
-        {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
-        {:ok, _} -> {:error, :workflow_front_matter_not_a_map}
-        {:error, reason} -> {:error, reason}
-      end
+      nil -> {:error, :missing_project}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_project_identity}
     end
   end
+
+  defp read_workflow(path) do
+    case File.read(path) do
+      {:ok, content} -> {:ok, content}
+      {:error, reason} -> {:error, {:missing_workflow_file, path, reason}}
+    end
+  end
+
+  defp decode_yaml(content) do
+    case YamlElixir.read_from_string(content) do
+      {:ok, decoded} when is_map(decoded) -> {:ok, stringify_keys(decoded)}
+      {:ok, _decoded} -> {:error, :workflow_document_not_a_map}
+      {:error, reason} -> {:error, {:workflow_parse_error, reason}}
+    end
+  end
+
+  defp validate_identity(id, key) do
+    cond do
+      not Regex.match?(~r/\A[a-zA-Z0-9][a-zA-Z0-9._-]*\z/, id) ->
+        {:error, :invalid_project_id}
+
+      not Regex.match?(~r/\A[A-Z][A-Z0-9]*\z/, key) ->
+        {:error, :invalid_project_key}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp stringify_keys(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {to_string(key), stringify_keys(nested)} end)
+  end
+
+  defp stringify_keys(value) when is_list(value), do: Enum.map(value, &stringify_keys/1)
+  defp stringify_keys(value), do: value
 
   defp maybe_reload_store do
-    if Process.whereis(WorkflowStore) do
-      _ = WorkflowStore.force_reload()
-    end
-
+    if Process.whereis(Store), do: Store.force_reload()
     :ok
   end
 end

@@ -1,24 +1,12 @@
 defmodule SymphonyElixir.Config do
   @moduledoc """
-  Runtime configuration loaded from `WORKFLOW.md`.
+  Runtime accessors for the active `WORKFLOW.yml` bundle and local overrides.
   """
 
+  alias SymphonyElixir.AgentStage
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Workflow
-
-  @default_prompt_template """
-  You are working on a Linear issue.
-
-  Identifier: {{ issue.identifier }}
-  Title: {{ issue.title }}
-
-  Body:
-  {% if issue.description %}
-  {{ issue.description }}
-  {% else %}
-  No description provided.
-  {% endif %}
-  """
+  alias SymphonyElixir.Workflow.Bundle
 
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
@@ -26,188 +14,130 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
-  @type codex_selection :: %{model: String.t() | nil, effort: String.t() | nil}
+  @type codex_selection :: %{model: String.t(), effort: String.t()}
 
-  @type codex_selection_error ::
-          {:model_not_permitted, String.t()}
-          | {:effort_not_permitted, String.t()}
-          | {:model_effort_not_permitted, String.t(), String.t()}
+  @spec bundle() :: {:ok, Bundle.t()} | {:error, term()}
+  def bundle, do: Workflow.current()
+
+  @spec bundle!() :: Bundle.t()
+  def bundle! do
+    case bundle() do
+      {:ok, bundle} -> bundle
+      {:error, reason} -> raise ArgumentError, format_config_error(reason)
+    end
+  end
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
-    case Workflow.current() do
-      {:ok, %{config: config}} when is_map(config) ->
-        Schema.parse(config)
-
-      {:error, reason} ->
-        {:error, reason}
+    case bundle() do
+      {:ok, bundle} -> {:ok, Schema.from_bundle(bundle)}
+      {:error, reason} -> {:error, reason}
     end
   end
 
   @spec settings!() :: Schema.t()
   def settings! do
     case settings() do
-      {:ok, settings} ->
-        settings
-
-      {:error, reason} ->
-        raise ArgumentError, message: format_config_error(reason)
+      {:ok, settings} -> settings
+      {:error, reason} -> raise ArgumentError, format_config_error(reason)
     end
   end
 
-  @spec max_concurrent_agents_for_state(term()) :: pos_integer()
-  def max_concurrent_agents_for_state(state_name) when is_binary(state_name) do
-    config = settings!()
-
-    Map.get(
-      config.agent.max_concurrent_agents_by_state,
-      Schema.normalize_issue_state(state_name),
-      config.agent.max_concurrent_agents
-    )
+  @spec stage(String.t()) :: {:ok, AgentStage.t()} | {:error, term()}
+  def stage(stage_id) when is_binary(stage_id) do
+    case Map.fetch(bundle!().stages, stage_id) do
+      {:ok, stage} -> {:ok, stage}
+      :error -> {:error, {:unknown_stage, stage_id}}
+    end
   end
 
-  def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
-
-  @spec allowed_codex_model_efforts() :: %{required(String.t()) => [String.t()]}
-  def allowed_codex_model_efforts do
-    settings!().codex.allowed_model_efforts
+  @spec validate_codex_selection(String.t(), codex_selection()) :: :ok | {:error, term()}
+  def validate_codex_selection(stage_id, %{model: model, effort: effort}) do
+    with {:ok, stage} <- stage(stage_id) do
+      if AgentStage.permits?(stage, model, effort) do
+        :ok
+      else
+        {:error, {:model_effort_not_permitted, stage_id, model, effort}}
+      end
+    end
   end
 
-  @spec validate_codex_selection(codex_selection()) :: :ok | {:error, [codex_selection_error()]}
+  @doc false
+  @spec validate_codex_selection(codex_selection()) :: :ok | {:error, term()}
   def validate_codex_selection(%{model: model, effort: effort}) do
-    allowed_model_efforts = allowed_codex_model_efforts()
+    if Enum.any?(bundle!().stages, fn {_id, stage} -> AgentStage.permits?(stage, model, effort) end) do
+      :ok
+    else
+      {:error, {:model_effort_not_permitted, model, effort}}
+    end
+  end
 
-    errors =
-      []
-      |> maybe_add_model_error(model, allowed_model_efforts)
-      |> maybe_add_effort_error(effort, allowed_model_efforts)
-      |> maybe_add_pair_error(model, effort, allowed_model_efforts)
+  @doc false
+  @spec allowed_codex_model_efforts() :: %{optional(String.t()) => [String.t()]}
+  def allowed_codex_model_efforts do
+    Enum.reduce(bundle!().stages, %{}, fn {_id, stage}, acc ->
+      Map.merge(acc, stage.allowed_model_efforts, fn _model, left, right -> Enum.uniq(left ++ right) end)
+    end)
+  end
 
-    case errors do
-      [] -> :ok
-      _ -> {:error, errors}
+  @doc false
+  @spec max_concurrent_agents_for_state(term()) :: pos_integer()
+  def max_concurrent_agents_for_state(_state), do: settings!().agent.max_concurrent_agents
+
+  @doc false
+  @spec workflow_prompt() :: String.t()
+  def workflow_prompt do
+    bundle = bundle!()
+    Enum.join([bundle.base_prompt, bundle.context_prompt], "\n\n")
+  end
+
+  @spec server_port() :: non_neg_integer() | nil
+  def server_port do
+    case Application.get_env(:symphony_elixir, :server_port_override) || System.get_env("SYMPHONY_PORT") do
+      port when is_integer(port) and port >= 0 -> port
+      port when is_binary(port) -> parse_port(port)
+      _ -> nil
     end
   end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
-      {:ok, policy} ->
-        policy
-
-      {:error, reason} ->
-        raise ArgumentError, message: "Invalid codex turn sandbox policy: #{inspect(reason)}"
-    end
-  end
-
-  @spec workflow_prompt() :: String.t()
-  def workflow_prompt do
-    case Workflow.current() do
-      {:ok, %{prompt_template: prompt}} ->
-        if String.trim(prompt) == "", do: @default_prompt_template, else: prompt
-
-      _ ->
-        @default_prompt_template
-    end
-  end
-
-  @spec server_port() :: non_neg_integer() | nil
-  def server_port do
-    case Application.get_env(:symphony_elixir, :server_port_override) do
-      port when is_integer(port) and port >= 0 -> port
-      _ -> settings!().server.port
-    end
-  end
-
-  @spec validate!() :: :ok | {:error, term()}
-  def validate! do
-    with {:ok, settings} <- settings() do
-      validate_semantics(settings)
+      {:ok, policy} -> policy
+      {:error, reason} -> raise ArgumentError, "invalid Codex sandbox policy: #{inspect(reason)}"
     end
   end
 
   @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
-    with {:ok, settings} <- settings() do
-      with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
-        {:ok,
-         %{
-           approval_policy: settings.codex.approval_policy,
-           thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
-         }}
-      end
+    with {:ok, settings} <- settings(),
+         {:ok, policy} <- Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+      {:ok,
+       %{
+         approval_policy: settings.codex.approval_policy,
+         thread_sandbox: settings.codex.thread_sandbox,
+         turn_sandbox_policy: policy
+       }}
     end
   end
 
-  defp validate_semantics(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        :ok
+  @spec validate!() :: :ok | {:error, term()}
+  def validate! do
+    case bundle() do
+      {:ok, _bundle} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp maybe_add_model_error(errors, nil, _allowed_model_efforts), do: errors
-
-  defp maybe_add_model_error(errors, model, allowed_model_efforts) do
-    if Map.has_key?(allowed_model_efforts, model) do
-      errors
-    else
-      [{:model_not_permitted, model} | errors]
-    end
-  end
-
-  defp maybe_add_effort_error(errors, nil, _allowed_model_efforts), do: errors
-
-  defp maybe_add_effort_error(errors, effort, allowed_model_efforts) do
-    if Enum.any?(allowed_model_efforts, fn {_model, efforts} -> effort in efforts end) do
-      errors
-    else
-      [{:effort_not_permitted, effort} | errors]
-    end
-  end
-
-  defp maybe_add_pair_error(errors, nil, _effort, _allowed_model_efforts), do: errors
-  defp maybe_add_pair_error(errors, _model, nil, _allowed_model_efforts), do: errors
-
-  defp maybe_add_pair_error(errors, model, effort, allowed_model_efforts) do
-    if errors == [] and effort in Map.fetch!(allowed_model_efforts, model) do
-      errors
-    else
-      [{:model_effort_not_permitted, model, effort} | errors]
+  defp parse_port(port) do
+    case Integer.parse(port) do
+      {value, ""} when value >= 0 and value <= 65_535 -> value
+      _ -> nil
     end
   end
 
   defp format_config_error(reason) do
-    case reason do
-      {:invalid_workflow_config, message} ->
-        "Invalid WORKFLOW.md config: #{message}"
-
-      {:missing_workflow_file, path, raw_reason} ->
-        "Missing WORKFLOW.md at #{path}: #{inspect(raw_reason)}"
-
-      {:workflow_parse_error, raw_reason} ->
-        "Failed to parse WORKFLOW.md: #{inspect(raw_reason)}"
-
-      :workflow_front_matter_not_a_map ->
-        "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"
-
-      other ->
-        "Invalid WORKFLOW.md config: #{inspect(other)}"
-    end
+    "Invalid WORKFLOW.yml bundle: #{inspect(reason)}"
   end
 end

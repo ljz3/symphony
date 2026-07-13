@@ -1,7 +1,5 @@
 defmodule SymphonyElixirWeb.Router do
-  @moduledoc """
-  Router for Symphony's observability dashboard and API.
-  """
+  @moduledoc "Loopback-only Kanban UI and read-only JSON API router."
 
   use Phoenix.Router
   import Phoenix.LiveView.Router
@@ -15,7 +13,7 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
-    get("/dashboard.css", StaticAssetController, :dashboard_css)
+    get("/board.css", StaticAssetController, :board_css)
     get("/favicon.png", StaticAssetController, :favicon)
     get("/vendor/phoenix_html/phoenix_html.js", StaticAssetController, :phoenix_html_js)
     get("/vendor/phoenix/phoenix.js", StaticAssetController, :phoenix_js)
@@ -25,18 +23,21 @@ defmodule SymphonyElixirWeb.Router do
   scope "/", SymphonyElixirWeb do
     pipe_through(:browser)
 
-    live("/", DashboardLive, :index)
+    live("/", BoardLive, :index)
+    live("/stats", StatsLive, :index)
+    live("/tasks/:identifier", TaskLive, :show)
+    live("/archive", ArchiveLive, :index)
   end
 
   scope "/", SymphonyElixirWeb do
-    get("/api/v1/state", ObservabilityApiController, :state)
+    get("/api/v1/state", BoardApiController, :state)
+    get("/api/v1/tasks/:identifier", BoardApiController, :task)
+    post("/api/v1/refresh", BoardApiController, :refresh)
 
-    match(:*, "/", ObservabilityApiController, :method_not_allowed)
-    match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
-    post("/api/v1/refresh", ObservabilityApiController, :refresh)
-    match(:*, "/api/v1/refresh", ObservabilityApiController, :method_not_allowed)
-    get("/api/v1/:issue_identifier", ObservabilityApiController, :issue)
-    match(:*, "/api/v1/:issue_identifier", ObservabilityApiController, :method_not_allowed)
-    match(:*, "/*path", ObservabilityApiController, :not_found)
+    match(:*, "/", BoardApiController, :method_not_allowed)
+    match(:*, "/api/v1/state", BoardApiController, :method_not_allowed)
+    match(:*, "/api/v1/tasks/:identifier", BoardApiController, :method_not_allowed)
+    match(:*, "/api/v1/refresh", BoardApiController, :method_not_allowed)
+    match(:*, "/*path", BoardApiController, :not_found)
   end
 end

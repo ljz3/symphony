@@ -26,10 +26,16 @@ defmodule SymphonyElixir.Application do
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
-      SymphonyElixir.WorkflowStore,
+      SymphonyElixir.Workflow.Store,
+      SymphonyElixir.Repo,
+      SymphonyElixir.Board.Storage,
+      SymphonyElixir.Board.Lease,
+      SymphonyElixir.Board.Writer,
+      SymphonyElixir.MCP.Transport,
+      SymphonyElixir.Board.Sync,
+      SymphonyElixir.Codex.Catalog,
       SymphonyElixir.Orchestrator,
-      SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
+      SymphonyElixir.HttpServer
     ]
 
     Supervisor.start_link(
@@ -41,7 +47,16 @@ defmodule SymphonyElixir.Application do
 
   @impl true
   def stop(_state) do
-    SymphonyElixir.StatusDashboard.render_offline_status()
+    case Process.whereis(SymphonyElixir.Board.Writer) do
+      pid when is_pid(pid) -> maybe_checkpoint_on_shutdown()
+      nil -> :ok
+    end
+
+    :ok
+  end
+
+  defp maybe_checkpoint_on_shutdown do
+    unless SymphonyElixir.Board.busy?(), do: SymphonyElixir.Board.checkpoint()
     :ok
   end
 end

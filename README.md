@@ -1,46 +1,61 @@
 # Symphony
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
-
-[![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
-
-_In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
+Symphony turns project work into isolated, autonomous implementation runs. The reference service
+owns a local Kanban board, records every task action in Git, runs stage-specific Codex agents in
+persistent source worktrees, and coordinates pull requests through GitHub.
 
 > [!WARNING]
-> Symphony is a low-key engineering preview for testing in trusted environments.
+> Symphony is an engineering preview for trusted environments. It can run Codex unattended with
+> the permissions configured for a project; inspect the workflow and source repository before
+> starting it.
 
-## Running Symphony
+## Architecture
 
-### Requirements
+Symphony separates durable task authority from rebuildable runtime state:
 
-Symphony works best in codebases that have adopted
-[harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
-moving from managing coding agents to managing work that needs to get done.
+- A bare Git repository is the canonical, append-only event history.
+- SQLite is the local board projection and stores non-canonical run workpads.
+- Phoenix LiveView serves the loopback-only Kanban board, task editor, and live project statistics.
+- The same loopback listener exposes one guarded MCP tool for creating Backlog tasks from Codex.
+- One persistent Git worktree and immutable branch belong to each task.
+- A service-owned `gh` client creates draft pull requests, publishes workpads, checks review
+  readiness, and verifies merges.
+- Completed, stopped, and failed Codex runs retain canonical runtime/turn/token statistics; the PR
+  body or the run's published workpad comment exposes the same compact summary without extra comments.
+- The board and statistics view combine those durable summaries with active SQLite telemetry to show
+  all-time project/task usage, live agent time, safe activity, and current per-worker rate limits.
+- `WORKFLOW.yml` plus strict Solid Markdown templates define columns, transitions, stages, prompts,
+  model policy, and hooks.
 
-### Option 1. Make your own
+The standard flow is:
 
-Tell your favorite coding agent to build Symphony in a programming language of your choice:
+```text
+Backlog -> Todo -> In Progress -> Automated Review -> Human Review -> Merging -> Done
+                                \-> Rework ---------/
+```
 
-> Implement Symphony according to the following spec:
+Blocked and Cancelled are explicit side paths. A failed agent invocation moves the task to Blocked;
+there is no agent retry queue.
+
+See [SPEC.md](SPEC.md) for the behavioral contract and [elixir/README.md](elixir/README.md) for setup,
+operation, storage, and recovery instructions.
+
+## Clean break from the previous service
+
+This architecture does not import tasks or managed state from the former Linear-backed service.
+Existing external tasks and unmanaged workspace directories are neither imported nor deleted. Start
+with a new `WORKFLOW.yml` and create tasks on the embedded board. An empty `board.remote` and absent
+local board history mean “start a fresh embedded board,” not “migrate external task state.”
+
+## Reference implementation
+
+The current implementation is under [`elixir/`](elixir/). It requires Elixir 1.19/OTP 28, Git, an
+authenticated GitHub CLI, and Codex app-server.
+
+To implement a compatible service in another language, use the root specification:
+
+> Implement Symphony according to
 > https://github.com/openai/symphony/blob/main/SPEC.md
-
-### Option 2. Use our experimental reference implementation
-
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
-help with the setup:
-
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
-
-The reference implementation supports optional per-issue Codex overrides through Linear labels such
-as `model:gpt-5.5` and `effort:xhigh`. Each workflow declares the permitted model/effort
-combinations in `codex.allowed_model_efforts`; empty, conflicting, disallowed, or unavailable
-selections are explained in a Linear comment and moved to `Failed Need Assistance` before Codex
-begins work. Missing labels preserve the configured Codex settings.
-
----
 
 ## License
 

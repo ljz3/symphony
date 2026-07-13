@@ -1,0 +1,121 @@
+project:
+  id: symphony
+  key: SYM
+
+source:
+  remote: origin
+
+board:
+  remote:
+
+agent:
+  max_concurrent_agents: 10
+  max_turns_per_run: 20
+  ssh_hosts: []
+
+codex:
+  command: codex --config shell_environment_policy.inherit=all app-server
+  approval_policy: never
+  sandbox: workspace-write
+  network_access: true
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 5000
+  stall_timeout_ms: 300000
+
+prompts:
+  base: workflow/prompts/base.md
+  context: workflow/prompts/context.md
+
+stages:
+  implementation:
+    prompt: workflow/prompts/implementation.md
+    workpad: workflow/workpads/implementation.md
+    allowed_model_efforts:
+      gpt-5.5: [xhigh]
+  automated_review:
+    prompt: workflow/prompts/automated_review.md
+    workpad: workflow/workpads/automated_review.md
+    allowed_model_efforts:
+      gpt-5.5: [xhigh]
+  rework:
+    prompt: workflow/prompts/rework.md
+    workpad: workflow/workpads/rework.md
+    allowed_model_efforts:
+      gpt-5.5: [xhigh]
+  merging:
+    prompt: workflow/prompts/merging.md
+    workpad: workflow/workpads/merging.md
+    allowed_model_efforts:
+      gpt-5.5: [xhigh]
+
+columns:
+  - id: backlog
+    name: Backlog
+    role: pause
+    initial: true
+  - id: todo
+    name: Todo
+    role: dispatch
+    stage: implementation
+    on_claim: in_progress
+  - id: in_progress
+    name: In Progress
+    role: dispatch
+    stage: implementation
+  - id: automated_review
+    name: Automated Review
+    role: dispatch
+    stage: automated_review
+  - id: human_review
+    name: Human Review
+    role: pause
+    publish_workpad: true
+    mark_pr_ready: true
+  - id: rework
+    name: Rework
+    role: dispatch
+    stage: rework
+  - id: merging
+    name: Merging
+    role: dispatch
+    stage: merging
+  - id: blocked
+    name: Blocked
+    role: blocked
+  - id: done
+    name: Done
+    role: terminal
+    successful: true
+    satisfies_dependencies: true
+  - id: cancelled
+    name: Cancelled
+    role: terminal
+
+transitions:
+  human:
+    backlog: [todo, cancelled]
+    todo: [backlog, cancelled]
+    in_progress: [blocked, cancelled]
+    automated_review: [blocked, cancelled]
+    human_review: [rework, merging, cancelled]
+    rework: [blocked, cancelled]
+    merging: [blocked, cancelled]
+    blocked: []
+    done: []
+    cancelled: []
+  agent:
+    backlog: []
+    todo: []
+    in_progress: [automated_review, blocked]
+    automated_review: [human_review, rework, blocked]
+    human_review: []
+    rework: [automated_review, blocked]
+    merging: [done, blocked]
+    blocked: []
+    done: []
+    cancelled: []
+
+hooks:
+  before_run: cd elixir && mise exec -- mix deps.get
+  before_remove: cd elixir && mise exec -- mix workspace.before_remove
+  timeout_ms: 60000
