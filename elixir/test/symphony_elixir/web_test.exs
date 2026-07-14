@@ -167,8 +167,96 @@ defmodule SymphonyElixirWebTest do
              )
   end
 
+  test "task HTML renders every workpad invocation for completed, failed, and stopped runs without exposing content in JSON" do
+    Enum.each(["completed", "failed", "stopped"], fn status ->
+      {task, run, contents} = terminal_run_with_workpads(status)
+      detail = html_response(build_conn() |> get("/tasks/#{task["identifier"]}"), 200)
+
+      assert detail =~ run["id"]
+      assert detail =~ status
+      assert detail =~ "Invocation 1"
+      assert detail =~ "Invocation 2"
+      assert detail =~ Enum.at(contents, 0)
+      assert detail =~ Enum.at(contents, 1)
+
+      payload =
+        build_conn()
+        |> get("/api/v1/tasks/#{task["identifier"]}")
+        |> json_response(200)
+        |> Jason.encode!()
+
+      Enum.each(contents, &refute(payload =~ &1))
+    end)
+  end
+
   test "HTTP startup rejects non-loopback bind addresses" do
     assert {:error, {:non_loopback_http_host, "0.0.0.0"}} =
              HttpServer.start_link(host: "0.0.0.0", port: 0)
+  end
+
+  defp terminal_run_with_workpads(status) do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("#{status} HTML workpad")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    assert {:ok, %{"task" => claimed, "run" => run}} =
+             Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+               actor: :system,
+               expected_revision: todo["revision"],
+               idempotency_key: BoardFactory.unique("web-workpad-claim")
+             )
+
+    contents = ["#{status} invocation one #{run["id"]}", "#{status} invocation two #{run["id"]}"]
+    assert :ok = Board.write_workpad(run["id"], 2, Enum.at(contents, 1))
+    assert :ok = Board.write_workpad(run["id"], 1, Enum.at(contents, 0))
+
+    terminal_task =
+      case status do
+        "completed" ->
+          assert {:ok, %{"task" => transitioned}} =
+                   Board.execute(%Commands.MoveTask{task_id: claimed["id"], column_id: "automated_review"},
+                     actor: %{type: :agent, identity: run["id"]},
+                     expected_revision: claimed["revision"],
+                     idempotency_key: BoardFactory.unique("web-workpad-complete-transition")
+                   )
+
+          assert {:ok, %{"task" => completed, "run" => %{"status" => "completed"}}} =
+                   Board.execute(%Commands.RunFinished{task_id: transitioned["id"], run_id: run["id"], outcome: %{}},
+                     actor: :system,
+                     expected_revision: transitioned["revision"],
+                     idempotency_key: BoardFactory.unique("web-workpad-complete")
+                   )
+
+          completed
+
+        "failed" ->
+          assert {:ok, %{"task" => blocked, "run" => %{"status" => "failed"}}} =
+                   Board.execute(%Commands.RunFailed{task_id: claimed["id"], run_id: run["id"], reason: :test},
+                     actor: :system,
+                     expected_revision: claimed["revision"],
+                     idempotency_key: BoardFactory.unique("web-workpad-failed")
+                   )
+
+          blocked
+
+        "stopped" ->
+          assert {:ok, %{"task" => stopping}} =
+                   Board.execute(%Commands.MoveTask{task_id: claimed["id"], column_id: "cancelled"},
+                     actor: :human,
+                     expected_revision: claimed["revision"],
+                     idempotency_key: BoardFactory.unique("web-workpad-stop")
+                   )
+
+          assert {:ok, %{"task" => stopped, "run" => %{"status" => "stopped"}}} =
+                   Board.execute(%Commands.RunFinished{task_id: stopping["id"], run_id: run["id"], outcome: %{}},
+                     actor: :system,
+                     expected_revision: stopping["revision"],
+                     idempotency_key: BoardFactory.unique("web-workpad-stopped")
+                   )
+
+          stopped
+      end
+
+    {:ok, terminal_run} = Board.run(run["id"])
+    {terminal_task, terminal_run, contents}
   end
 end

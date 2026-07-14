@@ -36,10 +36,13 @@ defmodule SymphonyElixir.Orchestrator do
               cleanup_completed: MapSet.new(),
               rate_limits: %{},
               telemetry_broadcasts: MapSet.new(),
+              publication_errors: %{},
               github_health: nil,
               github_health_checked_at: 0,
               dispatch_gate: nil,
               last_reconciled_at: nil
+
+    @type t :: %__MODULE__{}
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -60,7 +63,8 @@ defmodule SymphonyElixir.Orchestrator do
           running: [],
           rate_limits: [],
           dispatch_gate: :not_started,
-          cleanup_errors: %{}
+          cleanup_errors: %{},
+          publication_errors: %{}
         }
     end
   end
@@ -109,6 +113,7 @@ defmodule SymphonyElixir.Orchestrator do
        dispatch_gate: state.dispatch_gate,
        github: state.github_health,
        cleanup_errors: state.cleanup_errors,
+       publication_errors: state.publication_errors,
        last_reconciled_at: state.last_reconciled_at
      }, state}
   end
@@ -281,7 +286,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     candidates =
       Board.tasks()
-      |> Enum.filter(&eligible?(&1, bundle))
+      |> Enum.filter(&dispatch_eligible?(&1, bundle, state))
       |> Enum.sort_by(&{Task.priority_weight(&1.priority), &1.rank, &1.number})
 
     {state, _remaining_slots} =
@@ -353,6 +358,12 @@ defmodule SymphonyElixir.Orchestrator do
 
     not Task.archived?(task) and is_nil(task.runtime_state) and is_nil(task.active_run_id) and
       match?(%{role: :dispatch}, column) and dependencies_done?(task, bundle)
+  end
+
+  @doc false
+  @spec dispatch_eligible?(Task.t(), Bundle.t(), State.t()) :: boolean()
+  def dispatch_eligible?(task, bundle, state) do
+    eligible?(task, bundle) and not Map.has_key?(state.publication_errors, task.id)
   end
 
   defp dependencies_done?(task, bundle) do
@@ -553,10 +564,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp run_stats(run_id), do: RunStats.summary(Projection.run_telemetry(run_id))
 
   defp reconcile_external_effects(state) do
-    Enum.reduce(Board.tasks(), state, fn task, acc ->
+    tasks = Board.tasks()
+    bundle = Config.bundle!()
+    previous_publication_errors = state.publication_errors
+    state = reconcile_workpad_publications(state, tasks, bundle, &publish_task_workpads/1)
+
+    if state.publication_errors != previous_publication_errors do
+      Phoenix.PubSub.broadcast(SymphonyElixir.PubSub, "board:health", :board_health_changed)
+    end
+
+    Enum.reduce(tasks, state, fn task, acc ->
       acc
       |> maybe_rework_to_draft(task)
-      |> maybe_publish_workpads(task)
       |> maybe_publish_run_stats(task)
       |> maybe_terminal_cleanup(task.id)
     end)
@@ -579,23 +598,46 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_rework_to_draft(state, _task), do: state
 
-  defp maybe_publish_workpads(state, task) do
-    bundle = Config.bundle!()
+  @doc false
+  @spec reconcile_workpad_publications(
+          State.t(),
+          [Task.t()],
+          Bundle.t(),
+          (Task.t() -> {:ok, term()} | {:error, term()})
+        ) :: State.t()
+  def reconcile_workpad_publications(state, tasks, bundle, publisher) when is_function(publisher, 1) do
+    current_errors = Map.take(state.publication_errors, Enum.map(tasks, & &1.id))
 
+    publication_errors =
+      Enum.reduce(tasks, current_errors, fn task, errors ->
+        reconcile_task_publication(task, errors, bundle, publisher)
+      end)
+
+    %{state | publication_errors: publication_errors}
+  end
+
+  defp reconcile_task_publication(task, errors, bundle, publisher) do
     case Bundle.column(bundle, task.column_id) do
-      %{publish_workpad: true} ->
-        {worktree, worker_host} = last_location(task)
+      %{publish_workpad: true} when is_nil(task.active_run_id) ->
+        update_publication_error(task, errors, publisher.(task))
 
-        case GitHub.publish_workpads(task, worktree, worker_host: worker_host) do
-          {:ok, _publication_id} -> :ok
-          {:error, reason} -> Logger.warning("workpad publication pending task_id=#{task.id} reason=#{inspect(reason)}")
-        end
-
-      _ ->
-        :ok
+      _column ->
+        Map.delete(errors, task.id)
     end
+  end
 
-    state
+  defp update_publication_error(task, errors, {:ok, _publication_id}) do
+    Map.delete(errors, task.id)
+  end
+
+  defp update_publication_error(task, errors, {:error, reason}) do
+    Logger.warning("workpad publication pending task_id=#{task.id} reason=#{inspect(reason)}")
+    Map.put(errors, task.id, reason)
+  end
+
+  defp publish_task_workpads(task) do
+    {worktree, worker_host} = last_location(task)
+    GitHub.publish_workpads(task, worktree, worker_host: worker_host)
   end
 
   defp maybe_publish_run_stats(state, task) do

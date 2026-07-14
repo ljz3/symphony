@@ -5,6 +5,7 @@ defmodule SymphonyElixir.DynamicToolTest do
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.BoardFactory
   alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Workflow
 
   test "tools are scoped to one active task/run and use call IDs for idempotency" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Tool")})
@@ -219,6 +220,94 @@ defmodule SymphonyElixir.DynamicToolTest do
              )
   end
 
+  test "reads failed and stopped same-task workpads while rejecting another active run" do
+    Enum.each(["failed", "stopped"], fn status ->
+      {current_task, current_run, prior_run} = terminal_prior_fixture(status)
+      opts = [task_id: current_task["id"], run_id: current_run["id"]]
+
+      assert %{"success" => true, "output" => json} =
+               DynamicTool.execute(
+                 "symphony_workpad_read",
+                 %{"run_id" => prior_run["id"], "invocation" => 2},
+                 Keyword.put(opts, :call_id, "#{status}-prior-read")
+               )
+
+      payload = Jason.decode!(json)
+      assert payload["status"] == status
+      assert payload["content"] == "#{status} terminal evidence"
+
+      {other_created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Active secret")})
+      {other_todo, _result} = BoardFactory.move(other_created, "todo")
+      {other_task, other_run} = claim(other_todo)
+      :ok = Board.write_workpad(other_run["id"], 1, "active cross-task secret")
+
+      assert %{"success" => false, "output" => rejected} =
+               DynamicTool.execute(
+                 "symphony_workpad_read",
+                 %{"run_id" => other_run["id"], "invocation" => 1},
+                 Keyword.put(opts, :call_id, "#{status}-active-read")
+               )
+
+      refute rejected =~ "active cross-task secret"
+      cleanup_active_run(other_task["id"], other_run["id"])
+      cleanup_active_run(current_task["id"], current_run["id"])
+    end)
+  end
+
+  test "a publish-only destination rejects the transition until publication succeeds" do
+    original = Workflow.workflow_file_path()
+    source = publish_only_workflow_source()
+    :ok = Workflow.set_workflow_file_path(source.workflow)
+    assert :ok = Workflow.Store.force_reload()
+
+    on_exit(fn ->
+      Workflow.set_workflow_file_path(original)
+      Workflow.Store.force_reload()
+    end)
+
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Publish before merging")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+    {implementation_task, implementation_run} = claim(todo)
+    {review_ready, _completed} = finish_to(implementation_task, implementation_run, "automated_review")
+    {review_task, review_run} = claim(review_ready)
+    :ok = Board.write_workpad(review_run["id"], 1, "review workpad")
+
+    opts = [task_id: review_task["id"], run_id: review_run["id"], call_id: "merge-transition"]
+    parent = self()
+
+    failing_publisher = fn _task, _worktree, _publisher_opts ->
+      send(parent, :publication_attempted)
+      {:error, :publication_failed}
+    end
+
+    assert %{"success" => false} =
+             DynamicTool.execute(
+               "symphony_task_transition",
+               %{"column_id" => "merging", "expected_revision" => review_task["revision"]},
+               Keyword.put(opts, :workpad_publisher, failing_publisher)
+             )
+
+    assert_receive :publication_attempted
+    assert {:ok, unchanged} = Board.task(review_task["id"])
+    assert unchanged.column_id == "automated_review"
+    assert unchanged.active_run_id == review_run["id"]
+
+    successful_publisher = fn _task, _worktree, _publisher_opts -> {:ok, "stable-publication"} end
+
+    assert %{"success" => true} =
+             DynamicTool.execute(
+               "symphony_task_transition",
+               %{"column_id" => "merging", "expected_revision" => unchanged.revision},
+               opts
+               |> Keyword.put(:call_id, "merge-transition-retry")
+               |> Keyword.put(:workpad_publisher, successful_publisher)
+             )
+
+    assert {:ok, merged} = Board.task(review_task["id"])
+    assert merged.column_id == "merging"
+    cleanup_active_run(merged.id, review_run["id"])
+  end
+
   defp claim(task) do
     {:ok, %{"task" => claimed, "run" => run}} =
       Board.execute(%Commands.ClaimRun{task_id: task["id"]},
@@ -246,6 +335,83 @@ defmodule SymphonyElixir.DynamicToolTest do
       )
 
     {finished_task, finished_run}
+  end
+
+  defp terminal_prior_fixture(status) do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("#{status} prior")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+    {prior_task, prior_run} = claim(todo)
+    :ok = Board.write_workpad(prior_run["id"], 2, "#{status} terminal evidence")
+
+    terminal_task =
+      case status do
+        "failed" ->
+          {:ok, %{"task" => blocked, "run" => %{"status" => "failed"}}} =
+            Board.execute(%Commands.RunFailed{task_id: prior_task["id"], run_id: prior_run["id"], reason: :test},
+              actor: :system,
+              expected_revision: prior_task["revision"],
+              idempotency_key: BoardFactory.unique("failed-prior")
+            )
+
+          blocked
+
+        "stopped" ->
+          {:ok, %{"task" => stopping}} =
+            Board.execute(%Commands.MoveTask{task_id: prior_task["id"], column_id: "cancelled"},
+              actor: :human,
+              expected_revision: prior_task["revision"],
+              idempotency_key: BoardFactory.unique("stop-prior")
+            )
+
+          {:ok, %{"task" => cancelled, "run" => %{"status" => "stopped"}}} =
+            Board.execute(%Commands.RunFinished{task_id: stopping["id"], run_id: prior_run["id"], outcome: %{}},
+              actor: :system,
+              expected_revision: stopping["revision"],
+              idempotency_key: BoardFactory.unique("finish-stopped-prior")
+            )
+
+          cancelled
+      end
+
+    {:ok, %{"task" => resumed}} =
+      case status do
+        "failed" ->
+          Board.execute(%Commands.ResumeTask{task_id: terminal_task["id"]},
+            actor: :human,
+            expected_revision: terminal_task["revision"],
+            idempotency_key: BoardFactory.unique("resume-failed-prior")
+          )
+
+        "stopped" ->
+          Board.execute(%Commands.MoveTask{task_id: terminal_task["id"], column_id: "todo", force: true},
+            actor: :system,
+            expected_revision: terminal_task["revision"],
+            idempotency_key: BoardFactory.unique("resume-stopped-prior")
+          )
+      end
+
+    {current_task, current_run} = claim(resumed)
+    {:ok, terminal_run} = Board.run(prior_run["id"])
+    {current_task, current_run, terminal_run}
+  end
+
+  defp publish_only_workflow_source do
+    source = BoardFactory.workflow_source()
+
+    workflow =
+      source.workflow
+      |> File.read!()
+      |> String.replace(
+        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
+        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging\n    publish_workpad: true"
+      )
+      |> String.replace(
+        "    automated_review: [human_review, rework, blocked]",
+        "    automated_review: [human_review, merging, rework, blocked]"
+      )
+
+    File.write!(source.workflow, workflow)
+    source
   end
 
   defp cleanup_active_run(task_id, run_id) do

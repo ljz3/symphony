@@ -22,9 +22,13 @@ Use `$SYMPHONY_HOME`, defaulting to `~/.symphony`, with this layout:
 ~/.symphony/<project.id>/
 ├── history.git/            # Bare canonical board-history repository
 ├── runtime/
-│   ├── board.sqlite3       # Rebuildable projection plus local workpads
+│   ├── board.sqlite3       # Rebuildable board and workpad projection
+│   ├── recovery/           # Retained confirmed-corrupt database families
 │   ├── lease/              # Single-instance ownership
 │   └── logs/
+├── workpads/               # Private authoritative local workpad history
+│   ├── records/<run-id>/<invocation>.json
+│   └── publications/<publication-id>.json
 └── worktrees/
     └── <TASK-ID>/          # Persistent source worktree per task
 ```
@@ -51,10 +55,11 @@ Add Ecto SQL with `ecto_sqlite3 ~> 0.24.1`, WAL mode, full durability, and inter
 Project:
 
 - Task state, criteria/evidence, dependencies, stage model selections, projected event history, runs, branch/PR metadata, sync state, and idempotency records.
-- Keep run workpads in SQLite only. They are deliberately non-canonical and may rewind to the latest checkpoint after catastrophic recovery.
+- Keep run workpads non-canonical and private, but make versioned JSON sidecars under `workpads/` authoritative over their SQLite projection. Write each owner-only record with write-sync-rename before updating SQLite. After GitHub acknowledges a marker comment, atomically write an owner-only publication manifest before marking projection rows published. Publication identity is the task ID plus sorted run/invocation/content hashes and excludes timestamps.
+- On startup, export legacy SQLite-only workpads, validate every existing sidecar without overwriting it, rehydrate SQLite from the sidecars, and derive publication state only from manifests whose stored hashes match current records. A malformed sidecar aborts startup and reports its exact path.
 - Keep live run telemetry in an internally migrated SQLite table: the latest accepted cumulative token high-water mark and unique Codex turn IDs. On terminal finalization, copy the summary into the canonical run event and remove the transient row. Replay must reconstruct final stats without requiring telemetry.
-- Restore from the newest compatible, integrity-checked checkpoint, then replay later events; fall back to full replay when necessary.
-- Hold one process-level project lease. A second instance may expose diagnostics but cannot mutate or dispatch.
+- Classify database health as healthy, confirmed corrupt, or indeterminate. Leave healthy databases untouched. An open, permission, NIF, or health-check execution failure is indeterminate and aborts startup without changing the database, WAL, or SHM files. For confirmed corruption, build and validate a checkpoint-derived or empty replacement first, retain the original database family under `runtime/recovery/`, and roll back installation failures. Never delete quarantines automatically; replay canonical events after startup.
+- Hold one process-level project lease. A second instance may expose diagnostics but cannot mutate or dispatch. Identify the owning machine independently of its mutable hostname so a dead local owner can be reclaimed without treating a remote owner as stale.
 
 ## Workflow and Task Contract
 
@@ -92,9 +97,9 @@ For every run render, in order:
 3. Workflow context prompt.
 4. Selected stage prompt.
 
-Expose stable curated Solid maps for `task`, `run`, `stage`, `github`, dependencies, criteria/evidence, prior handoffs, and allowed transitions. Prior handoffs include run/stage/status metadata plus available workpad invocation metadata. Formatting and field inclusion remain controlled by the workflow context template.
+Expose stable curated Solid maps for `task`, `run`, `stage`, `github`, dependencies, criteria/evidence, prior handoffs, and allowed transitions. Prior handoffs include completed, failed, and stopped run/stage/status metadata plus available workpad invocation metadata. Formatting and field inclusion remain controlled by the workflow context template.
 
-Each named stage references its own workpad template. Render a fresh SQLite workpad per AgentRunner invocation; continuation turns in that invocation share it.
+Each named stage references its own workpad template. Render a fresh durable private workpad per AgentRunner invocation; continuation turns in that invocation share it.
 
 ### Standard workflow
 
@@ -214,7 +219,7 @@ Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
 
 Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task.
 
-Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed prior runs with the same task ID; cross-task and other non-completed-run reads are rejected. Prior-run reads return run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
+Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed, failed, or stopped prior runs with the same task ID; cross-task and active prior-run reads are rejected. Prior-run reads retain run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
 
 ### External MCP task creation
 
@@ -242,7 +247,8 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 - Put a hidden creator-run marker in each newly created PR and retain that association on the run. An existing PR without the marker is pre-existing and has no creator run.
 - Store branch, base/head SHAs, PR number/URL, and merge SHA as canonical board events.
 - A mid-run GitHub outage globally gates new dispatch; let the active invocation reach a safe local commit and wait in the same run/session while push/PR operations retry.
-- Entering a `publish_workpad` column posts one new PR comment containing every unpublished run workpad since the last publication. Include a hidden publication ID marker so retries are idempotent.
+- Before accepting an agent transition into any `publish_workpad` column, synchronously publish every unpublished workpad and durably record its acknowledged marker; publication failure rejects the transition. Reconciliation skips tasks with active runs, retries marker-idempotently, gates only the affected task's dispatch, and reports per-task publication errors in health/status.
+- Each publication posts one PR comment containing every unpublished run workpad since the last publication. Include the stable hidden publication ID marker so retries across comment/manifest/SQLite crash windows are idempotent; changed content has a new hash and becomes unpublished.
 - After termination, append the creator run's compact status/model/effort/runtime/turn/token block to the PR body. Append every other run's block to the existing comment identified by its workpad publication marker, reconciling comments posted before final stats exist. Never create a stats-only comment, never copy a creator run into a workpad comment, and never expose Codex thread IDs or pricing estimates.
 - Include a hidden per-run stats marker and record successful publication as an idempotent canonical run event with destination, publication ID, and timestamp. GitHub failures stay in external-effect reconciliation and never retry or alter the agent run.
 - Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, then complete the board transition through a resumable saga.
@@ -257,11 +263,11 @@ Replace the read-only dashboard with a loopback-only LiveView application:
 
 - `/`: ordered Kanban with drag/drop, priority-aware ordering, dependency/runtime/blocked badges, PR links, and project health.
 - `/stats`: durable all-history project/task accounting with exact-model aggregates and nested stage breakdowns, active sessions, service uptime, safe activity, and current rate limits grouped by worker.
-- `/tasks/:identifier`: editable task detail, criteria/evidence, dependencies, stage selections, branch/PR, effective live/canonical run statistics, workpads, event history, and Blocked resume/archive actions.
+- `/tasks/:identifier`: editable task detail, criteria/evidence, dependencies, stage selections, branch/PR, effective live/canonical run statistics, every ordered workpad invocation for every run outcome, event history, and Blocked resume/archive actions.
 - `/archive`: archived tasks.
 - Creation/edit forms enforce the complete task contract and only show selectors for stages with multiple allowed pairs.
 - Human moves are limited to configured transition edges; stopping/cancelling active work requires confirmation.
-- Header health covers workflow validity/pending activation, lease, board projection/history, remote sync, GitHub, Codex catalog, and workers.
+- Header health covers workflow validity/pending activation, lease, board projection/history, remote sync, GitHub, per-task workpad publication failures, Codex catalog, and workers.
 - Kanban cards show per-task token, agent-time, and turn summaries. Project and task totals include archived history and overlay active telemetry without changing canonical events.
 - Model and model-stage summaries reuse the same effective runs, combine effort levels, count distinct all-time and active thread IDs, and preserve missing dimensions as Unknown. Completed-task participation counts distinct current or archived Done tasks per group only for runs with a canonical start time or an effective session ID, deduplicates within each model aggregate, and is intentionally non-additive across models and stages.
 - Sum reported input, cached-input, output, and total fields independently. Mark aggregates complete, partial, or unavailable; cached input is a subset of input, partial totals are lower bounds, and authoritative zero remains distinct from missing usage.
@@ -277,6 +283,8 @@ Keep JSON APIs read-only and loopback-only:
 `GET /api/v1/state` includes a `stats` snapshot with counts, project/runtime summaries, active runs,
 and per-task totals. `GET /api/v1/tasks/:identifier` includes aggregate `stats` and adds
 `effective_stats` plus optional safe `activity` to each run without replacing canonical run `stats`.
+Workpad content remains private to the loopback HTML task view and run-scoped tool boundary and is
+not included in either public JSON response.
 
 LiveView calls the board context directly, and there is no general-purpose mutation REST API. The
 loopback MCP route is the only external model-facing write interface and is constrained by its exact
@@ -317,10 +325,10 @@ Add targeted coverage for:
 - YAML bundle loading, strict template validation, dependency graph checks, deferred hot reload, and incompatible live-task policy changes.
 - Stage-specific model resolution: singleton auto-selection, required multi-pair choices, catalog fallback during editing, exact dispatch validation, and Blocked failures.
 - Git event append/CAS/idempotency, replay, projection failure recovery, checkpoint restore/integrity fallback, push lag, divergence, handoff, and backup refs.
-- SQLite migrations, task invariants, evidence, dependency cycles, rank compaction, archive, Blocked resume, and workpad loss/recovery semantics.
+- SQLite migrations, task invariants, evidence, dependency cycles, rank compaction, archive, Blocked resume, tri-state database recovery/quarantine/rollback, and sidecar-authoritative workpad loss/recovery semantics.
 - Actor-aware transitions and all external-effect saga crash windows.
 - Local and SSH worktree creation/reuse/removal, path/symlink safety, branch collisions, dirty worktrees, source fetch failures, and terminal cleanup.
-- Run-scoped dynamic-tool schemas, current/prior invocation selection, completed same-task prior-workpad reads, cross-task isolation, expected revisions, call-id idempotency, transition requirements, and follow-up creation.
+- Run-scoped dynamic-tool schemas, current/prior invocation selection, completed/failed/stopped same-task prior-workpad reads, active/cross-task isolation, expected revisions, call-id idempotency, transition requirements, and follow-up creation.
 - Shared-listener MCP handshake/tool discovery, exact-path dispatch, project-ID fail-closed behavior, Host/Origin rejection, canonical task creation, and per-request idempotency.
 - Orchestrator claim/on-claim behavior, stage handoffs, no-retry blocking, orphan recovery, human stop, GitHub-wait exception, capacity, and dependency gating.
 - Cumulative-only token extraction, camel/snake-case token fields, cached tokens, high-water behavior, unique turns, telemetry migration/recovery/cleanup, terminal stats for completion/stop/failure, and `null` unavailable usage.

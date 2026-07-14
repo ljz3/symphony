@@ -14,12 +14,14 @@ persistent source worktrees, and coordinates pull requests through GitHub.
 Symphony separates durable task authority from rebuildable runtime state:
 
 - A bare Git repository is the canonical, append-only event history.
-- SQLite is the local board projection and stores non-canonical run workpads.
+- SQLite is the replaceable local board/workpad projection; private versioned sidecars outside the
+  runtime database are authoritative for non-canonical local workpad history and publication state.
 - Phoenix LiveView serves the loopback-only Kanban board, task editor, and live project statistics.
 - The same loopback listener exposes one guarded MCP tool for creating Backlog tasks from Codex.
 - One persistent Git worktree and immutable branch belong to each task.
 - A service-owned `gh` client creates draft pull requests, publishes workpads, checks review
-  readiness, and verifies merges.
+  readiness, and verifies merges. Publish-only transitions are accepted only after their workpad
+  marker and local publication manifest are durable.
 - Completed, stopped, and failed Codex runs retain canonical runtime/turn/token statistics; the PR
   body or the run's published workpad comment exposes the same compact summary without extra comments.
 - The board and statistics view combine those durable summaries with active SQLite telemetry to show

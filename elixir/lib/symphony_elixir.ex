@@ -29,6 +29,7 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.Workflow.Store,
       SymphonyElixir.Repo,
       SymphonyElixir.Board.Storage,
+      SymphonyElixir.Board.WorkpadStore,
       SymphonyElixir.Board.Lease,
       SymphonyElixir.Board.Writer,
       SymphonyElixir.MCP.Transport,

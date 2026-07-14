@@ -4,7 +4,7 @@ defmodule SymphonyElixir.GitHub do
   exclusively through the service-owned `gh` CLI client.
   """
 
-  alias SymphonyElixir.Board.Projection
+  alias SymphonyElixir.Board.{Projection, WorkpadStore}
   alias SymphonyElixir.Config
   alias SymphonyElixir.GitHub.Client
   alias SymphonyElixir.Paths
@@ -82,6 +82,7 @@ defmodule SymphonyElixir.GitHub do
   def publish_workpads(%Task{} = task, worktree, opts \\ []) do
     gh_directory = github_directory(worktree, Keyword.get(opts, :worker_host))
     workpads = Projection.unpublished_workpads(task.id)
+    publication_recorder = Keyword.get(opts, :publication_recorder, &WorkpadStore.record_publication/2)
 
     case workpads do
       [] ->
@@ -92,7 +93,7 @@ defmodule SymphonyElixir.GitHub do
              publication_id <- publication_id(task, workpads),
              {:ok, already_published} <- publication_exists?(gh_directory, number, publication_id),
              :ok <- maybe_post_publication(gh_directory, number, publication_id, workpads, already_published),
-             :ok <- Projection.mark_workpads_published(workpads, publication_id) do
+             :ok <- publication_recorder.(publication_id, workpads) do
           {:ok, publication_id}
         end
     end
@@ -690,8 +691,7 @@ defmodule SymphonyElixir.GitHub do
   defp pull_request_number(_task), do: {:error, :pull_request_not_linked}
 
   defp publication_id(task, workpads) do
-    :crypto.hash(:sha256, Jason.encode!(%{task_id: task.id, workpads: workpads}))
-    |> Base.encode16(case: :lower)
+    WorkpadStore.publication_id(task.id, workpads)
   end
 
   defp publication_marker(publication_id), do: "<!-- symphony-workpad-publication:#{publication_id} -->"

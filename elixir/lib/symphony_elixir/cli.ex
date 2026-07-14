@@ -2,6 +2,7 @@ defmodule SymphonyElixir.CLI do
   @moduledoc "Escript entrypoint for the loopback Kanban service and board maintenance commands."
 
   alias SymphonyElixir.{Board, Config, LogFile, Paths, Workflow}
+  alias SymphonyElixir.CLI.StartupError
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
   @exqlite_nif_entry_prefix "exqlite/priv/sqlite3_nif."
@@ -17,9 +18,11 @@ defmodule SymphonyElixir.CLI do
 
   @type command :: :run | :status | :checkpoint | :handoff | {:reconcile, :take_local | :take_remote}
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
+  @type listener_info :: %{optional(:command) => String.t(), optional(:pid) => pos_integer()}
   @type deps :: %{
-          file_regular?: (String.t() -> boolean()),
-          ensure_all_started: (-> ensure_started_result())
+          required(:file_regular?) => (String.t() -> boolean()),
+          required(:ensure_all_started) => (-> ensure_started_result()),
+          optional(:listener_info) => (non_neg_integer() -> listener_info() | nil)
         }
 
   @spec main([String.t()]) :: no_return()
@@ -194,14 +197,40 @@ defmodule SymphonyElixir.CLI do
   end
 
   defp start_application(path, deps) do
-    with :ok <- prepare_escript_native_dependencies(), do: ensure_all_started(path, deps)
+    case prepare_escript_native_dependencies() do
+      :ok -> ensure_all_started(path, deps)
+      {:error, reason} -> {:error, startup_error_message(path, reason, deps)}
+    end
   end
 
   defp ensure_all_started(path, deps) do
     case deps.ensure_all_started.() do
       {:ok, _apps} -> :ok
-      {:error, reason} -> {:error, "Failed to start Symphony with workflow #{path}: #{inspect(reason)}"}
+      {:error, reason} -> {:error, startup_error_message(path, reason, deps)}
     end
+  end
+
+  defp startup_error_message(path, reason, deps) do
+    port = Config.server_port()
+
+    StartupError.format(path, reason,
+      port: port,
+      listener: listener_info(deps, port),
+      log_file: startup_log_file()
+    )
+  end
+
+  defp listener_info(deps, port) when is_integer(port) do
+    case Map.get(deps, :listener_info) do
+      listener_info when is_function(listener_info, 1) -> listener_info.(port)
+      _missing -> nil
+    end
+  end
+
+  defp listener_info(_deps, _port), do: nil
+
+  defp startup_log_file do
+    Application.get_env(:symphony_elixir, :log_file) || LogFile.default_log_file()
   end
 
   defp execute_command(:run), do: :ok
@@ -219,9 +248,30 @@ defmodule SymphonyElixir.CLI do
   defp runtime_deps do
     %{
       file_regular?: &File.regular?/1,
-      ensure_all_started: fn -> Application.ensure_all_started(:symphony_elixir) end
+      ensure_all_started: fn -> Application.ensure_all_started(:symphony_elixir) end,
+      listener_info: &runtime_listener_info/1
     }
   end
+
+  defp runtime_listener_info(port) when is_integer(port) and port > 0 do
+    with executable when is_binary(executable) <- System.find_executable("lsof"),
+         {output, 0} <-
+           System.cmd(
+             executable,
+             ["-nP", "-iTCP:#{port}", "-sTCP:LISTEN", "-Fpc"],
+             stderr_to_stdout: true
+           ),
+         [_, pid, command] <- Regex.run(~r/(?:\A|\n)p(\d+)\nc([^\n]+)/, output),
+         {pid, ""} <- Integer.parse(pid) do
+      %{pid: pid, command: command}
+    else
+      _unavailable -> nil
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp runtime_listener_info(_port), do: nil
 
   defp prepare_escript_native_dependencies do
     script_path = :escript.script_name() |> List.to_string() |> Path.expand()
@@ -229,7 +279,7 @@ defmodule SymphonyElixir.CLI do
     if Path.basename(script_path) == "symphony" do
       case extract_exqlite_nif(script_path) do
         :ok -> :ok
-        {:error, reason} -> {:error, "Failed to prepare embedded SQLite library: #{inspect(reason)}"}
+        {:error, reason} -> {:error, {:native_dependency_preparation_failed, script_path, reason}}
       end
     else
       :ok

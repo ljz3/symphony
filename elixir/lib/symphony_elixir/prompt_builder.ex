@@ -104,7 +104,11 @@ defmodule SymphonyElixir.PromptBuilder do
         "status" => run["status"],
         "outcome" => run["outcome"],
         "finished_at" => run["finished_at"],
-        "workpads" => if(run["status"] == "completed", do: Board.workpad_metadata(run["id"]), else: [])
+        "workpads" =>
+          if(run["status"] in ["completed", "failed", "stopped"],
+            do: Board.workpad_metadata(run["id"]),
+            else: []
+          )
       }
     end)
   end

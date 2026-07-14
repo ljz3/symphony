@@ -206,16 +206,45 @@ defmodule SymphonyElixir.Board.Projection do
   @spec write_workpad(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def write_workpad(run_id, invocation, content)
       when is_binary(run_id) and is_integer(invocation) and invocation > 0 and is_binary(content) do
-    now = timestamp()
-
     case SQL.query(
            Repo,
            """
            INSERT INTO board_workpads(run_id, invocation, content, published, updated_at)
            VALUES (?, ?, ?, 0, ?)
-           ON CONFLICT(run_id, invocation) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at
+           ON CONFLICT(run_id, invocation) DO UPDATE SET
+             content = excluded.content,
+             published = CASE WHEN board_workpads.content = excluded.content THEN board_workpads.published ELSE 0 END,
+             publication_id = CASE WHEN board_workpads.content = excluded.content THEN board_workpads.publication_id ELSE NULL END,
+             updated_at = excluded.updated_at
            """,
-           [run_id, invocation, content, now]
+           [run_id, invocation, content, timestamp()]
+         ) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec put_workpad(map()) :: :ok | {:error, term()}
+  def put_workpad(workpad) when is_map(workpad) do
+    case SQL.query(
+           Repo,
+           """
+           INSERT INTO board_workpads(run_id, invocation, content, published, publication_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id, invocation) DO UPDATE SET
+             content = excluded.content,
+             published = excluded.published,
+             publication_id = excluded.publication_id,
+             updated_at = excluded.updated_at
+           """,
+           [
+             value(workpad, :run_id),
+             value(workpad, :invocation),
+             value(workpad, :content),
+             if(value(workpad, :published, false), do: 1, else: 0),
+             value(workpad, :publication_id),
+             value(workpad, :updated_at)
+           ]
          ) do
       {:ok, _result} -> :ok
       {:error, reason} -> {:error, reason}
@@ -252,12 +281,79 @@ defmodule SymphonyElixir.Board.Projection do
     end)
   end
 
+  @spec list_workpads(String.t()) :: [map()]
+  def list_workpads(run_id) when is_binary(run_id) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT run_id, invocation, content, published, publication_id, updated_at
+      FROM board_workpads
+      WHERE run_id = ?
+      ORDER BY invocation ASC
+      """,
+      [run_id]
+    ).rows
+    |> Enum.map(&workpad_map/1)
+  end
+
+  @spec all_workpads() :: [map()]
+  def all_workpads do
+    SQL.query!(
+      Repo,
+      """
+      SELECT run_id, invocation, content, published, publication_id, updated_at
+      FROM board_workpads
+      ORDER BY run_id ASC, invocation ASC
+      """,
+      []
+    ).rows
+    |> Enum.map(fn [run_id, invocation, content, published, publication_id, updated_at] ->
+      %{
+        run_id: run_id,
+        invocation: invocation,
+        content: content,
+        published: published == 1,
+        publication_id: publication_id,
+        updated_at: updated_at
+      }
+    end)
+  end
+
+  @spec replace_workpads([map()]) :: :ok | {:error, term()}
+  def replace_workpads(workpads) when is_list(workpads) do
+    Repo.transaction(fn ->
+      SQL.query!(Repo, "DELETE FROM board_workpads", [])
+
+      Enum.each(workpads, fn workpad ->
+        SQL.query!(
+          Repo,
+          """
+          INSERT INTO board_workpads(run_id, invocation, content, published, publication_id, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          """,
+          [
+            value(workpad, :run_id),
+            value(workpad, :invocation),
+            value(workpad, :content),
+            if(value(workpad, :published, false), do: 1, else: 0),
+            value(workpad, :publication_id),
+            value(workpad, :updated_at)
+          ]
+        )
+      end)
+    end)
+    |> case do
+      {:ok, _value} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec unpublished_workpads(String.t()) :: [map()]
   def unpublished_workpads(task_id) when is_binary(task_id) do
     SQL.query!(
       Repo,
       """
-      SELECT w.run_id, w.invocation, w.content, w.updated_at
+      SELECT r.task_id, w.run_id, w.invocation, w.content, w.updated_at
       FROM board_workpads AS w
       JOIN board_runs AS r ON r.id = w.run_id
       WHERE r.task_id = ? AND w.published = 0
@@ -265,8 +361,8 @@ defmodule SymphonyElixir.Board.Projection do
       """,
       [task_id]
     ).rows
-    |> Enum.map(fn [run_id, invocation, content, updated_at] ->
-      %{run_id: run_id, invocation: invocation, content: content, updated_at: updated_at}
+    |> Enum.map(fn [task_id, run_id, invocation, content, updated_at] ->
+      %{task_id: task_id, run_id: run_id, invocation: invocation, content: content, updated_at: updated_at}
     end)
   end
 
@@ -466,5 +562,20 @@ defmodule SymphonyElixir.Board.Projection do
 
   defp timestamp do
     DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
+  end
+
+  defp workpad_map([run_id, invocation, content, published, publication_id, updated_at]) do
+    %{
+      "run_id" => run_id,
+      "invocation" => invocation,
+      "content" => content,
+      "published" => published == 1,
+      "publication_id" => publication_id,
+      "updated_at" => updated_at
+    }
+  end
+
+  defp value(map, key, default \\ nil) do
+    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
   end
 end

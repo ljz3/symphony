@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.GitHubClientTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Board.Projection
+  alias SymphonyElixir.Board
+  alias SymphonyElixir.Board.{Commands, Projection}
   alias SymphonyElixir.BoardFactory
   alias SymphonyElixir.GitHub
   alias SymphonyElixir.GitHub.Client
@@ -14,6 +15,7 @@ defmodule SymphonyElixir.GitHubClientTest do
     File.mkdir_p!(root)
     File.write!(Path.join(root, "pr_edit_count"), "0\n")
     File.write!(Path.join(root, "comment_patch_count"), "0\n")
+    File.write!(Path.join(root, "comment_count"), "0\n")
     executable = Path.join(root, "gh")
 
     File.write!(executable, """
@@ -56,10 +58,21 @@ defmodule SymphonyElixir.GitHubClientTest do
             printf '%s' '{}'
             ;;
           *issues/*/comments*)
-            if [ -f "$state/comment_body" ]; then
-              printf '[{"id":123,"body":"<!-- symphony-workpad-publication:%s --><!-- symphony-run-stats:%s -->"}]' "$FAKE_PUBLICATION_ID" "$FAKE_RUN_ID"
+            if [ -f "$state/comment_marker" ]; then
+              marker=$(cat "$state/comment_marker")
+              if [ -f "$state/comment_body" ]; then
+                printf '[{"id":123,"body":"%s<!-- symphony-run-stats:%s -->"}]' "$marker" "$FAKE_RUN_ID"
+              else
+                printf '[{"id":123,"body":"%s"}]' "$marker"
+              fi
+            elif [ -n "$FAKE_PUBLICATION_ID" ]; then
+              if [ -f "$state/comment_body" ]; then
+                printf '[{"id":123,"body":"<!-- symphony-workpad-publication:%s --><!-- symphony-run-stats:%s -->"}]' "$FAKE_PUBLICATION_ID" "$FAKE_RUN_ID"
+              else
+                printf '[{"id":123,"body":"<!-- symphony-workpad-publication:%s -->"}]' "$FAKE_PUBLICATION_ID"
+              fi
             else
-              printf '[{"id":123,"body":"<!-- symphony-workpad-publication:%s -->"}]' "$FAKE_PUBLICATION_ID"
+              printf '%s' '[]'
             fi
             ;;
           *) printf '%s' 'unsupported api command'; exit 7 ;;
@@ -105,6 +118,18 @@ defmodule SymphonyElixir.GitHubClientTest do
             done
             increment "$state/pr_edit_count"
             printf '%s' 'edited'
+            ;;
+          comment)
+            previous=""
+            for argument in "$@"; do
+              if [ "$previous" = "--body-file" ]; then
+                cp "$argument" "$state/posted_comment_body"
+                grep -o '<!-- symphony-workpad-publication:[^>]* -->' "$argument" > "$state/comment_marker"
+              fi
+              previous="$argument"
+            done
+            increment "$state/comment_count"
+            printf '%s' 'commented'
             ;;
           view)
             case "$*" in
@@ -318,6 +343,45 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert body =~ "700"
   end
 
+  test "publication retries bridge the acknowledged-comment crash window and changed content gets a new marker", %{
+    fake_gh_root: root
+  } do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Publication crash window")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    assert {:ok, %{"task" => claimed, "run" => run}} =
+             Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+               actor: :system,
+               expected_revision: todo["revision"],
+               idempotency_key: BoardFactory.unique("publication-claim")
+             )
+
+    on_exit(fn -> cleanup_active_run(claimed["id"], run["id"]) end)
+
+    assert :ok = Board.write_workpad(run["id"], 1, "original publication content")
+    {:ok, task} = Board.task(claimed["id"])
+    task = %{task | github: %{"number" => 42}}
+
+    crash_after_comment = fn _publication_id, _workpads -> {:error, :crash_after_comment} end
+
+    assert {:error, :crash_after_comment} =
+             GitHub.publish_workpads(task, File.cwd!(), publication_recorder: crash_after_comment)
+
+    assert file_count(root, "comment_count") == 1
+    assert [%{"published" => false}] = Board.workpad_metadata(run["id"])
+
+    assert {:ok, first_publication_id} = GitHub.publish_workpads(task, File.cwd!())
+    assert file_count(root, "comment_count") == 1
+    assert [%{"published" => true, "publication_id" => ^first_publication_id}] = Board.workpad_metadata(run["id"])
+
+    assert :ok = Board.write_workpad(run["id"], 1, "changed publication content")
+    assert [%{"published" => false, "publication_id" => nil}] = Board.workpad_metadata(run["id"])
+
+    assert {:ok, second_publication_id} = GitHub.publish_workpads(task, File.cwd!())
+    refute second_publication_id == first_publication_id
+    assert file_count(root, "comment_count") == 2
+  end
+
   defp readiness(scenario) do
     System.put_env("FAKE_GH_CHECKS", scenario)
     source = BoardFactory.workflow_source()
@@ -382,5 +446,19 @@ defmodule SymphonyElixir.GitHubClientTest do
       created_at: "now",
       updated_at: "now"
     }
+  end
+
+  defp cleanup_active_run(task_id, run_id) do
+    case Board.task(task_id) do
+      {:ok, %{active_run_id: ^run_id} = task} ->
+        Board.execute(%Commands.RunFailed{task_id: task_id, run_id: run_id, reason: :test_cleanup},
+          actor: :system,
+          expected_revision: task.revision,
+          idempotency_key: BoardFactory.unique("publication-cleanup")
+        )
+
+      _ ->
+        :ok
+    end
   end
 end

@@ -379,7 +379,7 @@ defmodule SymphonyElixir.BoardTest do
                idempotency_key: BoardFactory.unique("creator-second-claim")
              )
 
-    assert {:ok, %{"run" => recovered_creator}} =
+    assert {:ok, %{"task" => linked_task, "run" => recovered_creator}} =
              Board.execute(
                %Commands.LinkPullRequest{
                  task_id: second_claimed["id"],
@@ -399,5 +399,17 @@ defmodule SymphonyElixir.BoardTest do
     assert recovered_creator["id"] == first_run["id"]
     assert recovered_creator["pull_request_created"] == true
     assert {:ok, %{"pull_request_created" => false}} = Board.run(second_run["id"])
+
+    assert {:ok, _result} =
+             Board.execute(
+               %Commands.RunFailed{
+                 task_id: linked_task["id"],
+                 run_id: second_run["id"],
+                 reason: :test_cleanup
+               },
+               actor: :system,
+               expected_revision: linked_task["revision"],
+               idempotency_key: BoardFactory.unique("creator-cleanup")
+             )
   end
 end

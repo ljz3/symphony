@@ -54,4 +54,24 @@ defmodule SymphonyElixir.CLITest do
     assert {:error, usage} = CLI.evaluate([@ack, "--port", "0", "board", "reconcile"], deps)
     assert usage =~ "Usage:"
   end
+
+  test "reports an actionable error when the loopback port is already in use" do
+    listener_error = {:failed_to_start_child, :listener, :eaddrinuse}
+    endpoint_error = {:failed_to_start_child, SymphonyElixir.HttpServer, {:shutdown, listener_error}}
+
+    deps = %{
+      file_regular?: &File.regular?/1,
+      ensure_all_started: fn -> {:error, {:symphony_elixir, {:shutdown, endpoint_error}}} end,
+      listener_info: fn 4100 -> %{pid: 12_345, command: "beam.smp"} end
+    }
+
+    assert {:error, message} = CLI.evaluate([@ack, "--port", "4100", "WORKFLOW.yml"], deps)
+    assert message =~ "Component: HTTP server → TCP listener"
+    assert message =~ "Loopback port 4100 is already in use (listener: beam.smp, PID 12345)."
+    assert message =~ "http://127.0.0.1:4100/"
+    assert message =~ "ps -p 12345 -o command="
+    assert message =~ "kill -TERM 12345"
+    assert message =~ "Log:"
+    refute message =~ "failed_to_start_child"
+  end
 end

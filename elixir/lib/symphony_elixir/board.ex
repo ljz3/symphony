@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Board do
   """
 
   alias SymphonyElixir.AgentStage
-  alias SymphonyElixir.Board.{Commands, History, Lease, Metrics, Projection, Sync, Writer}
+  alias SymphonyElixir.Board.{Commands, History, Lease, Metrics, Projection, Sync, WorkpadStore, Writer}
   alias SymphonyElixir.Codex.Catalog
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Task
@@ -97,7 +97,8 @@ defmodule SymphonyElixir.Board do
     orchestrator =
       safe_status(Orchestrator, :status, %{
         dispatch_gate: :orchestrator_unavailable,
-        github: %{available: false, error: :orchestrator_unavailable}
+        github: %{available: false, error: :orchestrator_unavailable},
+        publication_errors: %{}
       })
 
     %{
@@ -106,6 +107,7 @@ defmodule SymphonyElixir.Board do
       projection: writer_status,
       board_sync: sync,
       github: orchestrator[:github] || %{available: false, error: :not_checked},
+      publication_errors: orchestrator[:publication_errors] || %{},
       codex_catalog: safe_status(Catalog, :status, %{available: false, error: :unavailable}),
       workers: orchestrator
     }
@@ -144,13 +146,16 @@ defmodule SymphonyElixir.Board do
   end
 
   @spec write_workpad(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
-  def write_workpad(run_id, invocation, content), do: Projection.write_workpad(run_id, invocation, content)
+  def write_workpad(run_id, invocation, content), do: WorkpadStore.write(run_id, invocation, content)
 
   @spec read_workpad(String.t(), pos_integer()) :: {:ok, String.t()} | {:error, :not_found}
   def read_workpad(run_id, invocation), do: Projection.read_workpad(run_id, invocation)
 
   @spec workpad_metadata(String.t()) :: [map()]
   def workpad_metadata(run_id), do: Projection.workpad_metadata(run_id)
+
+  @spec workpads(String.t()) :: [map()]
+  def workpads(run_id), do: Projection.list_workpads(run_id)
 
   @spec live_column_ids() :: [String.t()]
   def live_column_ids do

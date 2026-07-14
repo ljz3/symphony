@@ -1,9 +1,9 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e
+.PHONY: help all setup deps build smoke fmt fmt-check lint test coverage ci dialyzer e2e
 
 MIX ?= mix
 
 help:
-	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
+	@echo "Targets: setup, deps, build, smoke, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
 
 setup:
 	$(MIX) setup
@@ -13,6 +13,9 @@ deps:
 
 build:
 	$(MIX) build
+
+smoke:
+	./scripts/smoke_escript.sh
 
 fmt:
 	$(MIX) format
@@ -39,6 +42,7 @@ e2e:
 ci:
 	$(MAKE) setup
 	$(MAKE) build
+	$(MAKE) smoke
 	$(MAKE) fmt-check
 	$(MAKE) lint
 	$(MAKE) coverage

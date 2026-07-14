@@ -35,19 +35,19 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "additionalProperties" => false,
         "properties" => %{}
       }),
-      tool_spec(@workpad_read_tool, "Read the current run's workpad or a completed prior run's workpad for this task.", %{
+      tool_spec(@workpad_read_tool, "Read the current run's workpad or a terminal prior run's workpad for this task.", %{
         "type" => "object",
         "additionalProperties" => false,
         "properties" => %{
           "run_id" => %{
             "type" => "string",
             "minLength" => 1,
-            "description" => "Defaults to the active run; may select only a completed prior run of the same task."
+            "description" => "Defaults to the active run; may select only a completed, failed, or stopped prior run of the same task."
           },
           "invocation" => %{"type" => "integer", "minimum" => 1}
         }
       }),
-      tool_spec(@workpad_write_tool, "Replace this run's shared SQLite workpad content.", %{
+      tool_spec(@workpad_write_tool, "Replace this run's private durable workpad content.", %{
         "type" => "object",
         "additionalProperties" => false,
         "required" => ["content"],
@@ -181,7 +181,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:ok, scope.run}
     else
       case Board.run(requested_run_id) do
-        {:ok, %{"task_id" => task_id, "status" => "completed"} = run} when task_id == scope.task.id ->
+        {:ok, %{"task_id" => task_id, "status" => status} = run}
+        when task_id == scope.task.id and status in ["completed", "failed", "stopped"] ->
           {:ok, run}
 
         _ ->
@@ -229,6 +230,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
              Keyword.put(opts, :idempotency_suffix, "ready")
            ) do
       {:ok, get_in(result, ["task", "revision"])}
+    end
+  end
+
+  defp maybe_complete_external_saga(scope, %{publish_workpad: true}, revision, opts) do
+    worktree = scope.run["workspace_path"] || Worktree.path(scope.task)
+    publisher = Keyword.get(opts, :workpad_publisher, &GitHub.publish_workpads/3)
+
+    case publisher.(scope.task, worktree, worker_host: scope.run["worker_host"]) do
+      {:ok, _publication_id} -> {:ok, revision}
+      {:error, reason} -> {:error, reason}
     end
   end
 

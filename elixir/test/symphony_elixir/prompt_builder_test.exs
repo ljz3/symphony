@@ -98,6 +98,26 @@ defmodule SymphonyElixir.PromptBuilderTest do
     )
   end
 
+  test "exposes failed and stopped prior-run workpads with terminal status metadata" do
+    Enum.each(["failed", "stopped"], fn status ->
+      {task, current_run, terminal_run} = terminal_handoff_fixture(status)
+
+      context = """
+      {% for handoff in prior_handoffs %}
+      handoff={{ handoff.run_id }}:{{ handoff.status }}
+      {% for workpad in handoff.workpads %}workpad={{ workpad.invocation }}:{{ workpad.published }}{% endfor %}
+      {% endfor %}
+      """
+
+      current_run = put_in(current_run, ["frozen_bundle", "context_prompt"], context)
+      prompt = PromptBuilder.build_prompt(task, current_run)
+
+      assert prompt =~ "handoff=#{terminal_run["id"]}:#{status}"
+      assert prompt =~ "workpad=2:false"
+      cleanup_active_run(task.id, current_run["id"])
+    end)
+  end
+
   defp index(string, pattern), do: :binary.match(string, pattern) |> elem(0)
 
   defp cleanup_active_run(task_id, run_id) do
@@ -112,5 +132,75 @@ defmodule SymphonyElixir.PromptBuilderTest do
       _ ->
         :ok
     end
+  end
+
+  defp terminal_handoff_fixture(status) do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("#{status} handoff")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    {:ok, %{"task" => prior_task, "run" => prior_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+        actor: :system,
+        expected_revision: todo["revision"],
+        idempotency_key: BoardFactory.unique("terminal-handoff-claim")
+      )
+
+    :ok = Board.write_workpad(prior_run["id"], 2, "#{status} handoff evidence")
+
+    terminal_task =
+      case status do
+        "failed" ->
+          {:ok, %{"task" => blocked}} =
+            Board.execute(%Commands.RunFailed{task_id: prior_task["id"], run_id: prior_run["id"], reason: :test},
+              actor: :system,
+              expected_revision: prior_task["revision"],
+              idempotency_key: BoardFactory.unique("handoff-failed")
+            )
+
+          blocked
+
+        "stopped" ->
+          {:ok, %{"task" => stopping}} =
+            Board.execute(%Commands.MoveTask{task_id: prior_task["id"], column_id: "cancelled"},
+              actor: :human,
+              expected_revision: prior_task["revision"],
+              idempotency_key: BoardFactory.unique("handoff-stop")
+            )
+
+          {:ok, %{"task" => cancelled}} =
+            Board.execute(%Commands.RunFinished{task_id: stopping["id"], run_id: prior_run["id"], outcome: %{}},
+              actor: :system,
+              expected_revision: stopping["revision"],
+              idempotency_key: BoardFactory.unique("handoff-stopped")
+            )
+
+          cancelled
+      end
+
+    {:ok, %{"task" => resumed}} =
+      if status == "failed" do
+        Board.execute(%Commands.ResumeTask{task_id: terminal_task["id"]},
+          actor: :human,
+          expected_revision: terminal_task["revision"],
+          idempotency_key: BoardFactory.unique("handoff-resume-failed")
+        )
+      else
+        Board.execute(%Commands.MoveTask{task_id: terminal_task["id"], column_id: "todo", force: true},
+          actor: :system,
+          expected_revision: terminal_task["revision"],
+          idempotency_key: BoardFactory.unique("handoff-resume-stopped")
+        )
+      end
+
+    {:ok, %{"task" => current, "run" => current_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: resumed["id"]},
+        actor: :system,
+        expected_revision: resumed["revision"],
+        idempotency_key: BoardFactory.unique("terminal-handoff-current")
+      )
+
+    {:ok, task} = Board.task(current["id"])
+    {:ok, terminal_run} = Board.run(prior_run["id"])
+    {task, current_run, terminal_run}
   end
 end

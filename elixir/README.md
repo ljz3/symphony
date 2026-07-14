@@ -45,7 +45,9 @@ mise exec -- mix build
 The build embeds Exqlite's native SQLite library in `bin/symphony`. On escript startup, Symphony
 extracts that library into a content-addressed directory under the current user's cache and adds
 only its synthetic `ebin` directory to the front of the code path so `:code.priv_dir/1` resolves a
-real filesystem location for NIF loading.
+real filesystem location for NIF loading. `make all` rebuilds the package and runs a clean-cache
+smoke test that starts the escript against a disposable home and reads board status through the
+embedded NIF.
 
 ## Start the service
 
@@ -60,6 +62,11 @@ mise exec -- ./bin/symphony \
 
 Open `http://127.0.0.1:4000/`. The HTTP server always binds to loopback.
 The same listener serves Symphony's MCP endpoint at `http://127.0.0.1:4000/mcp`.
+
+Startup failures name the failed supervision component, summarize the cause and next action, and
+show the workflow and log paths. Port conflicts also report the listener PID and executable name
+when `lsof` is available, including the explicit `kill -TERM <pid>` command for a graceful stop;
+Symphony never stops an existing listener automatically.
 
 Pass a workflow path as the final argument when the file lives elsewhere:
 
@@ -103,9 +110,13 @@ Machine-local data defaults to `$SYMPHONY_HOME`, or `~/.symphony` when unset:
 ~/.symphony/<project.id>/
 ├── history.git/            # canonical bare board-history repository
 ├── runtime/
-│   ├── board.sqlite3       # rebuildable projection and local workpads
+│   ├── board.sqlite3       # rebuildable board/workpad projection
+│   ├── recovery/           # retained confirmed-corrupt database families
 │   ├── lease/              # single-instance ownership
 │   └── logs/
+├── workpads/               # private authoritative local workpad history
+│   ├── records/<run-id>/<invocation>.json
+│   └── publications/<publication-id>.json
 └── worktrees/
     └── <TASK-ID>/          # persistent source worktree
 ```
@@ -118,7 +129,16 @@ Use these machine-local overrides; they are intentionally unavailable in tracked
 - `--port` or `SYMPHONY_PORT`
 
 The project lease permits a second process to show diagnostics, but only its owner may mutate the
-board or dispatch agents.
+board or dispatch agents. Lease owners include a hashed stable machine identifier so a dead local
+owner can be reclaimed safely even when the operating system hostname changes.
+
+Workpad records and publication manifests are versioned JSON with owner-only permissions. Symphony
+writes, syncs, and atomically renames a record before updating SQLite. Existing sidecars win during
+startup reconciliation; SQLite-only records are exported once, then the projection is rehydrated
+from sidecars. Publication state is true only when a manifest's run/invocation/content hashes match
+the current records. Startup stops on a malformed sidecar and reports its exact path rather than
+discarding local history. These files remain private, local, and noncanonical; do not publish or
+copy the directory into a source repository.
 
 ## Board and task contract
 
@@ -127,7 +147,8 @@ The LiveView routes are:
 - `/` — ordered Kanban, task creation, drag/drop transitions, and health
 - `/stats` — all-time project/task/model/stage accounting, active sessions, service uptime, and per-worker rate limits
 - `/tasks/:identifier` — task contract, criteria and evidence, dependencies, model selections,
-  source/PR state, effective live/canonical run statistics, workpads, and event history
+  source/PR state, effective live/canonical run statistics, every ordered workpad invocation for
+  completed, failed, and stopped runs, and event history
 - `/archive` — archived task tombstones
 
 A task requires a title, immutable Feature/Bug Fix/Chore type, Markdown brief, and at least one
@@ -148,7 +169,7 @@ The REST-style JSON interface is diagnostic and intentionally read-only:
 
 All other REST mutation methods are rejected. LiveView and MCP mutations call the same validated
 board command boundary used by internal tools; `/mcp` is a separate Streamable HTTP protocol route,
-not a general-purpose task API.
+not a general-purpose task API. Workpad content is intentionally absent from these JSON responses.
 
 ## `WORKFLOW.yml`
 
@@ -202,18 +223,26 @@ the run ID with the app-server call ID for idempotency, so call IDs may restart 
 replaying a prior run's result.
 
 `symphony_workpad_read` defaults to the active run and selected invocation. It may also select an
-explicit completed prior run of the same task; prompt handoffs expose each run's stage and available
-workpad invocations. Cross-task reads and reads from other non-completed runs are rejected. This
-lets Automated Review hand findings directly to Rework without waiting for Human Review publication.
+explicit completed, failed, or stopped prior run of the same task; prompt handoffs retain each
+terminal run's status, stage, finish metadata, and available workpad invocations. Cross-task and
+active prior-run reads are rejected. This lets later stages inspect terminal evidence without
+waiting for Human Review publication.
 
 After the first meaningful committed diff from the remote default branch, Symphony pushes the task
 branch and creates a deterministic draft PR. Documentation, product-specification, configuration,
-and tooling-only commits qualify; a zero-diff branch does not. Entering Human Review publishes
-unpublished workpads, enforces acceptance evidence, review-thread and required-check readiness, then
-marks the PR ready. GitHub CLI's exact no-required-checks diagnostic is normalized to an empty green
-set, while listed failed or pending checks and other CLI failures remain blocking. Rework returns the
-PR to draft. Cancelled closes an open PR. Done is accepted only after the merge commit is reachable
-from the remote default branch.
+and tooling-only commits qualify; a zero-diff branch does not. Any agent transition into a
+`publish_workpad` column synchronously publishes before Symphony accepts the move. The acknowledged
+marker is written to an atomic local manifest before SQLite is marked published; stable task/content
+hash IDs make retries idempotent, while changed content becomes unpublished. Entering Human Review
+continues to publish, enforce acceptance evidence, review-thread and required-check readiness, and
+then mark the PR ready. GitHub CLI's exact no-required-checks diagnostic is normalized to an empty
+green set, while listed failed or pending checks and other CLI failures remain blocking. Rework
+returns the PR to draft. Cancelled closes an open PR. Done is accepted only after the merge commit is
+reachable from the remote default branch.
+
+Periodic reconciliation never publishes an active run's workpad. A publication failure appears in
+health/status under the affected task ID and gates only that task's dispatch while marker-idempotent
+retries continue; unrelated eligible tasks remain dispatchable.
 
 Terminal cleanup never changes the terminal board outcome. Symphony first removes its marked,
 clean managed worktree, then deletes only the marker-proven local task branch. It never deletes the
@@ -273,8 +302,16 @@ itself recorded as a canonical run event.
 The canonical board branch is `refs/heads/main` in `history.git`. Every commit adds exactly one JSON
 event. Git is committed before SQLite is updated, so startup replay repairs a crash in that window.
 SQLite uses WAL and full durability. Checkpoints are written every 100 events, at clean shutdown,
-and during handoff to a separate `checkpoints` branch; incompatible or corrupt snapshots fall back
-to full event replay.
+and during handoff to a separate `checkpoints` branch.
+
+Startup classifies an existing database as healthy, confirmed corrupt, or indeterminate. Healthy
+database/WAL/SHM files are untouched. NIF, permission, open, and health-check execution failures are
+indeterminate and abort startup without replacing or deleting that family. Only confirmed corruption
+starts recovery: Symphony builds and validates a compatible checkpoint-derived replacement, or a
+valid empty projection when no checkpoint exists, before moving the original family into a unique
+`runtime/recovery/` quarantine. Installation failures roll the family back. Quarantines are never
+deleted automatically; preserve them for operator diagnosis. Canonical Git replay and authoritative
+workpad sidecars repopulate the installed projection.
 
 Maintenance commands require the same acknowledgement and port as normal startup:
 
@@ -309,7 +346,7 @@ make e2e
 
 That target creates disposable source and board remotes, a fake app-server process, and a fake `gh`
 executable. It exercises local task creation, the implementation/review/rework/merge stages, two
-workpad publications, terminal cleanup, verified handoff, projection loss, writer restart, and
+marker-idempotent workpad publications, terminal cleanup, verified handoff, projection loss, writer restart, and
 identical event replay without using a production repository.
 
 ## Migration note

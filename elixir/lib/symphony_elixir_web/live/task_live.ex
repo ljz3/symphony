@@ -204,7 +204,14 @@ defmodule SymphonyElixirWeb.TaskLive do
                   data-copy={run["session_id"]}
                 >Copy session ID</button>
               </div>
-              <pre :if={workpad(@workpads, run["id"])}>{workpad(@workpads, run["id"])}</pre>
+              <div :for={workpad <- workpads(@workpads, run["id"])} class="workpad-invocation">
+                <div class="run-heading">
+                  <strong>Invocation {workpad["invocation"]}</strong>
+                  <span>{if workpad["published"], do: "published", else: "private"}</span>
+                  <code>{workpad["updated_at"]}</code>
+                </div>
+                <pre>{workpad["content"]}</pre>
+              </div>
             </article>
           </section>
 
@@ -353,18 +360,10 @@ defmodule SymphonyElixirWeb.TaskLive do
   end
 
   defp load_workpads(runs) do
-    Map.new(runs, fn run ->
-      content =
-        case Board.read_workpad(run["id"], 1) do
-          {:ok, value} -> value
-          _ -> nil
-        end
-
-      {run["id"], content}
-    end)
+    Map.new(runs, fn run -> {run["id"], Board.workpads(run["id"])} end)
   end
 
-  defp workpad(workpads, run_id), do: workpads[run_id]
+  defp workpads(workpads, run_id), do: Map.get(workpads, run_id, [])
   defp selected_pair?(task, stage_id, model, effort), do: task.stage_selections[stage_id] == %{"model" => model, "effort" => effort}
   defp contract_frozen?(task), do: task.runtime_state in ["starting", "running", "stopping"] or Task.archived?(task)
   defp column_name(_bundle, nil), do: "Unknown"
