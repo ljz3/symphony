@@ -192,7 +192,9 @@ giving an agent write access to source files outside its managed worktree. `read
 
 The agent can use only the task/run-scoped `symphony_*` tools advertised by the service. It must
 complete a permitted transition before the invocation ends. A transition into another dispatch
-stage schedules a new run with that stage's frozen prompt and workpad.
+stage schedules a new run with that stage's frozen prompt and workpad. Mutating tool calls combine
+the run ID with the app-server call ID for idempotency, so call IDs may restart in a later run without
+replaying a prior run's result.
 
 `symphony_workpad_read` defaults to the active run and selected invocation. It may also select an
 explicit completed prior run of the same task; prompt handoffs expose each run's stage and available

@@ -212,7 +212,7 @@ Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
 - `symphony_task_transition`
 - `symphony_task_create`
 
-Pass app-server call metadata to the executor so the call ID becomes the idempotency key. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task.
+Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task.
 
 Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed prior runs with the same task ID; cross-task and other non-completed-run reads are rejected. Prior-run reads return run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
 

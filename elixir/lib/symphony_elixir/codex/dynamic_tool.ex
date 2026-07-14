@@ -253,7 +253,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     executor = Keyword.get(opts, :board_executor, &Board.execute/2)
     call_id = Keyword.fetch!(opts, :call_id) |> to_string()
     suffix = Keyword.get(opts, :idempotency_suffix)
-    key = if suffix, do: "#{call_id}:#{suffix}", else: call_id
+    base_key = "dynamic-tool:#{scope.run["id"]}:#{call_id}"
+    key = if suffix, do: "#{base_key}:#{suffix}", else: base_key
 
     executor.(command,
       actor: %{type: :agent, identity: scope.run["id"]},

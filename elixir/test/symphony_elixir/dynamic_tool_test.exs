@@ -102,6 +102,48 @@ defmodule SymphonyElixir.DynamicToolTest do
     refute Map.has_key?(create["inputSchema"]["properties"], "project_id")
   end
 
+  test "mutation call IDs are idempotent within one run and independent across runs" do
+    {first_created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("First call namespace")})
+    {first_todo, _} = BoardFactory.move(first_created, "todo")
+    {first_task, first_run} = claim(first_todo)
+
+    {second_created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Second call namespace")})
+    {second_todo, _} = BoardFactory.move(second_created, "todo")
+    {second_task, second_run} = claim(second_todo)
+
+    on_exit(fn ->
+      cleanup_active_run(first_task["id"], first_run["id"])
+      cleanup_active_run(second_task["id"], second_run["id"])
+    end)
+
+    first_args = %{
+      "criterion_id" => first_task["acceptance_criteria"] |> hd() |> Map.fetch!("id"),
+      "evidence" => [%{"command" => "mix test", "result" => "first passed"}],
+      "expected_revision" => first_task["revision"]
+    }
+
+    second_args = %{
+      "criterion_id" => second_task["acceptance_criteria"] |> hd() |> Map.fetch!("id"),
+      "evidence" => [%{"command" => "mix test", "result" => "second passed"}],
+      "expected_revision" => second_task["revision"]
+    }
+
+    first_opts = [task_id: first_task["id"], run_id: first_run["id"], call_id: "1"]
+    second_opts = [task_id: second_task["id"], run_id: second_run["id"], call_id: "1"]
+
+    assert %{"success" => true, "output" => first_json} =
+             DynamicTool.execute("symphony_acceptance_complete", first_args, first_opts)
+
+    assert %{"success" => true, "output" => second_json} =
+             DynamicTool.execute("symphony_acceptance_complete", second_args, second_opts)
+
+    assert Jason.decode!(first_json)["task"]["id"] == first_task["id"]
+    assert Jason.decode!(second_json)["task"]["id"] == second_task["id"]
+
+    assert %{"success" => true, "output" => ^first_json} =
+             DynamicTool.execute("symphony_acceptance_complete", first_args, first_opts)
+  end
+
   test "reads completed same-task prior-run workpads without permitting cross-task access" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Prior workpad")})
     {todo, _} = BoardFactory.move(created, "todo")
