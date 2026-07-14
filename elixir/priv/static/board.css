@@ -182,6 +182,8 @@ pre { overflow: auto; max-height: 28rem; margin: 0; border-radius: .7rem; paddin
 .model-summary-row:first-child > :is(th, td) { border-top: 0; }
 .model-stage-row th { padding-left: 1.4rem; }
 .stage-label::before { content: "↳"; margin-right: .4rem; color: var(--muted); }
+.model-effort-row th { padding-left: 2.6rem; }
+.effort-label::before { content: "↳"; margin-right: .4rem; color: var(--muted); }
 .rate-limit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .65rem; }
 .rate-limit-card { display: grid; gap: .55rem; border: 1px solid var(--line); border-radius: .75rem; padding: .75rem; background: #faf9f5; }
 .rate-limit-card time { color: var(--muted); font-size: .68rem; }

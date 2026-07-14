@@ -132,11 +132,13 @@ defmodule SymphonyElixirWebTest do
     assert stats =~ "Copy ID"
     assert stats =~ "Codex sessions"
     assert stats =~ "Completed tasks"
-    assert stats =~ "Usage by model and stage"
+    assert stats =~ "Usage by model, stage, and effort"
     assert stats =~ run["model"]
     assert stats =~ run["stage_id"]
+    assert stats =~ run["effort"]
     assert stats =~ ~s(<th scope="row"><strong>#{run["model"]}</strong>)
     assert stats =~ ~s(aria-label="#{run["model"]}, #{run["stage_id"]} stage")
+    assert stats =~ ~s(aria-label="#{run["model"]}, #{run["stage_id"]} stage, #{run["effort"]} effort")
 
     detail = html_response(build_conn() |> get("/tasks/#{created["identifier"]}"), 200)
     assert detail =~ "1,000"
@@ -151,6 +153,7 @@ defmodule SymphonyElixirWebTest do
     state = build_conn() |> get("/api/v1/state") |> json_response(200)
     model = Enum.find(state["stats"]["models"], &(&1["model"] == run["model"]))
     stage = Enum.find(model["stages"], &(&1["stage_id"] == run["stage_id"]))
+    refute Map.has_key?(stage, "efforts")
     assert state["stats"]["counts"]["session_count"] >= 1
     assert model["session_count"] >= 1
     assert model["active_session_count"] >= 1

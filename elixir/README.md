@@ -145,7 +145,7 @@ copy the directory into a source repository.
 The LiveView routes are:
 
 - `/` — ordered Kanban, task creation, drag/drop transitions, and health
-- `/stats` — all-time project/task/model/stage accounting, active sessions, service uptime, and per-worker rate limits
+- `/stats` — all-time project/task/model/stage/effort accounting, active sessions, service uptime, and per-worker rate limits
 - `/tasks/:identifier` — task contract, criteria and evidence, dependencies, model selections,
   source/PR state, effective live/canonical run statistics, every ordered workpad invocation for
   completed, failed, and stopped runs, and event history
@@ -272,21 +272,22 @@ a subset of input and is not added again. Aggregates are marked `complete`, `par
 `unavailable`: a partial UI total is prefixed with `≥`, unavailable usage is shown as `—`, and an
 authoritative zero remains `0`.
 
-The stats snapshot also groups the same effective runs by exact model and then by stage, combining
-effort levels. Each group reports distinct tasks, distinct all-time and active Codex thread IDs,
-active and total runs, turns, agent time, and token usage. Completed-task counts represent distinct
-current or archived Done tasks with a run that has a canonical start time or an effective session ID
-in the group. One completed task can therefore appear under several models or stages, while each
-model aggregate deduplicates that task across its own stages.
+The stats snapshot groups the same effective runs by exact model and then by stage, combining effort
+levels. Each model and stage aggregate reports distinct tasks, distinct all-time and active Codex
+thread IDs, active and total runs, turns, agent time, and token usage. The `/stats` HTML view also
+renders the same accounting separately for each observed effort beneath its stage row. Completed-task
+counts represent distinct current or archived Done tasks with a run that has a canonical start time
+or an effective session ID in the group. One completed task can therefore appear under several models,
+stages, or efforts, while each model aggregate deduplicates that task across its own stages.
 
 Agent time is the sum of run durations and can exceed service uptime or project age when agents run
 concurrently. Project age runs from the earliest claim and continues while idle. Service uptime,
 safe latest-activity labels, and rate limits keyed by local/SSH worker are operational values that
 reset when the orchestrator process restarts; token, turn, and terminal-duration history does not.
 
-`GET /api/v1/state` exposes the same snapshot under `stats`, including `models` with nested `stages`,
-per-group `session_count` and `active_session_count`, and project `session_count` and
-`completed_task_count` values. Task responses expose aggregate
+`GET /api/v1/state` exposes the public model/stage snapshot under `stats`, including `models` with
+nested `stages`, per-group `session_count` and `active_session_count`, and project `session_count`
+and `completed_task_count` values. Effort rows are private to the loopback HTML stats view. Task responses expose aggregate
 `stats`, preserve each run's canonical `stats`, and add `effective_stats` plus safe active
 `activity`. Session IDs remain confined to the loopback UI/API and are never published to GitHub.
 

@@ -74,16 +74,16 @@ defmodule SymphonyElixirWeb.StatsLive do
 
       <section class="detail-card stats-section">
         <div class="section-heading">
-          <div><p class="eyebrow">All durable history</p><h2>Usage by model and stage</h2></div>
+          <div><p class="eyebrow">All durable history</p><h2>Usage by model, stage, and effort</h2></div>
           <span class="revision">highest known token spend first</span>
         </div>
-        <p class="stats-note">Completed tasks are distinct Done tasks with a started run for each model or stage. A task can contribute to multiple rows.</p>
+        <p class="stats-note">Completed tasks are distinct Done tasks with a started run in each grouping. A task can contribute to multiple model, stage, or effort rows.</p>
         <p :if={@metrics["models"] == []} class="empty">No model usage yet.</p>
         <div :if={@metrics["models"] != []} class="table-wrap">
           <table class="stats-table model-usage-table">
             <thead>
               <tr>
-                <th>Model / stage</th>
+                <th>Model / stage / effort</th>
                 <th>Tasks</th>
                 <th>Completed</th>
                 <th>Sessions</th>
@@ -105,16 +105,28 @@ defmodule SymphonyElixirWeb.StatsLive do
                   <td class="numeric">{Telemetry.format_duration(group_agent_time(model, @metrics, @now))}</td>
                   <td class="numeric"><span>{Telemetry.format_token_total(model)}</span><small>{Telemetry.format_token_breakdown(model)}</small><span :if={Telemetry.partial?(model)} class="badge waiting">{model["token_usage_state"]}</span></td>
                 </tr>
-                <tr :for={stage <- model["stages"]} class="model-stage-row">
-                  <th scope="row" aria-label={stage_accessible_label(model["model"], stage["stage_id"])}><span class="stage-label">{stage_label(stage["stage_id"])}</span></th>
-                  <td class="numeric">{Telemetry.format_count(stage["task_count"])}</td>
-                  <td class="numeric">{Telemetry.format_count(stage["completed_task_count"])}</td>
-                  <td class="numeric"><span>{Telemetry.format_count(stage["session_count"])}</span><small>{Telemetry.format_count(stage["active_session_count"])} active</small></td>
-                  <td class="numeric">{Telemetry.format_count(stage["run_count"])}</td>
-                  <td class="numeric">{Telemetry.format_count(stage["turn_count"])}</td>
-                  <td class="numeric">{Telemetry.format_duration(group_agent_time(stage, @metrics, @now))}</td>
-                  <td class="numeric"><span>{Telemetry.format_token_total(stage)}</span><small>{Telemetry.format_token_breakdown(stage)}</small><span :if={Telemetry.partial?(stage)} class="badge waiting">{stage["token_usage_state"]}</span></td>
-                </tr>
+                <%= for stage <- model["stages"] do %>
+                  <tr class="model-stage-row">
+                    <th scope="row" aria-label={stage_accessible_label(model["model"], stage["stage_id"])}><span class="stage-label">{stage_label(stage["stage_id"])}</span><small>All efforts combined</small></th>
+                    <td class="numeric">{Telemetry.format_count(stage["task_count"])}</td>
+                    <td class="numeric">{Telemetry.format_count(stage["completed_task_count"])}</td>
+                    <td class="numeric"><span>{Telemetry.format_count(stage["session_count"])}</span><small>{Telemetry.format_count(stage["active_session_count"])} active</small></td>
+                    <td class="numeric">{Telemetry.format_count(stage["run_count"])}</td>
+                    <td class="numeric">{Telemetry.format_count(stage["turn_count"])}</td>
+                    <td class="numeric">{Telemetry.format_duration(group_agent_time(stage, @metrics, @now))}</td>
+                    <td class="numeric"><span>{Telemetry.format_token_total(stage)}</span><small>{Telemetry.format_token_breakdown(stage)}</small><span :if={Telemetry.partial?(stage)} class="badge waiting">{stage["token_usage_state"]}</span></td>
+                  </tr>
+                  <tr :for={effort <- stage["efforts"]} class="model-effort-row">
+                    <th scope="row" aria-label={effort_accessible_label(model["model"], stage["stage_id"], effort["effort"])}><span class="effort-label">{effort_label(effort["effort"])}</span></th>
+                    <td class="numeric">{Telemetry.format_count(effort["task_count"])}</td>
+                    <td class="numeric">{Telemetry.format_count(effort["completed_task_count"])}</td>
+                    <td class="numeric"><span>{Telemetry.format_count(effort["session_count"])}</span><small>{Telemetry.format_count(effort["active_session_count"])} active</small></td>
+                    <td class="numeric">{Telemetry.format_count(effort["run_count"])}</td>
+                    <td class="numeric">{Telemetry.format_count(effort["turn_count"])}</td>
+                    <td class="numeric">{Telemetry.format_duration(group_agent_time(effort, @metrics, @now))}</td>
+                    <td class="numeric"><span>{Telemetry.format_token_total(effort)}</span><small>{Telemetry.format_token_breakdown(effort)}</small><span :if={Telemetry.partial?(effort)} class="badge waiting">{effort["token_usage_state"]}</span></td>
+                  </tr>
+                <% end %>
               <% end %>
             </tbody>
           </table>
@@ -204,7 +216,7 @@ defmodule SymphonyElixirWeb.StatsLive do
     """
   end
 
-  defp load(socket), do: assign(socket, :metrics, Board.metrics())
+  defp load(socket), do: assign(socket, :metrics, Board.metrics_for_stats())
 
   defp project_agent_time(metrics, now) do
     Telemetry.live_duration_ms(
@@ -249,9 +261,15 @@ defmodule SymphonyElixirWeb.StatsLive do
   defp model_label(model), do: model
   defp stage_label(nil), do: "Unknown stage"
   defp stage_label(stage), do: stage
+  defp effort_label(nil), do: "Unknown effort"
+  defp effort_label(effort), do: effort
 
   defp stage_accessible_label(model, stage) do
     "#{model_label(model)}, #{stage_label(stage)} stage"
+  end
+
+  defp effort_accessible_label(model, stage, effort) do
+    "#{model_label(model)}, #{stage_label(stage)} stage, #{effort_label(effort)} effort"
   end
 
   defp rate_limit_json(limits), do: Jason.encode!(limits, pretty: true)

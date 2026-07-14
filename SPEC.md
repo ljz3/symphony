@@ -262,14 +262,14 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 Replace the read-only dashboard with a loopback-only LiveView application:
 
 - `/`: ordered Kanban with drag/drop, priority-aware ordering, dependency/runtime/blocked badges, PR links, and project health.
-- `/stats`: durable all-history project/task accounting with exact-model aggregates and nested stage breakdowns, active sessions, service uptime, safe activity, and current rate limits grouped by worker.
+- `/stats`: durable all-history project/task accounting with exact-model aggregates, nested stage breakdowns, and effort rows beneath each stage, plus active sessions, service uptime, safe activity, and current rate limits grouped by worker.
 - `/tasks/:identifier`: editable task detail, criteria/evidence, dependencies, stage selections, branch/PR, effective live/canonical run statistics, every ordered workpad invocation for every run outcome, event history, and Blocked resume/archive actions.
 - `/archive`: archived tasks.
 - Creation/edit forms enforce the complete task contract and only show selectors for stages with multiple allowed pairs.
 - Human moves are limited to configured transition edges; stopping/cancelling active work requires confirmation.
 - Header health covers workflow validity/pending activation, lease, board projection/history, remote sync, GitHub, per-task workpad publication failures, Codex catalog, and workers.
 - Kanban cards show per-task token, agent-time, and turn summaries. Project and task totals include archived history and overlay active telemetry without changing canonical events.
-- Model and model-stage summaries reuse the same effective runs, combine effort levels, count distinct all-time and active thread IDs, and preserve missing dimensions as Unknown. Completed-task participation counts distinct current or archived Done tasks per group only for runs with a canonical start time or an effective session ID, deduplicates within each model aggregate, and is intentionally non-additive across models and stages.
+- Model and model-stage summaries reuse the same effective runs, combine effort levels, count distinct all-time and active thread IDs, and preserve missing dimensions as Unknown. The `/stats` HTML view additionally renders effort-level summaries beneath each model-stage row, while the public stats JSON remains model/stage-shaped. Completed-task participation counts distinct current or archived Done tasks per group only for runs with a canonical start time or an effective session ID, deduplicates within each model aggregate, and is intentionally non-additive across models and stages.
 - Sum reported input, cached-input, output, and total fields independently. Mark aggregates complete, partial, or unavailable; cached input is a subset of input, partial totals are lower bounds, and authoritative zero remains distinct from missing usage.
 - Agent time sums run durations and may exceed project age or current service uptime under concurrency. Project age begins at the earliest claim; uptime, safe latest activity, and per-worker rate limits reset with the orchestrator.
 - `/mcp`: Streamable HTTP MCP sharing the configured UI port and exposing only guarded Backlog task creation.

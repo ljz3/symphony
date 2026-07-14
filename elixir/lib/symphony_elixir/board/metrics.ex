@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Board.Metrics do
 
   @type build_result :: %{
           required(:snapshot) => map(),
+          required(:ui_snapshot) => map(),
           required(:task_summaries) => %{optional(String.t()) => map()},
           required(:run_metrics) => %{optional(String.t()) => map()}
         }
@@ -70,17 +71,26 @@ defmodule SymphonyElixir.Board.Metrics do
       |> Map.put("first_run_at", first_run_at)
       |> Map.put("age_ms", elapsed_ms(first_run_at, now))
 
+    models = model_summaries(project_runs, completed_task_ids)
+
     snapshot = %{
       "generated_at" => iso8601(now),
       "counts" => counts,
       "project" => project,
       "runtime" => runtime_summary(runtime, now),
       "active_runs" => active_runs(project_runs),
-      "models" => model_summaries(project_runs, completed_task_ids),
+      "models" => public_model_summaries(models),
       "tasks" => sorted_task_summaries(Map.values(task_summaries))
     }
 
-    %{snapshot: snapshot, task_summaries: task_summaries, run_metrics: run_metrics}
+    ui_snapshot = Map.put(snapshot, "models", models)
+
+    %{
+      snapshot: snapshot,
+      ui_snapshot: ui_snapshot,
+      task_summaries: task_summaries,
+      run_metrics: run_metrics
+    }
   end
 
   @spec task_metrics(build_result(), String.t(), [map()]) :: {:ok, map()} | {:error, :not_found}
@@ -206,8 +216,28 @@ defmodule SymphonyElixir.Board.Metrics do
       stage_metrics
       |> group_summary(completed_task_ids)
       |> Map.put("stage_id", stage_id)
+      |> Map.put("efforts", effort_summaries(stage_metrics, completed_task_ids))
     end)
     |> sorted_dimension_summaries("stage_id")
+  end
+
+  defp effort_summaries(metrics, completed_task_ids) do
+    metrics
+    |> Enum.group_by(&dimension_value(&1["effort"]))
+    |> Enum.map(fn {effort, effort_metrics} ->
+      effort_metrics
+      |> group_summary(completed_task_ids)
+      |> Map.put("effort", effort)
+    end)
+    |> sorted_dimension_summaries("effort")
+  end
+
+  defp public_model_summaries(models) do
+    Enum.map(models, fn model ->
+      Map.update!(model, "stages", fn stages ->
+        Enum.map(stages, &Map.delete(&1, "efforts"))
+      end)
+    end)
   end
 
   defp group_summary(metrics, completed_task_ids) do

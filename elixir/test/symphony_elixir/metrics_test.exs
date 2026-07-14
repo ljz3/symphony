@@ -199,6 +199,62 @@ defmodule SymphonyElixir.MetricsTest do
     assert hd(unknown["stages"])["active_session_count"] == 1
   end
 
+  test "separates efforts under each model stage without changing the public snapshot" do
+    now = ~U[2026-07-13 12:00:00Z]
+    completed_task = task("effort-completed", "SYM-25", "done")
+    active_task = task("effort-active", "SYM-26", "in_progress")
+
+    high_effort =
+      run("effort-high", completed_task, "alpha", "implementation", "thread-high", usage(80, 40, 20, 100))
+
+    low_effort =
+      run("effort-low", completed_task, "alpha", "implementation", "thread-low", usage(160, 80, 40, 200))
+      |> Map.put("effort", "low")
+
+    unknown_effort =
+      run("effort-unknown", active_task, "alpha", "implementation", "thread-unknown", nil, "running")
+      |> Map.put("effort", nil)
+
+    build =
+      Metrics.build(
+        [completed_task, active_task],
+        [high_effort, low_effort, unknown_effort],
+        %{},
+        %{online: false, running: []},
+        %{blocked: "blocked", done: "done"},
+        now
+      )
+
+    public_alpha = hd(build.snapshot["models"])
+    public_stage = hd(public_alpha["stages"])
+    refute Map.has_key?(public_stage, "efforts")
+
+    ui_alpha = hd(build.ui_snapshot["models"])
+    ui_stage = hd(ui_alpha["stages"])
+    assert ui_stage["run_count"] == 3
+    assert ui_stage["task_count"] == 2
+    assert ui_stage["completed_task_count"] == 1
+    assert ui_stage["session_count"] == 3
+    assert ui_stage["token_usage"] == usage(240, 120, 60, 300)
+    assert ui_stage["token_usage_state"] == "partial"
+
+    assert Enum.map(ui_stage["efforts"], & &1["effort"]) == ["low", "high", nil]
+
+    low = Enum.find(ui_stage["efforts"], &(&1["effort"] == "low"))
+    high = Enum.find(ui_stage["efforts"], &(&1["effort"] == "high"))
+    unknown = Enum.find(ui_stage["efforts"], &is_nil(&1["effort"]))
+
+    assert low["token_usage"] == usage(160, 80, 40, 200)
+    assert low["token_usage_state"] == "complete"
+    assert low["completed_task_count"] == 1
+    assert high["token_usage"] == usage(80, 40, 20, 100)
+    assert high["completed_task_count"] == 1
+    assert unknown["token_usage"] == nil
+    assert unknown["token_usage_state"] == "unavailable"
+    assert unknown["completed_task_count"] == 0
+    assert ui_alpha["token_usage"] == usage(240, 120, 60, 300)
+  end
+
   test "credits completed tasks only to models whose runs started" do
     now = ~U[2026-07-13 12:00:00Z]
     completed_task = task("completed-after-retry", "SYM-23", "done")

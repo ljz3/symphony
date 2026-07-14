@@ -312,8 +312,9 @@ The board builds effective run statistics without adding a second durable accoun
   cached-input, output, and total fields independently; cached input is informational and is never
   added to total again.
 - Group project runs by exact model and then by stage, combining effort levels and applying the same
-  live/canonical token completeness rules independently to every group. Preserve missing model or
-  stage values in an Unknown bucket rather than dropping their accounting.
+  live/canonical token completeness rules independently to every public group. The HTML stats view
+  further groups each model/stage pair by effort without changing the public JSON shape. Preserve
+  missing model, stage, or effort values in an Unknown bucket rather than dropping their accounting.
 - Count Codex sessions as distinct nonempty thread IDs and active sessions as distinct nonempty
   thread IDs on active runs. Count completed tasks in a model or stage as distinct current or
   archived Done tasks with a run in that group that has a canonical start time or an effective
@@ -331,7 +332,8 @@ The board builds effective run statistics without adding a second durable accoun
   never raw prompts, reasoning, command output, workpads, or arbitrary protocol payloads.
 
 `GET /api/v1/state` exposes project/runtime/task summaries under `stats`, plus model summaries with
-nested stage summaries and project session/completion counts. Task responses retain canonical run
+nested stage summaries and project session/completion counts. Effort summaries are private to the
+HTML stats view. Task responses retain canonical run
 `stats` and add `effective_stats` plus optional safe `activity` for live display.
 
 Completed, stopped, and failed runs expose duration, turn count, and cumulative usage through the

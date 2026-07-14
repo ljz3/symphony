@@ -51,6 +51,9 @@ defmodule SymphonyElixir.Board do
   @spec metrics() :: map()
   def metrics, do: metrics_build().snapshot
 
+  @spec metrics_for_stats() :: map()
+  def metrics_for_stats, do: metrics_build().ui_snapshot
+
   @spec task_metrics(String.t()) :: {:ok, map()} | {:error, :not_found}
   def task_metrics(id_or_identifier) when is_binary(id_or_identifier) do
     with {:ok, task} <- task(id_or_identifier) do
