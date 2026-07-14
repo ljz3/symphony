@@ -258,10 +258,16 @@ defmodule SymphonyElixir.Board do
     tasks = tasks() ++ tasks(archived: true)
     runtime = safe_status(Orchestrator, :status, %{online: false, running: [], rate_limits: []})
 
-    blocked_column_id =
+    column_ids =
       case Workflow.current() do
-        {:ok, bundle} -> Bundle.blocked_column(bundle).id
-        _ -> nil
+        {:ok, bundle} ->
+          %{
+            blocked: Bundle.blocked_column(bundle).id,
+            done: Bundle.done_column(bundle).id
+          }
+
+        _ ->
+          %{}
       end
 
     Metrics.build(
@@ -269,7 +275,7 @@ defmodule SymphonyElixir.Board do
       runs(),
       Projection.list_run_telemetry(),
       runtime,
-      blocked_column_id,
+      column_ids,
       DateTime.utc_now()
     )
   end

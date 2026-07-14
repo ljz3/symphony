@@ -23,10 +23,15 @@ defmodule SymphonyElixir.Board.Metrics do
           required(:run_metrics) => %{optional(String.t()) => map()}
         }
 
-  @spec build([Task.t()], [map()], %{optional(String.t()) => map()}, map(), String.t() | nil, DateTime.t()) ::
+  @type column_ids :: %{
+          optional(:blocked) => String.t() | nil,
+          optional(:done) => String.t() | nil
+        }
+
+  @spec build([Task.t()], [map()], %{optional(String.t()) => map()}, map(), column_ids(), DateTime.t()) ::
           build_result()
-  def build(tasks, runs, telemetry, runtime, blocked_column_id, %DateTime{} = now)
-      when is_list(tasks) and is_list(runs) and is_map(telemetry) and is_map(runtime) do
+  def build(tasks, runs, telemetry, runtime, column_ids, %DateTime{} = now)
+      when is_list(tasks) and is_list(runs) and is_map(telemetry) and is_map(runtime) and is_map(column_ids) do
     task_by_id = Map.new(tasks, &{&1.id, &1})
     runtime_by_run = runtime_by_run(runtime)
 
@@ -46,14 +51,17 @@ defmodule SymphonyElixir.Board.Metrics do
 
     project_runs = Map.values(run_metrics)
     project_accounting = aggregate(project_runs)
+    completed_task_ids = completed_task_ids(tasks, column_ids[:done])
     first_run_at = earliest_claimed_at(runs)
 
     counts = %{
       "task_count" => length(tasks),
       "archived_task_count" => Enum.count(tasks, &Task.archived?/1),
       "active_run_count" => Enum.count(project_runs, & &1["active"]),
-      "blocked_task_count" => blocked_task_count(tasks, blocked_column_id),
+      "blocked_task_count" => blocked_task_count(tasks, column_ids[:blocked]),
+      "completed_task_count" => MapSet.size(completed_task_ids),
       "run_count" => length(project_runs),
+      "session_count" => unique_count(project_runs, "session_id"),
       "turn_count" => project_accounting["turn_count"]
     }
 
@@ -68,6 +76,7 @@ defmodule SymphonyElixir.Board.Metrics do
       "project" => project,
       "runtime" => runtime_summary(runtime, now),
       "active_runs" => active_runs(project_runs),
+      "models" => model_summaries(project_runs, completed_task_ids),
       "tasks" => sorted_task_summaries(Map.values(task_summaries))
     }
 
@@ -102,6 +111,7 @@ defmodule SymphonyElixir.Board.Metrics do
   defp effective_run(run, telemetry, runtime, task, now) do
     active = run["status"] in @active_statuses
     effective_stats = if active, do: live_stats(run, telemetry, now), else: terminal_stats(run)
+    session_id = effective_session_id(run["session_id"], runtime_value(runtime, :session_id))
 
     %{
       "run_id" => run["id"],
@@ -113,7 +123,7 @@ defmodule SymphonyElixir.Board.Metrics do
       "model" => run["model"],
       "effort" => run["effort"],
       "worker_host" => run["worker_host"],
-      "session_id" => run["session_id"] || runtime_value(runtime, :session_id),
+      "session_id" => session_id,
       "claimed_at" => run["claimed_at"],
       "started_at" => run["started_at"],
       "finished_at" => run["finished_at"],
@@ -177,6 +187,42 @@ defmodule SymphonyElixir.Board.Metrics do
     }
   end
 
+  defp model_summaries(metrics, completed_task_ids) do
+    metrics
+    |> Enum.group_by(&dimension_value(&1["model"]))
+    |> Enum.map(fn {model, model_metrics} ->
+      model_metrics
+      |> group_summary(completed_task_ids)
+      |> Map.put("model", model)
+      |> Map.put("stages", stage_summaries(model_metrics, completed_task_ids))
+    end)
+    |> sorted_dimension_summaries("model")
+  end
+
+  defp stage_summaries(metrics, completed_task_ids) do
+    metrics
+    |> Enum.group_by(&dimension_value(&1["stage_id"]))
+    |> Enum.map(fn {stage_id, stage_metrics} ->
+      stage_metrics
+      |> group_summary(completed_task_ids)
+      |> Map.put("stage_id", stage_id)
+    end)
+    |> sorted_dimension_summaries("stage_id")
+  end
+
+  defp group_summary(metrics, completed_task_ids) do
+    accounting = aggregate(metrics)
+
+    accounting
+    |> Map.merge(%{
+      "task_count" => unique_count(metrics, "task_id"),
+      "completed_task_count" => completed_task_count(metrics, completed_task_ids),
+      "session_count" => unique_count(metrics, "session_id"),
+      "active_session_count" => active_session_count(metrics),
+      "active_run_count" => Enum.count(metrics, & &1["active"])
+    })
+  end
+
   defp aggregate_usage([], _known, 0), do: {@zero_usage, "complete"}
   defp aggregate_usage(_metrics, [], _unknown), do: {nil, "unavailable"}
 
@@ -200,6 +246,16 @@ defmodule SymphonyElixir.Board.Metrics do
       total = get_in(summary, ["token_usage", "total_tokens"])
       known_rank = if is_integer(total), do: 0, else: 1
       {known_rank, -(total || 0), summary["task_identifier"]}
+    end)
+  end
+
+  defp sorted_dimension_summaries(summaries, dimension) do
+    Enum.sort_by(summaries, fn summary ->
+      value = summary[dimension]
+      total = get_in(summary, ["token_usage", "total_tokens"])
+      dimension_rank = if is_binary(value) and value != "", do: 0, else: 1
+      known_token_rank = if is_integer(total), do: 0, else: 1
+      {dimension_rank, known_token_rank, -(total || 0), value || ""}
     end)
   end
 
@@ -277,6 +333,53 @@ defmodule SymphonyElixir.Board.Metrics do
       not Task.archived?(task) and task.column_id == (blocked_column_id || "blocked")
     end)
   end
+
+  defp completed_task_ids(tasks, done_column_id) do
+    tasks
+    |> Enum.filter(&(&1.column_id == (done_column_id || "done")))
+    |> Enum.map(& &1.id)
+    |> MapSet.new()
+  end
+
+  defp completed_task_count(metrics, completed_task_ids) do
+    metrics
+    |> Enum.filter(&completion_participant?/1)
+    |> Enum.map(& &1["task_id"])
+    |> Enum.filter(&MapSet.member?(completed_task_ids, &1))
+    |> MapSet.new()
+    |> MapSet.size()
+  end
+
+  defp completion_participant?(metric) do
+    nonempty_binary?(metric["started_at"]) or nonempty_binary?(metric["session_id"])
+  end
+
+  defp active_session_count(metrics) do
+    metrics
+    |> Enum.filter(& &1["active"])
+    |> unique_count("session_id")
+  end
+
+  defp unique_count(metrics, key) do
+    metrics
+    |> Enum.map(& &1[key])
+    |> Enum.filter(&nonempty_binary?/1)
+    |> MapSet.new()
+    |> MapSet.size()
+  end
+
+  defp effective_session_id(run_session_id, runtime_session_id) do
+    cond do
+      nonempty_binary?(run_session_id) -> run_session_id
+      nonempty_binary?(runtime_session_id) -> runtime_session_id
+      true -> nil
+    end
+  end
+
+  defp nonempty_binary?(value), do: is_binary(value) and value != ""
+
+  defp dimension_value(value) when is_binary(value) and value != "", do: value
+  defp dimension_value(_value), do: nil
 
   defp normalized_usage(usage) when is_map(usage) do
     keys = ~w(input_tokens cached_input_tokens output_tokens total_tokens)

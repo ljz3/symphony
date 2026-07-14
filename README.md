@@ -23,7 +23,8 @@ Symphony separates durable task authority from rebuildable runtime state:
 - Completed, stopped, and failed Codex runs retain canonical runtime/turn/token statistics; the PR
   body or the run's published workpad comment exposes the same compact summary without extra comments.
 - The board and statistics view combine those durable summaries with active SQLite telemetry to show
-  all-time project/task usage, live agent time, safe activity, and current per-worker rate limits.
+  all-time project/task usage, exact-model and stage breakdowns, live agent time, safe activity, and
+  current per-worker rate limits.
 - `WORKFLOW.yml` plus strict Solid Markdown templates define columns, transitions, stages, prompts,
   model policy, and hooks.
 

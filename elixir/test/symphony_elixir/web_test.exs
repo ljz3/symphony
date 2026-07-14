@@ -130,6 +130,13 @@ defmodule SymphonyElixirWebTest do
     stats = html_response(build_conn() |> get("/stats"), 200)
     assert stats =~ "1,000"
     assert stats =~ "Copy ID"
+    assert stats =~ "Codex sessions"
+    assert stats =~ "Completed tasks"
+    assert stats =~ "Usage by model and stage"
+    assert stats =~ run["model"]
+    assert stats =~ run["stage_id"]
+    assert stats =~ ~s(<th scope="row"><strong>#{run["model"]}</strong>)
+    assert stats =~ ~s(aria-label="#{run["model"]}, #{run["stage_id"]} stage")
 
     detail = html_response(build_conn() |> get("/tasks/#{created["identifier"]}"), 200)
     assert detail =~ "1,000"
@@ -140,6 +147,16 @@ defmodule SymphonyElixirWebTest do
     assert hd(response["runs"])["stats"] == nil
     assert hd(response["runs"])["effective_stats"]["source"] == "live"
     assert hd(response["runs"])["effective_stats"]["token_usage"]["cached_input_tokens"] == 600
+
+    state = build_conn() |> get("/api/v1/state") |> json_response(200)
+    model = Enum.find(state["stats"]["models"], &(&1["model"] == run["model"]))
+    stage = Enum.find(model["stages"], &(&1["stage_id"] == run["stage_id"]))
+    assert state["stats"]["counts"]["session_count"] >= 1
+    assert model["session_count"] >= 1
+    assert model["active_session_count"] >= 1
+    assert model["active_run_count"] >= 1
+    assert stage["active_session_count"] >= 1
+    assert stage["token_usage"]["total_tokens"] >= 1_000
 
     assert {:ok, _result} =
              Board.execute(

@@ -311,6 +311,15 @@ The board builds effective run statistics without adding a second durable accoun
 - Task and project totals include every run, including archived tasks. Sum the authoritative input,
   cached-input, output, and total fields independently; cached input is informational and is never
   added to total again.
+- Group project runs by exact model and then by stage, combining effort levels and applying the same
+  live/canonical token completeness rules independently to every group. Preserve missing model or
+  stage values in an Unknown bucket rather than dropping their accounting.
+- Count Codex sessions as distinct nonempty thread IDs and active sessions as distinct nonempty
+  thread IDs on active runs. Count completed tasks in a model or stage as distinct current or
+  archived Done tasks with a run in that group that has a canonical start time or an effective
+  session ID. These participation counts are intentionally non-additive across models and stages;
+  model totals deduplicate across their nested stages, and the project total counts each Done task
+  once.
 - An aggregate with usage for every included run is `complete`. Some known and some missing runs is
   `partial`; no authoritative usage from any included run is `unavailable`. A collection with no
   runs is an exact zero. The UI renders partial totals as a lower bound (`≥`) and unavailable totals
@@ -321,8 +330,9 @@ The board builds effective run statistics without adding a second durable accoun
 - Rate limits are retained per local/SSH worker. Activity summaries expose bounded lifecycle labels,
   never raw prompts, reasoning, command output, workpads, or arbitrary protocol payloads.
 
-`GET /api/v1/state` exposes project/runtime/task summaries under `stats`. Task responses retain
-canonical run `stats` and add `effective_stats` plus optional safe `activity` for live display.
+`GET /api/v1/state` exposes project/runtime/task summaries under `stats`, plus model summaries with
+nested stage summaries and project session/completion counts. Task responses retain canonical run
+`stats` and add `effective_stats` plus optional safe `activity` for live display.
 
 Completed, stopped, and failed runs expose duration, turn count, and cumulative usage through the
 board/API. After termination, the run that created the PR is appended once to the managed PR body;
