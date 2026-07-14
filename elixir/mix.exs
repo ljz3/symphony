@@ -128,6 +128,7 @@ defmodule SymphonyElixir.MixProject do
   defp escript do
     [
       app: nil,
+      include_priv_for: [:exqlite],
       main_module: SymphonyElixir.CLI,
       name: "symphony",
       path: "bin/symphony"

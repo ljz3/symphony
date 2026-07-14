@@ -31,6 +31,10 @@ defmodule SymphonyElixir.CLITest do
     assert CLI.usage_message() =~ "WORKFLOW.yml"
   end
 
+  test "escript bundles the Exqlite native library for startup extraction" do
+    assert :exqlite in Mix.Project.config()[:escript][:include_priv_for]
+  end
+
   test "runs board status with explicit machine-local startup options" do
     deps = %{
       file_regular?: &File.regular?/1,

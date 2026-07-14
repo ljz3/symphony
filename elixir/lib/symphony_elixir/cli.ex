@@ -4,6 +4,7 @@ defmodule SymphonyElixir.CLI do
   alias SymphonyElixir.{Board, Config, LogFile, Paths, Workflow}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
+  @exqlite_nif_entry_prefix "exqlite/priv/sqlite3_nif."
   @switches [
     {@acknowledgement_switch, :boolean},
     logs_root: :string,
@@ -186,13 +187,20 @@ defmodule SymphonyElixir.CLI do
   defp start(path, deps) do
     if deps.file_regular?.(path) do
       :ok = Workflow.set_workflow_file_path(path)
-
-      case deps.ensure_all_started.() do
-        {:ok, _apps} -> :ok
-        {:error, reason} -> {:error, "Failed to start Symphony with workflow #{path}: #{inspect(reason)}"}
-      end
+      start_application(path, deps)
     else
       {:error, "Workflow file not found: #{path}"}
+    end
+  end
+
+  defp start_application(path, deps) do
+    with :ok <- prepare_escript_native_dependencies(), do: ensure_all_started(path, deps)
+  end
+
+  defp ensure_all_started(path, deps) do
+    case deps.ensure_all_started.() do
+      {:ok, _apps} -> :ok
+      {:error, reason} -> {:error, "Failed to start Symphony with workflow #{path}: #{inspect(reason)}"}
     end
   end
 
@@ -213,6 +221,103 @@ defmodule SymphonyElixir.CLI do
       file_regular?: &File.regular?/1,
       ensure_all_started: fn -> Application.ensure_all_started(:symphony_elixir) end
     }
+  end
+
+  defp prepare_escript_native_dependencies do
+    script_path = :escript.script_name() |> List.to_string() |> Path.expand()
+
+    if Path.basename(script_path) == "symphony" do
+      case extract_exqlite_nif(script_path) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "Failed to prepare embedded SQLite library: #{inspect(reason)}"}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp extract_exqlite_nif(script_path) do
+    with {:ok, sections} <- :escript.extract(String.to_charlist(script_path), []),
+         {:ok, archive} when is_binary(archive) <- Keyword.fetch(sections, :archive),
+         {:ok, entries} <- :zip.extract(archive, [:memory]),
+         {entry_name, nif} when is_binary(nif) <- find_exqlite_nif(entries) do
+      cache_exqlite_nif(entry_name, nif)
+    else
+      nil -> {:error, :embedded_exqlite_nif_not_found}
+      {:error, _reason} = error -> error
+      _other -> {:error, :invalid_escript_archive}
+    end
+  end
+
+  defp find_exqlite_nif(entries) do
+    Enum.find(entries, fn {entry_name, _contents} ->
+      entry_name
+      |> List.to_string()
+      |> String.starts_with?(@exqlite_nif_entry_prefix)
+    end)
+  end
+
+  defp cache_exqlite_nif(entry_name, nif) do
+    digest = :sha256 |> :crypto.hash(nif) |> Base.encode16(case: :lower)
+
+    user_cache = :filename.basedir(:user_cache, ~c"symphony") |> List.to_string()
+    cache_root = Path.join([user_cache, "escript", digest, "exqlite"])
+
+    ebin_path = Path.join(cache_root, "ebin")
+    priv_path = Path.join(cache_root, "priv")
+    nif_path = Path.join(priv_path, entry_name |> List.to_string() |> Path.basename())
+
+    with :ok <- File.mkdir_p(ebin_path),
+         :ok <- File.mkdir_p(priv_path),
+         :ok <- write_cached_nif(nif_path, nif),
+         true <- :code.add_patha(String.to_charlist(ebin_path)) do
+      verify_exqlite_priv_path(priv_path)
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp verify_exqlite_priv_path(expected_path) do
+    case :code.priv_dir(:exqlite) do
+      path when is_list(path) ->
+        if Path.expand(List.to_string(path)) == Path.expand(expected_path),
+          do: :ok,
+          else: {:error, {:unexpected_exqlite_priv_dir, List.to_string(path)}}
+
+      error ->
+        {:error, {:unresolved_exqlite_priv_dir, error}}
+    end
+  end
+
+  defp write_cached_nif(path, nif) do
+    case File.read(path) do
+      {:ok, ^nif} ->
+        :ok
+
+      _missing_or_stale ->
+        temporary_path = "#{path}.#{System.pid()}.#{System.unique_integer([:positive])}.tmp"
+
+        result =
+          with :ok <- File.write(temporary_path, nif, [:binary, :exclusive]),
+               :ok <- File.rename(temporary_path, path) do
+            File.chmod(path, 0o600)
+          end
+
+        File.rm(temporary_path)
+
+        case result do
+          {:error, :eexist} -> verify_cached_nif(path, nif)
+          other -> other
+        end
+    end
+  end
+
+  defp verify_cached_nif(path, expected) do
+    case File.read(path) do
+      {:ok, ^expected} -> :ok
+      {:ok, _other} -> {:error, {:native_cache_content_mismatch, path}}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp json_safe(%_{} = struct), do: struct |> Map.from_struct() |> json_safe()

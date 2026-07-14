@@ -42,6 +42,11 @@ mise exec -- mix setup
 mise exec -- mix build
 ```
 
+The build embeds Exqlite's native SQLite library in `bin/symphony`. On escript startup, Symphony
+extracts that library into a content-addressed directory under the current user's cache and adds
+only its synthetic `ebin` directory to the front of the code path so `:code.priv_dir/1` resolves a
+real filesystem location for NIF loading.
+
 ## Start the service
 
 The CLI requires both the preview acknowledgement and a loopback port. It defaults to

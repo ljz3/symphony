@@ -296,6 +296,8 @@ Update CLI behavior:
 - Require `--port` or `SYMPHONY_PORT`; bind only to loopback.
 - Add `--symphony-home`, `--worktrees-root`, and existing log overrides.
 - Add `board status`, `board checkpoint`, `board handoff`, and guarded divergence-reconciliation commands.
+- Package Exqlite's native library in the escript and extract a content-addressed copy into the
+  current user's cache before OTP application startup so the standard launcher can load SQLite.
 
 ## Migration, Documentation, and Testing
 
