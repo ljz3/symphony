@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Board.Storage do
   alias Ecto.Adapters.SQL
   alias SymphonyElixir.Repo
 
-  @migration_version 2
+  @migration_version 3
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -47,11 +47,15 @@ defmodule SymphonyElixir.Board.Storage do
   defp apply_migrations do
     current = migration_version()
 
-    with :ok <- maybe_apply_version_one(current), do: maybe_apply_version_two(current)
+    with :ok <- maybe_apply_version_one(current),
+         :ok <- maybe_apply_version_two(current) do
+      maybe_apply_version_three(current)
+    end
   end
 
   defp maybe_apply_version_one(current), do: if(current < 1, do: apply_version_one(), else: :ok)
   defp maybe_apply_version_two(current), do: if(current < 2, do: apply_version_two(), else: :ok)
+  defp maybe_apply_version_three(current), do: if(current < 3, do: apply_version_three(), else: :ok)
 
   defp apply_version_one do
     Repo.transaction(&migrate_version_one/0)
@@ -92,6 +96,21 @@ defmodule SymphonyElixir.Board.Storage do
     |> case do
       {:ok, _value} -> :ok
       {:error, reason} -> {:error, {:projection_migration_failed, 2, reason}}
+    end
+  end
+
+  defp apply_version_three do
+    Repo.transaction(fn ->
+      SQL.query!(Repo, "ALTER TABLE board_workpads ADD COLUMN template_sha256 TEXT", [])
+
+      SQL.query!(Repo, "INSERT INTO board_migrations(version, applied_at) VALUES (?, ?)", [
+        3,
+        timestamp()
+      ])
+    end)
+    |> case do
+      {:ok, _value} -> :ok
+      {:error, reason} -> {:error, {:projection_migration_failed, 3, reason}}
     end
   end
 

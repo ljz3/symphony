@@ -154,6 +154,14 @@ defmodule SymphonyElixir.Board do
   @spec write_workpad(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def write_workpad(run_id, invocation, content), do: WorkpadStore.write(run_id, invocation, content)
 
+  @spec write_workpad_template(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
+  def write_workpad_template(run_id, invocation, content),
+    do: WorkpadStore.write_template(run_id, invocation, content)
+
+  @spec latest_workpad(String.t(), String.t()) :: map() | nil
+  def latest_workpad(task_id, current_run_id),
+    do: WorkpadStore.latest_meaningful(task_id, current_run_id)
+
   @spec read_workpad(String.t(), pos_integer()) :: {:ok, String.t()} | {:error, :not_found}
   def read_workpad(run_id, invocation), do: Projection.read_workpad(run_id, invocation)
 

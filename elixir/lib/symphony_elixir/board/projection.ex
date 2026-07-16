@@ -229,13 +229,14 @@ defmodule SymphonyElixir.Board.Projection do
     case SQL.query(
            Repo,
            """
-           INSERT INTO board_workpads(run_id, invocation, content, published, publication_id, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+           INSERT INTO board_workpads(run_id, invocation, content, published, publication_id, updated_at, template_sha256)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id, invocation) DO UPDATE SET
              content = excluded.content,
              published = excluded.published,
              publication_id = excluded.publication_id,
-             updated_at = excluded.updated_at
+             updated_at = excluded.updated_at,
+             template_sha256 = excluded.template_sha256
            """,
            [
              value(workpad, :run_id),
@@ -243,7 +244,8 @@ defmodule SymphonyElixir.Board.Projection do
              value(workpad, :content),
              if(value(workpad, :published, false), do: 1, else: 0),
              value(workpad, :publication_id),
-             value(workpad, :updated_at)
+             value(workpad, :updated_at),
+             value(workpad, :template_sha256)
            ]
          ) do
       {:ok, _result} -> :ok
@@ -286,7 +288,7 @@ defmodule SymphonyElixir.Board.Projection do
     SQL.query!(
       Repo,
       """
-      SELECT run_id, invocation, content, published, publication_id, updated_at
+      SELECT run_id, invocation, content, published, publication_id, updated_at, template_sha256
       FROM board_workpads
       WHERE run_id = ?
       ORDER BY invocation ASC
@@ -301,20 +303,21 @@ defmodule SymphonyElixir.Board.Projection do
     SQL.query!(
       Repo,
       """
-      SELECT run_id, invocation, content, published, publication_id, updated_at
+      SELECT run_id, invocation, content, published, publication_id, updated_at, template_sha256
       FROM board_workpads
       ORDER BY run_id ASC, invocation ASC
       """,
       []
     ).rows
-    |> Enum.map(fn [run_id, invocation, content, published, publication_id, updated_at] ->
+    |> Enum.map(fn [run_id, invocation, content, published, publication_id, updated_at, template_sha256] ->
       %{
         run_id: run_id,
         invocation: invocation,
         content: content,
         published: published == 1,
         publication_id: publication_id,
-        updated_at: updated_at
+        updated_at: updated_at,
+        template_sha256: template_sha256
       }
     end)
   end
@@ -328,8 +331,8 @@ defmodule SymphonyElixir.Board.Projection do
         SQL.query!(
           Repo,
           """
-          INSERT INTO board_workpads(run_id, invocation, content, published, publication_id, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO board_workpads(run_id, invocation, content, published, publication_id, updated_at, template_sha256)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
           """,
           [
             value(workpad, :run_id),
@@ -337,7 +340,8 @@ defmodule SymphonyElixir.Board.Projection do
             value(workpad, :content),
             if(value(workpad, :published, false), do: 1, else: 0),
             value(workpad, :publication_id),
-            value(workpad, :updated_at)
+            value(workpad, :updated_at),
+            value(workpad, :template_sha256)
           ]
         )
       end)
@@ -564,14 +568,15 @@ defmodule SymphonyElixir.Board.Projection do
     DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
   end
 
-  defp workpad_map([run_id, invocation, content, published, publication_id, updated_at]) do
+  defp workpad_map([run_id, invocation, content, published, publication_id, updated_at, template_sha256]) do
     %{
       "run_id" => run_id,
       "invocation" => invocation,
       "content" => content,
       "published" => published == 1,
       "publication_id" => publication_id,
-      "updated_at" => updated_at
+      "updated_at" => updated_at,
+      "template_sha256" => template_sha256
     }
   end
 

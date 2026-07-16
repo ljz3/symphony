@@ -38,11 +38,67 @@ defmodule SymphonyElixir.WorkflowTest do
     File.write!(path, """
     {% if github %}{{ github.number }}{% endif %}
     {% if dependencies %}{{ dependencies[0].identifier }}{% endif %}
-    {% if prior_handoffs %}{{ prior_handoffs[0].run_id }}{% endif %}
+    {% if latest_workpad %}{{ latest_workpad.run_id }}{% endif %}
     """)
 
     assert {:error, {:template_parse_error, ^path, message}} = Workflow.load(source.workflow)
     assert message =~ "Undefined variable"
+  end
+
+  test "accepts every bounded current-state field in absent and populated template branches" do
+    source = BoardFactory.workflow_source()
+    path = Path.join(Path.dirname(source.workflow), "workflow/prompts/context.md")
+
+    File.write!(path, """
+    task={{ task.id }}:{{ task.identifier }}:{{ task.title }}:{{ task.type }}:{{ task.priority }}:{{ task.brief }}:{{ task.branch }}:{{ task.column_id }}:{{ task.revision }}
+    {% if task.block %}block={{ task.block.from_column_id }}:{{ task.block.reason }}{% endif %}
+    run={{ run.id }}:{{ run.stage_id }}:{{ run.status }}:{{ run.model }}:{{ run.effort }}:{{ run.claimed_at }}:{{ run.started_at }}:{{ run.updated_at }}
+    {% if run.worker_host %}worker={{ run.worker_host }}{% endif %}
+    {% if source.head_sha %}source={{ source.head_sha }}:{{ source.base_sha }}:{{ source.clean }}{% endif %}
+    {% if github.number %}github={{ github.number }}:{{ github.url }}:{{ github.state }}:{{ github.draft }}:{{ github.head_sha }}:{{ github.ready }}:{{ github.merged }}:{{ github.merge_sha }}:{{ github.reachable }}{% endif %}
+    {% for dependency in dependencies %}dependency={{ dependency.id }}:{{ dependency.identifier }}:{{ dependency.title }}:{{ dependency.column_id }}:{{ dependency.satisfied }}{% endfor %}
+    {% for criterion in criteria %}criterion={{ criterion.id }}:{{ criterion.text }}:{{ criterion.completed }}:{{ criterion.evidence }}{% endfor %}
+    {% for transition in allowed_transitions %}transition={{ transition.id }}:{{ transition.name }}:{{ transition.role }}{% endfor %}
+    {% if preflight %}preflight={{ preflight.status }}:{{ preflight.phase }}:{{ preflight.fingerprint }}:{{ preflight.reason }}:{{ preflight.started_at }}:{{ preflight.last_activity_at }}:{{ preflight.completed_at }}:{{ preflight.next_retry_at }}{% endif %}
+    {% if job %}job={{ job.job_id }}:{{ job.job }}:{{ job.status }}:{{ job.started_at }}:{{ job.finished_at }}:{{ job.elapsed_ms }}:{{ job.source_fingerprint }}{% endif %}
+    {% if latest_workpad %}latest={{ latest_workpad.run_id }}:{{ latest_workpad.stage_id }}:{{ latest_workpad.status }}:{{ latest_workpad.finished_at }}:{{ latest_workpad.invocation }}:{{ latest_workpad.updated_at }}:{{ latest_workpad.content }}{% endif %}
+    stage={{ stage.id }} workpad={{ workpad }} turn={{ turn_number }}
+    """)
+
+    assert {:ok, _bundle} = Workflow.load(source.workflow)
+  end
+
+  test "rejects forbidden current-state paths even inside populated guards" do
+    source = BoardFactory.workflow_source()
+    path = Path.join(Path.dirname(source.workflow), "workflow/prompts/context.md")
+
+    forbidden_templates = [
+      {"task.runtime_state direct", "{{ task.runtime_state }}"},
+      {"task.desired_column_id guarded", "{% if task.id %}{{ task.desired_column_id }}{% endif %}"},
+      {"dependency.brief direct", "{% for dependency in dependencies %}{{ dependency.brief }}{% endfor %}"},
+      {"dependency.branch guarded", "{% for dependency in dependencies %}{% if dependency.id %}{{ dependency.branch }}{% endif %}{% endfor %}"},
+      {"dependency.runtime_state guarded", "{% for dependency in dependencies %}{% if dependency.id %}{{ dependency.runtime_state }}{% endif %}{% endfor %}"},
+      {"source.raw_payload guarded", "{% if source.head_sha %}{{ source.raw_payload }}{% endif %}"},
+      {"job.stdout direct", "{{ job.stdout }}"},
+      {"job.stderr guarded", "{% if job.status %}{{ job.stderr }}{% endif %}"},
+      {"job.call_ids guarded", "{% if job.status %}{{ job.call_ids }}{% endif %}"},
+      {"preflight.workspace direct", "{{ preflight.workspace }}"},
+      {"preflight.raw guarded", "{% if preflight.status %}{{ preflight.raw }}{% endif %}"},
+      {"stage.prompt guarded", "{% if stage.id %}{{ stage.prompt }}{% endif %}"},
+      {"stage.workpad_template direct", "{{ stage.workpad_template }}"}
+    ]
+
+    Enum.each(forbidden_templates, fn {label, template} ->
+      File.write!(path, template)
+
+      case Workflow.load(source.workflow) do
+        {:error, {:template_parse_error, ^path, message}} ->
+          assert message =~ "Undefined variable", label
+
+        result ->
+          flunk("#{label} unexpectedly loaded: #{inspect(result)}")
+      end
+    end)
   end
 
   test "renders empty-safe context without empty conditional headings" do
@@ -57,9 +113,8 @@ defmodule SymphonyElixir.WorkflowTest do
     {% if github != empty %}
     Pull request: {{ github.number }}
     {% endif %}
-    {% if prior_handoffs.size > 0 %}
-    Prior run handoffs:
-    {% for handoff in prior_handoffs %}- {{ handoff.run_id }}{% endfor %}
+    {% if latest_workpad %}
+    Latest workpad: {{ latest_workpad.run_id }}
     {% endif %}
     """
 
@@ -70,7 +125,7 @@ defmodule SymphonyElixir.WorkflowTest do
       template
       |> Solid.parse!()
       |> Solid.render!(
-        %{"github" => %{}, "dependencies" => [], "prior_handoffs" => []},
+        %{"github" => %{}, "dependencies" => [], "latest_workpad" => nil},
         strict_variables: true,
         strict_filters: true
       )
@@ -78,7 +133,7 @@ defmodule SymphonyElixir.WorkflowTest do
 
     refute rendered =~ "Dependencies:"
     refute rendered =~ "Pull request:"
-    refute rendered =~ "Prior run handoffs:"
+    refute rendered =~ "Latest workpad:"
   end
 
   test "rejects user-visible schema versions and unknown configuration" do

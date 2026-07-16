@@ -3,8 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Renders the four-layer run prompt and fresh stage workpads from frozen bundles.
   """
 
-  alias SymphonyElixir.Board
-  alias SymphonyElixir.Task
+  alias SymphonyElixir.{Board, CurrentState, Task}
 
   @render_opts [strict_variables: true, strict_filters: true]
   @runner_contract """
@@ -60,56 +59,16 @@ defmodule SymphonyElixir.PromptBuilder do
 
   defp assigns(task, run, opts) do
     bundle = run["frozen_bundle"]
-    stage = bundle["stage"]
-    dependencies = dependency_maps(task.dependencies)
-    transitions = allowed_transition_maps(task.column_id, bundle["agent_transitions"], bundle["columns"])
+    stage = %{"id" => get_in(bundle, ["stage", "id"])}
 
-    %{
-      "task" => Task.to_map(task),
-      "run" => run,
+    task
+    |> CurrentState.project(run, bundle)
+    |> Map.merge(%{
       "stage" => stage,
-      "github" => task.github,
-      "dependencies" => dependencies,
-      "criteria" => task.acceptance_criteria,
-      "prior_handoffs" => prior_handoffs(task.id),
-      "allowed_transitions" => transitions,
+      "latest_workpad" => Board.latest_workpad(task.id, run["id"]),
       "workpad" => Keyword.get(opts, :workpad, ""),
       "turn_number" => Keyword.get(opts, :turn_number, 1)
-    }
-  end
-
-  defp dependency_maps(ids) do
-    Enum.flat_map(ids, fn id ->
-      case Board.task(id) do
-        {:ok, task} -> [Task.to_map(task)]
-        {:error, _reason} -> []
-      end
-    end)
-  end
-
-  defp allowed_transition_maps(column_id, transitions, columns) do
-    allowed = Map.get(transitions, column_id, [])
-    Enum.filter(columns, &(&1["id"] in allowed))
-  end
-
-  defp prior_handoffs(task_id) do
-    task_id
-    |> Board.runs()
-    |> Enum.reject(&(&1["status"] in ["starting", "running", "stopping"]))
-    |> Enum.map(fn run ->
-      %{
-        "run_id" => run["id"],
-        "stage_id" => run["stage_id"],
-        "status" => run["status"],
-        "outcome" => run["outcome"],
-        "finished_at" => run["finished_at"],
-        "workpads" =>
-          if(run["status"] in ["completed", "failed", "stopped"],
-            do: Board.workpad_metadata(run["id"]),
-            else: []
-          )
-      }
-    end)
+    })
   end
 
   defp render!(template, assigns, label) when is_binary(template) do

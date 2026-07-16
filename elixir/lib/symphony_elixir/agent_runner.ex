@@ -155,7 +155,7 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, :not_found} ->
         content = PromptBuilder.render_workpad(task, run, invocation: invocation)
-        Board.write_workpad(run["id"], invocation, content)
+        Board.write_workpad_template(run["id"], invocation, content)
     end
   end
 

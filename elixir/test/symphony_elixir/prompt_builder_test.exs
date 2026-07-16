@@ -1,10 +1,11 @@
 defmodule SymphonyElixir.PromptBuilderTest do
   use ExUnit.Case, async: false
 
+  alias Ecto.Adapters.SQL
   alias SymphonyElixir.Board
-  alias SymphonyElixir.Board.Commands
+  alias SymphonyElixir.Board.{Commands, Projection}
   alias SymphonyElixir.BoardFactory
-  alias SymphonyElixir.PromptBuilder
+  alias SymphonyElixir.{PromptBuilder, Repo}
 
   test "composes the hard runner contract, base, context, and frozen stage in order" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Prompt")})
@@ -44,7 +45,49 @@ defmodule SymphonyElixir.PromptBuilderTest do
     )
   end
 
-  test "exposes completed prior-run stage and workpad invocation metadata" do
+  test "templates receive only stage identity and cannot inspect the frozen stage contract" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Minimal stage")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    {:ok, %{"task" => claimed, "run" => run}} =
+      Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+        actor: :system,
+        expected_revision: todo["revision"],
+        idempotency_key: BoardFactory.unique("minimal-stage-claim")
+      )
+
+    on_exit(fn -> cleanup_active_run(claimed["id"], run["id"]) end)
+
+    sentinel = "FROZEN-STAGE-SECRET"
+
+    frozen_stage =
+      run["frozen_bundle"]["stage"]
+      |> Map.put("workpad_template", sentinel)
+      |> Map.put("prompt_path", sentinel)
+      |> Map.put("workpad_template_path", sentinel)
+      |> Map.put("allowed_model_efforts", %{sentinel => ["high"]})
+
+    safe_run =
+      run
+      |> put_in(["frozen_bundle", "stage"], frozen_stage)
+      |> put_in(["frozen_bundle", "context_prompt"], "stage={{ stage }} id={{ stage.id }}")
+
+    {:ok, task} = Board.task(claimed["id"])
+    prompt = PromptBuilder.build_prompt(task, safe_run)
+
+    assert prompt =~ "id=implementation"
+    refute prompt =~ sentinel
+
+    for field <- ~w(prompt prompt_path workpad_template workpad_template_path allowed_model_efforts) do
+      forbidden_run = put_in(run, ["frozen_bundle", "context_prompt"], "{{ stage.#{field} }}")
+
+      assert_raise RuntimeError, ~r/context prompt render failed/, fn ->
+        PromptBuilder.build_prompt(task, forbidden_run)
+      end
+    end
+  end
+
+  test "injects exactly one latest meaningful workpad body without prior-run lists" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Prompt handoff")})
     {todo, _} = BoardFactory.move(created, "todo")
 
@@ -55,7 +98,7 @@ defmodule SymphonyElixir.PromptBuilderTest do
         idempotency_key: BoardFactory.unique("claim")
       )
 
-    :ok = Board.write_workpad(implementation_run["id"], 3, "handoff evidence")
+    :ok = Board.write_workpad(implementation_run["id"], 3, "older-handoff-body")
 
     {:ok, %{"task" => review_ready}} =
       Board.execute(%Commands.MoveTask{task_id: implementation_task["id"], column_id: "automated_review"},
@@ -78,47 +121,134 @@ defmodule SymphonyElixir.PromptBuilderTest do
         idempotency_key: BoardFactory.unique("review-claim")
       )
 
-    on_exit(fn -> cleanup_active_run(claimed_review["id"], review_run["id"]) end)
+    :ok = Board.write_workpad(review_run["id"], 4, "only-latest-handoff-body")
+
+    {:ok, %{"task" => rework_ready}} =
+      Board.execute(%Commands.MoveTask{task_id: claimed_review["id"], column_id: "rework"},
+        actor: %{type: :agent, identity: review_run["id"]},
+        expected_revision: claimed_review["revision"],
+        idempotency_key: BoardFactory.unique("review-move")
+      )
+
+    {:ok, %{"task" => rework_task, "run" => completed_review}} =
+      Board.execute(%Commands.RunFinished{task_id: rework_ready["id"], run_id: review_run["id"], outcome: %{}},
+        actor: :system,
+        expected_revision: rework_ready["revision"],
+        idempotency_key: BoardFactory.unique("review-finish")
+      )
+
+    {:ok, %{"task" => claimed_rework, "run" => rework_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: rework_task["id"]},
+        actor: :system,
+        expected_revision: rework_task["revision"],
+        idempotency_key: BoardFactory.unique("rework-claim")
+      )
+
+    on_exit(fn -> cleanup_active_run(claimed_rework["id"], rework_run["id"]) end)
 
     context = """
-    {% for handoff in prior_handoffs %}
-    handoff={{ handoff.run_id }}:{{ handoff.stage_id }}:{{ handoff.status }}
-    {% for workpad in handoff.workpads %}workpad={{ workpad.invocation }}:{{ workpad.updated_at }}{% endfor %}
-    {% endfor %}
+    {% if latest_workpad %}
+    latest={{ latest_workpad.run_id }}:{{ latest_workpad.stage_id }}:{{ latest_workpad.status }}:{{ latest_workpad.invocation }}
+    {{ latest_workpad.content }}
+    {% endif %}
     """
 
-    review_run = put_in(review_run, ["frozen_bundle", "context_prompt"], context)
-    {:ok, task} = Board.task(claimed_review["id"])
-    prompt = PromptBuilder.build_prompt(task, review_run)
+    rework_run = put_in(rework_run, ["frozen_bundle", "context_prompt"], context)
+    {:ok, task} = Board.task(claimed_rework["id"])
+    prompt = PromptBuilder.build_prompt(task, rework_run)
 
-    assert prompt =~ "handoff=#{completed_run["id"]}:implementation:completed"
-    assert prompt =~ "workpad=3:"
+    assert completed_run["status"] == "completed"
+    assert prompt =~ "latest=#{completed_review["id"]}:automated_review:completed:4"
+    assert length(String.split(prompt, "only-latest-handoff-body")) == 2
+    refute prompt =~ "older-handoff-body"
+    refute prompt =~ "prior_handoffs"
 
-    Board.execute(%Commands.RunFailed{task_id: task.id, run_id: review_run["id"], reason: :test_complete},
+    Board.execute(%Commands.RunFailed{task_id: task.id, run_id: rework_run["id"], reason: :test_complete},
       actor: :system,
       expected_revision: task.revision,
       idempotency_key: BoardFactory.unique("cleanup")
     )
   end
 
-  test "exposes failed and stopped prior-run workpads with terminal status metadata" do
+  test "injects failed and stopped terminal workpads as the single latest body" do
     Enum.each(["failed", "stopped"], fn status ->
       {task, current_run, terminal_run} = terminal_handoff_fixture(status)
 
       context = """
-      {% for handoff in prior_handoffs %}
-      handoff={{ handoff.run_id }}:{{ handoff.status }}
-      {% for workpad in handoff.workpads %}workpad={{ workpad.invocation }}:{{ workpad.published }}{% endfor %}
-      {% endfor %}
+      {% if latest_workpad %}
+      latest={{ latest_workpad.run_id }}:{{ latest_workpad.status }}:{{ latest_workpad.invocation }}
+      {{ latest_workpad.content }}
+      {% endif %}
       """
 
       current_run = put_in(current_run, ["frozen_bundle", "context_prompt"], context)
       prompt = PromptBuilder.build_prompt(task, current_run)
 
-      assert prompt =~ "handoff=#{terminal_run["id"]}:#{status}"
-      assert prompt =~ "workpad=2:false"
+      assert prompt =~ "latest=#{terminal_run["id"]}:#{status}:2"
+      assert length(String.split(prompt, "#{status} handoff evidence")) == 2
       cleanup_active_run(task.id, current_run["id"])
     end)
+  end
+
+  test "historical run volume cannot change prompt output beyond the one selected workpad" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Bounded prompt history")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    {:ok, %{"task" => claimed, "run" => current_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+        actor: :system,
+        expected_revision: todo["revision"],
+        idempotency_key: BoardFactory.unique("bounded-history-claim")
+      )
+
+    selected_id = "selected-history-#{Ecto.UUID.generate()}"
+    historical_ids = Enum.map(1..60, &"historical-#{&1}-#{Ecto.UUID.generate()}")
+    run_ids = [selected_id | historical_ids]
+
+    on_exit(fn ->
+      cleanup_active_run(claimed["id"], current_run["id"])
+
+      Enum.each(run_ids, fn run_id ->
+        SQL.query!(Repo, "DELETE FROM board_workpads WHERE run_id = ?", [run_id])
+        SQL.query!(Repo, "DELETE FROM board_runs WHERE id = ?", [run_id])
+      end)
+    end)
+
+    insert_terminal_run(selected_id, claimed["id"], "2026-02-01T00:00:00Z", %{"outcome" => "selected"})
+
+    assert :ok =
+             Projection.put_workpad(%{
+               run_id: selected_id,
+               invocation: 7,
+               content: "ONLY-SELECTED-WORKPAD",
+               template_sha256: nil,
+               updated_at: "2026-02-01T00:00:00Z"
+             })
+
+    prompt_run = put_in(current_run, ["frozen_bundle", "context_prompt"], "latest={{ latest_workpad.content }}")
+    {:ok, task} = Board.task(claimed["id"])
+    baseline = PromptBuilder.build_prompt(task, prompt_run)
+
+    Enum.with_index(historical_ids, 1)
+    |> Enum.each(fn {run_id, index} ->
+      sentinel = "HISTORICAL-SENTINEL-#{index}-" <> String.duplicate("x", 2_000)
+      insert_terminal_run(run_id, claimed["id"], "2026-01-01T00:00:00Z", %{"outcome" => sentinel})
+
+      assert :ok =
+               Projection.put_workpad(%{
+                 run_id: run_id,
+                 invocation: index,
+                 content: sentinel,
+                 template_sha256: nil,
+                 updated_at: "2026-01-01T00:00:00Z"
+               })
+    end)
+
+    after_history = PromptBuilder.build_prompt(task, prompt_run)
+
+    assert after_history == baseline
+    assert length(String.split(after_history, "ONLY-SELECTED-WORKPAD")) == 2
+    refute after_history =~ "HISTORICAL-SENTINEL"
   end
 
   defp index(string, pattern), do: :binary.match(string, pattern) |> elem(0)
@@ -135,6 +265,27 @@ defmodule SymphonyElixir.PromptBuilderTest do
       _ ->
         :ok
     end
+  end
+
+  defp insert_terminal_run(id, task_id, finished_at, extra) do
+    run =
+      Map.merge(
+        %{
+          "id" => id,
+          "task_id" => task_id,
+          "stage_id" => "implementation",
+          "status" => "failed",
+          "finished_at" => finished_at,
+          "updated_at" => finished_at
+        },
+        extra
+      )
+
+    SQL.query!(
+      Repo,
+      "INSERT INTO board_runs(id, task_id, stage_id, status, run_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [id, task_id, "implementation", "failed", Jason.encode!(run), finished_at]
+    )
   end
 
   defp terminal_handoff_fixture(status) do

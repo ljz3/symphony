@@ -55,7 +55,7 @@ Add Ecto SQL with `ecto_sqlite3 ~> 0.24.1`, WAL mode, full durability, and inter
 Project:
 
 - Task state, criteria/evidence, dependencies, stage model selections, projected event history, runs, branch/PR metadata, sync state, and idempotency records.
-- Keep run workpads non-canonical and private, but make versioned JSON sidecars under `workpads/` authoritative over their SQLite projection. Write each owner-only record with write-sync-rename before updating SQLite. After GitHub acknowledges a marker comment, atomically write an owner-only publication manifest before marking projection rows published. Publication identity is the task ID plus sorted run/invocation/content hashes and excludes timestamps.
+- Keep run workpads non-canonical and private, but make versioned JSON sidecars under `workpads/` authoritative over their SQLite projection. Record v2 stores a nullable initial-template SHA-256; every non-null value is exactly 64 lowercase hexadecimal characters. Ordinary writes preserve it, while legacy v1 records remain readable and conservatively meaningful. Publication manifests remain v1. Write each owner-only record with write-sync-rename before updating SQLite. After GitHub acknowledges a marker comment, atomically write an owner-only publication manifest before marking projection rows published. Publication identity is the task ID plus sorted run/invocation/content hashes and excludes timestamps.
 - On startup, export legacy SQLite-only workpads, validate every existing sidecar without overwriting it, rehydrate SQLite from the sidecars, and derive publication state only from manifests whose stored hashes match current records. A malformed sidecar aborts startup and reports its exact path.
 - Keep live run telemetry in an internally migrated SQLite table: the latest accepted cumulative token high-water mark and unique Codex turn IDs. On terminal finalization, copy the summary into the canonical run event and remove the transient row. Replay must reconstruct final stats without requiring telemetry.
 - Classify database health as healthy, confirmed corrupt, or indeterminate. Leave healthy databases untouched. An open, permission, NIF, or health-check execution failure is indeterminate and aborts startup without changing the database, WAL, or SHM files. For confirmed corruption, build and validate a checkpoint-derived or empty replacement first, retain the original database family under `runtime/recovery/`, and roll back installation failures. Never delete quarantines automatically; replay canonical events after startup.
@@ -107,7 +107,7 @@ For every run render, in order:
 3. Workflow context prompt.
 4. Selected stage prompt.
 
-Expose stable curated Solid maps for `task`, `run`, `stage`, `github`, dependencies, criteria/evidence, prior handoffs, and allowed transitions. Prior handoffs include completed, failed, and stopped run/stage/status metadata plus available workpad invocation metadata. Formatting and field inclusion remain controlled by the workflow context template.
+Use one current-state projector for prompts and `symphony_task_context`. Expose only the current task contract and column, active run summary, curated source and GitHub summaries, criteria with current evidence, shallow dependency status, allowed transitions, current preflight state, and the actual active JobManager record reduced to job identity/status/timing/source fingerprint. Omit raw metadata, task runtime/desired state, evidence history, frozen bundles, prior runs/invocations, raw provider readiness, job output/artifact/call internals, and nested dependency state. Workflow templates receive only `stage.id`; frozen stage prompts, templates, paths, and model matrices remain inaccessible as data. Prompt assigns include exactly one `latest_workpad`: the current run's highest meaningful invocation, otherwise the newest completed/failed/stopped same-task run ordered by finish time and run ID with its highest meaningful invocation. An untouched generated template is not meaningful; legacy records without a template hash are meaningful.
 
 Each named stage references its own workpad template. Render a fresh durable private workpad per AgentRunner invocation; continuation turns in that invocation share it.
 
@@ -250,7 +250,7 @@ Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
 - `symphony_task_create`
 - `symphony_job_run` when the active run's frozen bundle defines jobs
 
-Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task.
+Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task. Return only the event type, task revision/current column, and run status when the command returns a run; never echo task/run identity, runtime state, active-run identity, or canonical payloads.
 
 Derive the `symphony_job_run` name enum solely from the claimed run's frozen job definitions. One
 call starts or attaches to a supervised job and stays pending until a terminal result; do not expose
@@ -273,7 +273,7 @@ running record `interrupted`, never timed out. Explicit run cancellation termina
 process group, with force escalation allowed only as cancellation policy; signal delivery must not
 block the worker or delay terminal cancellation.
 
-Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed, failed, or stopped prior runs with the same task ID; cross-task and active prior-run reads are rejected. Prior-run reads retain run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
+Agents cannot edit the running task contract or reopen criteria. `symphony_task_context` and `symphony_workpad_read` accept exactly an object and require it to be `{}`; JSON nulls, arrays, and scalars are rejected rather than normalized. `symphony_workpad_read` returns the single deterministic `latest_workpad` selection used by PromptBuilder, or `null`; arbitrary run/invocation selectors and workpad history are not exposed. The result contains only run/stage/status/finish/invocation/update metadata and content. Cross-task and non-current active work are never candidates. Human UI actions use the same command validator and event writer.
 
 ### External MCP task interface
 
@@ -388,7 +388,7 @@ Add targeted coverage for:
 - SQLite migrations, task invariants, evidence, dependency cycles, rank compaction, archive, Blocked resume, tri-state database recovery/quarantine/rollback, and sidecar-authoritative workpad loss/recovery semantics.
 - Actor-aware transitions and all external-effect saga crash windows.
 - Local and SSH worktree creation/reuse/removal, path/symlink safety, branch collisions, dirty worktrees, source fetch failures, and terminal cleanup.
-- Run-scoped dynamic-tool schemas, current/prior invocation selection, completed/failed/stopped same-task prior-workpad reads, active/cross-task isolation, expected revisions, call-id idempotency, transition requirements, and follow-up creation.
+- Run-scoped dynamic-tool schemas, exact current-state allowlists, deterministic single-workpad selection across current/completed/failed/stopped runs, untouched-template skipping, legacy record recovery, active/cross-task isolation, compact mutation results, expected revisions, call-id idempotency, transition requirements, and follow-up creation.
 - Shared-listener MCP handshake/tool discovery for exactly three tools, strict schemas and read
   annotations, dynamic state enum discovery, exact-path dispatch, project-ID fail-closed behavior,
   safe task/run/event projections, Host/Origin rejection, canonical task creation, and per-request

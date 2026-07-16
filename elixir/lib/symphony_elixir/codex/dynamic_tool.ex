@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.{GitHub, JobManager, Task, TaskCreateTool, Workflow, Worktree}
+  alias SymphonyElixir.{CurrentState, GitHub, JobManager, TaskCreateTool, Workflow, Worktree}
   alias SymphonyElixir.Workflow.Bundle
 
   @context_tool "symphony_task_context"
@@ -19,7 +19,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     with {:ok, scope} <- scope(opts),
-         {:ok, result} <- execute_scoped(tool, normalize_arguments(arguments), scope, opts) do
+         {:ok, normalized_arguments} <- normalize_arguments(arguments),
+         {:ok, result} <- execute_scoped(tool, normalized_arguments, scope, opts) do
       success_response(result)
     else
       {:error, reason} -> failure_response(reason)
@@ -41,17 +42,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "additionalProperties" => false,
         "properties" => %{}
       }),
-      tool_spec(@workpad_read_tool, "Read the current run's workpad or a terminal prior run's workpad for this task.", %{
+      tool_spec(@workpad_read_tool, "Read the one latest meaningful workpad selected for this task.", %{
         "type" => "object",
         "additionalProperties" => false,
-        "properties" => %{
-          "run_id" => %{
-            "type" => "string",
-            "minLength" => 1,
-            "description" => "Defaults to the active run; may select only a completed, failed, or stopped prior run of the same task."
-          },
-          "invocation" => %{"type" => "integer", "minimum" => 1}
-        }
+        "properties" => %{}
       }),
       tool_spec(@workpad_write_tool, "Replace this run's private durable workpad content.", %{
         "type" => "object",
@@ -91,43 +85,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp execute_scoped(@context_tool, _arguments, scope, _opts) do
-    with {:ok, bundle} <- Workflow.current() do
-      dependencies =
-        Enum.flat_map(scope.task.dependencies, &dependency_context/1)
-
-      allowed_ids = Map.get(bundle.agent_transitions, scope.task.column_id, [])
-      allowed = bundle.columns |> Enum.filter(&(&1.id in allowed_ids)) |> Enum.map(&Map.from_struct/1)
-
-      {:ok,
-       %{
-         task: Task.to_map(scope.task),
-         run: scope.run,
-         dependencies: dependencies,
-         github: scope.task.github,
-         allowed_transitions: allowed
-       }}
+  defp execute_scoped(@context_tool, arguments, scope, _opts) do
+    with :ok <- empty_arguments(arguments, @context_tool),
+         {:ok, bundle} <- Workflow.current() do
+      {:ok, CurrentState.project(scope.task, scope.run, bundle)}
     end
   end
 
-  defp execute_scoped(@workpad_read_tool, arguments, scope, opts) do
-    invocation = argument(arguments, "invocation", Keyword.get(opts, :invocation, 1))
-
-    with {:ok, target_run} <- readable_workpad_run(arguments, scope),
-         {:ok, content} <- Board.read_workpad(target_run["id"], invocation) do
-      {:ok,
-       %{
-         run_id: target_run["id"],
-         task_id: target_run["task_id"],
-         stage_id: target_run["stage_id"],
-         status: target_run["status"],
-         finished_at: target_run["finished_at"],
-         invocation: invocation,
-         content: content
-       }}
-    else
-      {:error, :not_found} -> {:error, {:workpad_not_found, argument(arguments, "run_id", scope.run["id"]), invocation}}
-      {:error, reason} -> {:error, reason}
+  defp execute_scoped(@workpad_read_tool, arguments, scope, _opts) do
+    with :ok <- empty_arguments(arguments, @workpad_read_tool) do
+      {:ok, Board.latest_workpad(scope.task.id, scope.run["id"])}
     end
   end
 
@@ -207,30 +174,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     {:error, {:unsupported_dynamic_tool, tool, supported_tool_names()}}
   end
 
-  defp dependency_context(id) do
-    case Board.task(id) do
-      {:ok, task} -> [Task.to_map(task)]
-      _ -> []
-    end
-  end
-
-  defp readable_workpad_run(arguments, scope) do
-    requested_run_id = argument(arguments, "run_id", scope.run["id"])
-
-    if requested_run_id == scope.run["id"] do
-      {:ok, scope.run}
-    else
-      case Board.run(requested_run_id) do
-        {:ok, %{"task_id" => task_id, "status" => status} = run}
-        when task_id == scope.task.id and status in ["completed", "failed", "stopped"] ->
-          {:ok, run}
-
-        _ ->
-          {:error, :workpad_run_not_readable}
-      end
-    end
-  end
-
   defp transition(scope, "blocked", reason, revision, opts) do
     with {:ok, reason} <- nonempty(reason, :blocked_transition_reason) do
       board_execute(
@@ -307,11 +250,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     base_key = "dynamic-tool:#{scope.run["id"]}:#{call_id}"
     key = if suffix, do: "#{base_key}:#{suffix}", else: base_key
 
-    executor.(command,
-      actor: %{type: :agent, identity: scope.run["id"]},
-      expected_revision: expected_revision,
-      idempotency_key: key
-    )
+    with {:ok, result} <-
+           executor.(command,
+             actor: %{type: :agent, identity: scope.run["id"]},
+             expected_revision: expected_revision,
+             idempotency_key: key
+           ) do
+      {:ok, compact_mutation_result(result)}
+    end
   end
 
   defp scope(opts) do
@@ -330,9 +276,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp normalize_arguments(arguments) when is_map(arguments), do: stringify_keys(arguments)
-  defp normalize_arguments(nil), do: %{}
-  defp normalize_arguments(_arguments), do: %{}
+  defp normalize_arguments(arguments) when is_map(arguments), do: {:ok, stringify_keys(arguments)}
+  defp normalize_arguments(_arguments), do: {:error, :tool_arguments_must_be_object}
 
   defp required_string(arguments, key), do: arguments |> Map.get(key) |> nonempty(key)
 
@@ -361,6 +306,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       _ -> {:error, :expected_revision_required}
     end
   end
+
+  defp empty_arguments(arguments, _tool) when map_size(arguments) == 0, do: :ok
+  defp empty_arguments(_arguments, tool), do: {:error, {:tool_takes_no_arguments, tool}}
 
   defp argument(arguments, key, default \\ nil), do: Map.get(arguments, key, default)
 
@@ -400,6 +348,24 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       :error -> {:error, {:unknown_project_job, name, jobs |> Map.keys() |> Enum.sort()}}
     end
   end
+
+  defp compact_mutation_result(result) do
+    %{
+      "event_type" => result["event_type"],
+      "task" => compact_mutation_task(result["task"]),
+      "run" => compact_mutation_run(result["run"])
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp compact_mutation_task(task) when is_map(task) do
+    Map.take(task, ~w(revision column_id))
+  end
+
+  defp compact_mutation_task(_task), do: nil
+
+  defp compact_mutation_run(run) when is_map(run), do: Map.take(run, ~w(status))
+  defp compact_mutation_run(_run), do: nil
 
   defp success_response(payload), do: response(true, payload)
   defp failure_response(reason), do: response(false, %{error: %{reason: inspect(reason)}})

@@ -116,6 +116,11 @@ defmodule SymphonyElixir.JobManager do
     GenServer.call(server, {:cancel_run, run_id}, :infinity)
   end
 
+  @spec active_for_run(String.t(), GenServer.server()) :: map() | nil
+  def active_for_run(run_id, server \\ __MODULE__) when is_binary(run_id) do
+    GenServer.call(server, {:active_for_run, run_id}, :infinity)
+  end
+
   @spec source_fingerprint(Path.t(), String.t() | nil) :: String.t() | {:error, term()}
   def source_fingerprint(workspace, nil) when is_binary(workspace) do
     with git when is_binary(git) <- System.find_executable("git"),
@@ -187,6 +192,16 @@ defmodule SymphonyElixir.JobManager do
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:active_for_run, run_id}, _from, state) do
+    active =
+      state.records
+      |> Map.values()
+      |> Enum.filter(&(&1["run_id"] == run_id and &1["status"] == "running"))
+      |> Enum.max_by(&{&1["started_at"] || "", &1["job_id"]}, fn -> nil end)
+
+    {:reply, active, state}
   end
 
   def handle_call({:cancel_run, run_id}, _from, state) do

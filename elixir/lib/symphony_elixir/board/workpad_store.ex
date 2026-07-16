@@ -13,7 +13,9 @@ defmodule SymphonyElixir.Board.WorkpadStore do
   alias SymphonyElixir.Paths
   alias SymphonyElixir.Workflow
 
-  @format_version 1
+  @record_format_version 2
+  @manifest_format_version 1
+  @sha256_pattern ~r/\A[0-9a-f]{64}\z/
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -23,7 +25,24 @@ defmodule SymphonyElixir.Board.WorkpadStore do
   @spec write(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
   def write(run_id, invocation, content)
       when is_binary(run_id) and is_integer(invocation) and invocation > 0 and is_binary(content) do
-    GenServer.call(__MODULE__, {:write, run_id, invocation, content})
+    GenServer.call(__MODULE__, {:write, run_id, invocation, content, false})
+  end
+
+  @spec write_template(String.t(), pos_integer(), String.t()) :: :ok | {:error, term()}
+  def write_template(run_id, invocation, content)
+      when is_binary(run_id) and is_integer(invocation) and invocation > 0 and is_binary(content) do
+    GenServer.call(__MODULE__, {:write, run_id, invocation, content, true})
+  end
+
+  @spec latest_meaningful(String.t(), String.t()) :: map() | nil
+  def latest_meaningful(task_id, current_run_id)
+      when is_binary(task_id) and is_binary(current_run_id) do
+    runs = Projection.list_runs(task_id)
+
+    case Enum.find(runs, &(&1["id"] == current_run_id and &1["task_id"] == task_id)) do
+      nil -> nil
+      current -> latest_for_run(current) || latest_terminal(runs, current_run_id)
+    end
   end
 
   @spec record_publication(String.t(), [map()]) :: :ok | {:error, term()}
@@ -56,8 +75,8 @@ defmodule SymphonyElixir.Board.WorkpadStore do
   end
 
   @impl true
-  def handle_call({:write, run_id, invocation, content}, _from, state) do
-    {:reply, write_record(state, run_id, invocation, content), state}
+  def handle_call({:write, run_id, invocation, content, template?}, _from, state) do
+    {:reply, write_record(state, run_id, invocation, content, template?), state}
   end
 
   def handle_call({:record_publication, publication_id, workpads}, _from, state) do
@@ -75,10 +94,10 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     end
   end
 
-  defp write_record(state, run_id, invocation, content) do
+  defp write_record(state, run_id, invocation, content, template?) do
     with :ok <- safe_component(run_id),
          :ok <- ensure_layout(state.root),
-         {:ok, record} <- current_or_new_record(state.root, run_id, invocation, content),
+         {:ok, record} <- current_or_new_record(state.root, run_id, invocation, content, template?),
          {:ok, publication_id} <- matching_publication(state.root, record) do
       Projection.put_workpad(
         Map.merge(record, %{
@@ -89,22 +108,40 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     end
   end
 
-  defp current_or_new_record(root, run_id, invocation, content) do
+  defp current_or_new_record(root, run_id, invocation, content, template?) do
     path = record_path(root, run_id, invocation)
 
     case File.stat(path) do
-      {:ok, %File.Stat{type: :regular}} -> current_record(root, path, run_id, invocation, content)
-      {:ok, _stat} -> {:error, {:malformed_workpad_sidecar, path, :not_a_regular_file}}
-      {:error, :enoent} -> persist_record(root, fresh_record(run_id, invocation, content))
-      {:error, reason} -> {:error, {:malformed_workpad_sidecar, path, reason}}
+      {:ok, %File.Stat{type: :regular}} ->
+        current_record(root, path, content)
+
+      {:ok, _stat} ->
+        {:error, {:malformed_workpad_sidecar, path, :not_a_regular_file}}
+
+      {:error, :enoent} ->
+        template_sha256 = if template?, do: content_sha256(content), else: nil
+        persist_record(root, fresh_record(run_id, invocation, content, timestamp(), template_sha256))
+
+      {:error, reason} ->
+        {:error, {:malformed_workpad_sidecar, path, reason}}
     end
   end
 
-  defp current_record(root, path, run_id, invocation, content) do
+  defp current_record(root, path, content) do
     with {:ok, existing} <- read_record(path) do
       if existing.content == content,
         do: {:ok, existing},
-        else: persist_record(root, fresh_record(run_id, invocation, content))
+        else:
+          persist_record(
+            root,
+            fresh_record(
+              existing.run_id,
+              existing.invocation,
+              content,
+              timestamp(),
+              existing.template_sha256
+            )
+          )
     end
   end
 
@@ -139,7 +176,8 @@ defmodule SymphonyElixir.Board.WorkpadStore do
           read_record(path)
         else
           updated_at = value(workpad, :updated_at, timestamp())
-          persist_record(root, fresh_record(run_id, invocation, content, updated_at))
+          template_sha256 = value(workpad, :template_sha256)
+          persist_record(root, fresh_record(run_id, invocation, content, updated_at, template_sha256))
         end
 
       case result do
@@ -162,7 +200,7 @@ defmodule SymphonyElixir.Board.WorkpadStore do
       |> Enum.uniq()
 
     %{
-      format_version: @format_version,
+      format_version: @manifest_format_version,
       publication_id: publication_id,
       task_id: List.first(task_ids),
       created_at: timestamp(),
@@ -211,7 +249,15 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     if File.exists?(path) do
       {:cont, :ok}
     else
-      record = fresh_record(workpad.run_id, workpad.invocation, workpad.content, workpad.updated_at)
+      record =
+        fresh_record(
+          workpad.run_id,
+          workpad.invocation,
+          workpad.content,
+          workpad.updated_at,
+          workpad.template_sha256
+        )
+
       persist_projection_record(root, record)
     end
   end
@@ -247,7 +293,7 @@ defmodule SymphonyElixir.Board.WorkpadStore do
 
   defp legacy_manifest(publication_id, workpads) do
     %{
-      format_version: @format_version,
+      format_version: @manifest_format_version,
       publication_id: publication_id,
       task_id: projection_task_id(workpads),
       created_at: workpads |> Enum.map(& &1.updated_at) |> Enum.max(fn -> timestamp() end),
@@ -363,17 +409,19 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     expected_invocation = path |> Path.basename(".json") |> Integer.parse()
 
     with %{
-           "format_version" => @format_version,
+           "format_version" => version,
            "run_id" => run_id,
            "invocation" => invocation,
            "content" => content,
            "content_sha256" => hash,
            "updated_at" => updated_at
          } <- record,
+         true <- version in [1, @record_format_version],
          true <- is_binary(run_id) and run_id == expected_run_id,
          {^invocation, ""} <- expected_invocation,
          true <- invocation > 0,
          true <- is_binary(content) and is_binary(updated_at),
+         {:ok, template_sha256} <- validate_template_sha256(version, record),
          true <- hash == content_sha256(content) do
       {:ok,
        %{
@@ -381,12 +429,27 @@ defmodule SymphonyElixir.Board.WorkpadStore do
          invocation: invocation,
          content: content,
          content_sha256: hash,
-         updated_at: updated_at
+         updated_at: updated_at,
+         template_sha256: template_sha256
        }}
     else
       _ -> {:error, :invalid_record}
     end
   end
+
+  defp validate_template_sha256(1, _record), do: {:ok, nil}
+
+  defp validate_template_sha256(@record_format_version, %{"template_sha256" => nil}),
+    do: {:ok, nil}
+
+  defp validate_template_sha256(@record_format_version, %{"template_sha256" => hash})
+       when is_binary(hash) do
+    if Regex.match?(@sha256_pattern, hash),
+      do: {:ok, hash},
+      else: {:error, :invalid_template_sha256}
+  end
+
+  defp validate_template_sha256(_version, _record), do: {:error, :invalid_template_sha256}
 
   defp read_manifest(path) do
     with {:ok, json} <- File.read(path),
@@ -402,7 +465,7 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     expected_id = Path.basename(path, ".json")
 
     with %{
-           "format_version" => @format_version,
+           "format_version" => @manifest_format_version,
            "publication_id" => publication_id,
            "created_at" => created_at,
            "records" => entries
@@ -437,18 +500,19 @@ defmodule SymphonyElixir.Board.WorkpadStore do
 
   defp encode_record(record) do
     %{
-      "format_version" => @format_version,
+      "format_version" => @record_format_version,
       "run_id" => record.run_id,
       "invocation" => record.invocation,
       "content" => record.content,
       "content_sha256" => record.content_sha256,
-      "updated_at" => record.updated_at
+      "updated_at" => record.updated_at,
+      "template_sha256" => record.template_sha256
     }
   end
 
   defp encode_manifest(manifest) do
     %{
-      "format_version" => @format_version,
+      "format_version" => @manifest_format_version,
       "publication_id" => manifest.publication_id,
       "task_id" => manifest.task_id,
       "created_at" => manifest.created_at,
@@ -479,18 +543,54 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     %{run_id: record.run_id, invocation: record.invocation, content_sha256: record.content_sha256}
   end
 
-  defp fresh_record(run_id, invocation, content, updated_at \\ timestamp()) do
+  defp fresh_record(run_id, invocation, content, updated_at, template_sha256) do
     %{
       run_id: run_id,
       invocation: invocation,
       content: content,
       content_sha256: content_sha256(content),
-      updated_at: updated_at
+      updated_at: updated_at,
+      template_sha256: template_sha256
     }
   end
 
   defp content_sha256(content) do
     :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+  end
+
+  defp latest_terminal(runs, current_run_id) do
+    runs
+    |> Enum.filter(&(&1["id"] != current_run_id and &1["status"] in ["completed", "failed", "stopped"]))
+    |> Enum.sort_by(&{&1["finished_at"] || "", &1["id"]}, :desc)
+    |> Enum.find_value(&latest_for_run/1)
+  end
+
+  defp latest_for_run(run) do
+    run["id"]
+    |> Projection.list_workpads()
+    |> Enum.filter(&meaningful?/1)
+    |> Enum.max_by(& &1["invocation"], fn -> nil end)
+    |> case do
+      nil ->
+        nil
+
+      workpad ->
+        %{
+          "run_id" => run["id"],
+          "stage_id" => run["stage_id"],
+          "status" => run["status"],
+          "finished_at" => run["finished_at"],
+          "invocation" => workpad["invocation"],
+          "updated_at" => workpad["updated_at"],
+          "content" => workpad["content"]
+        }
+    end
+  end
+
+  defp meaningful?(%{"template_sha256" => nil}), do: true
+
+  defp meaningful?(%{"template_sha256" => template_sha256, "content" => content}) do
+    content_sha256(content) != template_sha256
   end
 
   defp record_key(record), do: {record.run_id, record.invocation}
