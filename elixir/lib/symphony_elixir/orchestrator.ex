@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Codex.{Activity, AppServer, RunStats}
   alias SymphonyElixir.Config
   alias SymphonyElixir.GitHub
+  alias SymphonyElixir.JobManager
   alias SymphonyElixir.SSH
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.{Bundle, Store}
@@ -225,6 +226,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info({:interrupt_runner, task_id, run_id}, state) do
     case state.running[task_id] do
       %{run_id: ^run_id, session: session} = runtime ->
+        :ok = JobManager.cancel_run(run_id)
         if session, do: AppServer.stop_session(session)
         timer = Process.send_after(self(), {:kill_runner, task_id, run_id}, @forced_stop_ms)
         runtime = %{runtime | interrupt_timer: nil, kill_timer: timer}
@@ -238,6 +240,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info({:kill_runner, task_id, run_id}, state) do
     case state.running[task_id] do
       %{run_id: ^run_id, pid: pid} = runtime ->
+        :ok = JobManager.cancel_run(run_id)
         _ = Elixir.Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid)
         {:noreply, put_in(state.running[task_id], %{runtime | kill_timer: nil})}
 
@@ -498,6 +501,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_request_stop(state, task_id) do
     case {state.running[task_id], Board.task(task_id)} do
       {%{stopping: false} = runtime, {:ok, %{desired_column_id: desired}}} when is_binary(desired) ->
+        :ok = JobManager.cancel_run(runtime.run_id)
         send(runtime.pid, :stop)
         timer = Process.send_after(self(), {:interrupt_runner, task_id, runtime.run_id}, @graceful_stop_ms)
         put_in(state.running[task_id], %{runtime | stopping: true, interrupt_timer: timer})
@@ -510,6 +514,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp finalize_runner_result(_task_id, _run_id, :ok, state), do: state
 
   defp finalize_runner_result(task_id, run_id, {:error, reason}, state) do
+    :ok = JobManager.cancel_run(run_id)
+
     case Board.task(task_id) do
       {:ok, %{active_run_id: ^run_id, desired_column_id: desired} = task} when is_binary(desired) ->
         finish_stopped_run(task, run_id, reason)

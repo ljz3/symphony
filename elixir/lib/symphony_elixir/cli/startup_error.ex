@@ -51,6 +51,8 @@ defmodule SymphonyElixir.CLI.StartupError do
     SymphonyElixir.Board.Writer => "Board event writer",
     SymphonyElixir.Codex.Catalog => "Codex model catalog",
     SymphonyElixir.HttpServer => "HTTP server",
+    SymphonyElixir.JobManager => "Project job store",
+    SymphonyElixir.JobSupervisor => "Project job supervisor",
     SymphonyElixir.MCP.Transport => "MCP transport",
     SymphonyElixir.Orchestrator => "Orchestrator",
     SymphonyElixir.Repo => "SQLite database",

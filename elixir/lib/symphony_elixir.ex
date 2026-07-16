@@ -27,6 +27,8 @@ defmodule SymphonyElixir.Application do
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
       SymphonyElixir.Workflow.Store,
+      SymphonyElixir.JobSupervisor,
+      SymphonyElixir.JobManager,
       SymphonyElixir.Repo,
       SymphonyElixir.Board.Storage,
       SymphonyElixir.Board.WorkpadStore,

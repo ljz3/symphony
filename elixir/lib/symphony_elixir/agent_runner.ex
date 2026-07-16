@@ -7,7 +7,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.{Commands, Projection}
-  alias SymphonyElixir.Codex.{AppServer, RunStats}
+  alias SymphonyElixir.Codex.{AppServer, DynamicTool, RunStats}
   alias SymphonyElixir.{Config, GitHub, PromptBuilder, Task, Worktree}
 
   @github_retry_initial_ms 1_000
@@ -40,7 +40,9 @@ defmodule SymphonyElixir.AgentRunner do
     case AppServer.start_session(worktree,
            worker_host: worker_host,
            model: run["model"],
-           effort: run["effort"]
+           effort: run["effort"],
+           environment: managed_environment(task, run),
+           dynamic_tool_specs: DynamicTool.tool_specs(run)
          ) do
       {:ok, session} ->
         try do
@@ -92,7 +94,7 @@ defmodule SymphonyElixir.AgentRunner do
          {:ok, run} <- Board.run(context.run_id),
          :ok <- validate_scope(task, run),
          prompt <- turn_prompt(task, run, turn, context.opts),
-         {:ok, _turn_result} <-
+         {:ok, %{session: active_session}} <-
            AppServer.run_turn(session, prompt, task,
              on_message:
                message_handler(
@@ -102,6 +104,15 @@ defmodule SymphonyElixir.AgentRunner do
                  context.worktree,
                  run["worker_host"]
                ),
+             on_session_reconnected: fn reconnected_session ->
+               notify_session(
+                 context.recipient,
+                 task,
+                 run,
+                 reconnected_session,
+                 context.worktree
+               )
+             end,
              dynamic_tool_opts: [
                task_id: context.task_id,
                run_id: context.run_id,
@@ -119,7 +130,7 @@ defmodule SymphonyElixir.AgentRunner do
           finish_run(refreshed, context.run_id, %{turns: turn, transitioned_to: refreshed.column_id})
 
         true ->
-          do_run_turns(session, context, turn + 1)
+          do_run_turns(active_session, context, turn + 1)
       end
     else
       {:error, :graceful_stop_requested} ->
@@ -367,5 +378,15 @@ defmodule SymphonyElixir.AgentRunner do
     else
       {:error, :run_scope_not_active}
     end
+  end
+
+  defp managed_environment(task, run) do
+    %{
+      "SYMPHONY_MANAGED_RUN" => "1",
+      "SYMPHONY_TASK_ID" => task.id,
+      "SYMPHONY_TASK_IDENTIFIER" => task.identifier,
+      "SYMPHONY_TASK_BRANCH" => task.branch,
+      "SYMPHONY_RUN_ID" => run["id"]
+    }
   end
 end

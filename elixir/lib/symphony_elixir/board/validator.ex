@@ -482,10 +482,20 @@ defmodule SymphonyElixir.Board.Validator do
       "context_prompt_path" => bundle.context_prompt_path,
       "context_prompt" => bundle.context_prompt,
       "stage" => frozen_stage(stage),
+      "jobs" => frozen_jobs(bundle.jobs),
       "columns" => Enum.map(bundle.columns, &column_map/1),
       "agent_transitions" => bundle.agent_transitions,
       "human_transitions" => bundle.human_transitions
     }
+  end
+
+  defp frozen_jobs(jobs) do
+    Map.new(jobs, fn {id, job} ->
+      {id,
+       job
+       |> Map.from_struct()
+       |> stringify_keys()}
+    end)
   end
 
   defp column_map(column) do

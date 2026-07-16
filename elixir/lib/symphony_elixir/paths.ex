@@ -33,6 +33,9 @@ defmodule SymphonyElixir.Paths do
   @spec workpads_root(String.t()) :: Path.t()
   def workpads_root(project_id), do: Path.join(project_root(project_id), "workpads")
 
+  @spec jobs_root(String.t()) :: Path.t()
+  def jobs_root(project_id), do: Path.join(runtime_root(project_id), "jobs")
+
   @spec database(String.t()) :: Path.t()
   def database(project_id), do: Path.join(runtime_root(project_id), "board.sqlite3")
 
@@ -62,6 +65,7 @@ defmodule SymphonyElixir.Paths do
       project_root(project_id),
       runtime_root(project_id),
       workpads_root(project_id),
+      jobs_root(project_id),
       lease_root(project_id),
       logs_root(project_id),
       worktrees_root(project_id)
