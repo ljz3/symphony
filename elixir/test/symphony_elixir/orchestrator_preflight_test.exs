@@ -133,7 +133,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
 
     File.touch!(release)
     eventually(fn -> length(Board.runs(todo_id)) == 2 end)
-    Process.sleep(250)
+    assert_no_active_run(todo_id)
     assert attempt_count(attempts) == 1
     assert length(Board.runs(todo_id)) == 2
   end
@@ -294,7 +294,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     {_todo, _result} = BoardFactory.move(backlog, "todo")
     eventually(fn -> File.exists?(completed) end)
     eventually(fn -> length(Board.runs(todo_id)) == 1 end)
-    Process.sleep(250)
+    assert_no_active_run(todo_id)
     assert length(Board.runs(todo_id)) == 1
   end
 
@@ -508,6 +508,14 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
 
   defp os_process_alive?(pid) do
     match?({_output, 0}, System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true))
+  end
+
+  defp assert_no_active_run(task_id) do
+    eventually(fn ->
+      match?({:ok, %{runtime_state: nil, active_run_id: nil}}, Board.task(task_id))
+    end)
+
+    assert {:ok, %{runtime_state: nil, active_run_id: nil}} = Board.task(task_id)
   end
 
   defp eventually(predicate, attempts \\ 160)
