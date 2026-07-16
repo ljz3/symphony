@@ -23,7 +23,23 @@ defmodule SymphonyElixir.DynamicToolTest do
     assert %{"success" => true, "output" => context_json} =
              DynamicTool.execute("symphony_task_context", %{}, opts)
 
-    assert Jason.decode!(context_json)["task"]["id"] == claimed["id"]
+    context = Jason.decode!(context_json)
+    assert context["task"]["id"] == claimed["id"]
+
+    assert Map.keys(context) |> Enum.sort() ==
+             ~w(allowed_transitions criteria dependencies github run source task)
+
+    refute context_json =~ "frozen_bundle"
+    refute context_json =~ "evidence_history"
+
+    assert %{"success" => false, "output" => context_rejection} =
+             DynamicTool.execute(
+               "symphony_task_context",
+               %{"history" => true},
+               Keyword.put(opts, :call_id, "context-arguments")
+             )
+
+    assert context_rejection =~ "tool_takes_no_arguments"
 
     assert %{"success" => true} =
              DynamicTool.execute(
@@ -96,7 +112,7 @@ defmodule SymphonyElixir.DynamicToolTest do
 
     refute "linear_graphql" in names
     assert Enum.all?(DynamicTool.tool_specs(), &(&1["inputSchema"]["additionalProperties"] == false))
-    assert get_in(Enum.find(DynamicTool.tool_specs(), &(&1["name"] == "symphony_workpad_read")), ["inputSchema", "properties", "run_id", "type"]) == "string"
+    assert get_in(Enum.find(DynamicTool.tool_specs(), &(&1["name"] == "symphony_workpad_read")), ["inputSchema", "properties"]) == %{}
 
     create = Enum.find(DynamicTool.tool_specs(), &(&1["name"] == "symphony_task_create"))
     refute "project_id" in create["inputSchema"]["required"]
@@ -239,47 +255,46 @@ defmodule SymphonyElixir.DynamicToolTest do
     assert %{"success" => true, "output" => second_json} =
              DynamicTool.execute("symphony_acceptance_complete", second_args, second_opts)
 
-    assert Jason.decode!(first_json)["task"]["id"] == first_task["id"]
-    assert Jason.decode!(second_json)["task"]["id"] == second_task["id"]
+    first_payload = Jason.decode!(first_json)
+    second_payload = Jason.decode!(second_json)
+
+    assert Map.keys(first_payload) |> Enum.sort() == ["event_type", "run", "task"]
+
+    assert Map.keys(first_payload["task"]) |> Enum.sort() ==
+             ~w(active_run_id column_id id identifier revision runtime_state)
+
+    assert first_payload["task"]["id"] == first_task["id"]
+    assert first_payload["run"] == %{"id" => first_run["id"], "status" => "starting"}
+    assert second_payload["task"]["id"] == second_task["id"]
+    refute first_json =~ "acceptance_criteria"
+    refute first_json =~ "frozen_bundle"
 
     assert %{"success" => true, "output" => ^first_json} =
              DynamicTool.execute("symphony_acceptance_complete", first_args, first_opts)
   end
 
-  test "reads completed same-task prior-run workpads without permitting cross-task access" do
+  test "reads exactly one deterministic latest meaningful workpad" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Prior workpad")})
     {todo, _} = BoardFactory.move(created, "todo")
     {implementation_task, implementation_run} = claim(todo)
+    :ok = Board.write_workpad_template(implementation_run["id"], 1, "implementation template")
     :ok = Board.write_workpad(implementation_run["id"], 1, "implementation evidence")
     {review_ready, _completed_implementation} = finish_to(implementation_task, implementation_run, "automated_review")
 
     {review_task, review_run} = claim(review_ready)
-    :ok = Board.write_workpad(review_run["id"], 1, "review finding one")
+    :ok = Board.write_workpad_template(review_run["id"], 1, "review template")
     :ok = Board.write_workpad(review_run["id"], 2, "review finding two")
     {rework_ready, completed_review} = finish_to(review_task, review_run, "rework")
 
     {rework_task, rework_run} = claim(rework_ready)
-    :ok = Board.write_workpad(rework_run["id"], 1, "current rework")
+    :ok = Board.write_workpad_template(rework_run["id"], 1, "current template")
 
     on_exit(fn -> cleanup_active_run(rework_task["id"], rework_run["id"]) end)
 
-    opts = [task_id: rework_task["id"], run_id: rework_run["id"], call_id: "prior-read"]
-
-    assert %{"success" => true, "output" => first_prior_json} =
-             DynamicTool.execute(
-               "symphony_workpad_read",
-               %{"run_id" => completed_review["id"], "invocation" => 1},
-               Keyword.put(opts, :call_id, "first-prior-read")
-             )
-
-    assert Jason.decode!(first_prior_json)["content"] == "review finding one"
+    opts = [task_id: rework_task["id"], run_id: rework_run["id"], call_id: "latest-read"]
 
     assert %{"success" => true, "output" => prior_json} =
-             DynamicTool.execute(
-               "symphony_workpad_read",
-               %{"run_id" => completed_review["id"], "invocation" => 2},
-               opts
-             )
+             DynamicTool.execute("symphony_workpad_read", %{}, opts)
 
     prior = Jason.decode!(prior_json)
     assert prior["content"] == "review finding two"
@@ -287,6 +302,18 @@ defmodule SymphonyElixir.DynamicToolTest do
     assert prior["stage_id"] == "automated_review"
     assert prior["status"] == "completed"
     assert prior["invocation"] == 2
+    refute prior_json =~ "implementation evidence"
+
+    assert %{"success" => false, "output" => rejected_arguments} =
+             DynamicTool.execute(
+               "symphony_workpad_read",
+               %{"run_id" => completed_review["id"], "invocation" => 1},
+               Keyword.put(opts, :call_id, "historical-selector")
+             )
+
+    assert rejected_arguments =~ "tool_takes_no_arguments"
+
+    :ok = Board.write_workpad(rework_run["id"], 1, "current rework")
 
     assert %{"success" => true, "output" => current_json} =
              DynamicTool.execute("symphony_workpad_read", %{}, Keyword.put(opts, :call_id, "current-read"))
@@ -299,14 +326,11 @@ defmodule SymphonyElixir.DynamicToolTest do
     :ok = Board.write_workpad(other_run["id"], 1, "cross-task secret")
     {_other_review, completed_other} = finish_to(other_task, other_run, "automated_review")
 
-    assert %{"success" => false, "output" => cross_task_json} =
-             DynamicTool.execute(
-               "symphony_workpad_read",
-               %{"run_id" => completed_other["id"], "invocation" => 1},
-               Keyword.put(opts, :call_id, "cross-task-read")
-             )
+    assert %{"success" => true, "output" => isolated_json} =
+             DynamicTool.execute("symphony_workpad_read", %{}, Keyword.put(opts, :call_id, "isolated-read"))
 
-    refute cross_task_json =~ "cross-task secret"
+    refute isolated_json =~ "cross-task secret"
+    assert completed_other["status"] == "completed"
 
     assert {:ok, _result} =
              Board.execute(
@@ -321,15 +345,15 @@ defmodule SymphonyElixir.DynamicToolTest do
              )
   end
 
-  test "reads failed and stopped same-task workpads while rejecting another active run" do
+  test "selects failed and stopped same-task workpads while excluding active cross-task work" do
     Enum.each(["failed", "stopped"], fn status ->
-      {current_task, current_run, prior_run} = terminal_prior_fixture(status)
+      {current_task, current_run, _prior_run} = terminal_prior_fixture(status)
       opts = [task_id: current_task["id"], run_id: current_run["id"]]
 
       assert %{"success" => true, "output" => json} =
                DynamicTool.execute(
                  "symphony_workpad_read",
-                 %{"run_id" => prior_run["id"], "invocation" => 2},
+                 %{},
                  Keyword.put(opts, :call_id, "#{status}-prior-read")
                )
 
@@ -342,17 +366,29 @@ defmodule SymphonyElixir.DynamicToolTest do
       {other_task, other_run} = claim(other_todo)
       :ok = Board.write_workpad(other_run["id"], 1, "active cross-task secret")
 
-      assert %{"success" => false, "output" => rejected} =
-               DynamicTool.execute(
-                 "symphony_workpad_read",
-                 %{"run_id" => other_run["id"], "invocation" => 1},
-                 Keyword.put(opts, :call_id, "#{status}-active-read")
-               )
+      assert %{"success" => true, "output" => rejected} =
+               DynamicTool.execute("symphony_workpad_read", %{}, Keyword.put(opts, :call_id, "#{status}-active-read"))
 
       refute rejected =~ "active cross-task secret"
       cleanup_active_run(other_task["id"], other_run["id"])
       cleanup_active_run(current_task["id"], current_run["id"])
     end)
+  end
+
+  test "returns null when no meaningful current or terminal workpad exists" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("No workpad")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+    {task, run} = claim(todo)
+    :ok = Board.write_workpad_template(run["id"], 1, "untouched template")
+
+    on_exit(fn -> cleanup_active_run(task["id"], run["id"]) end)
+
+    assert %{"success" => true, "output" => "null"} =
+             DynamicTool.execute("symphony_workpad_read", %{},
+               task_id: task["id"],
+               run_id: run["id"],
+               call_id: "null-workpad"
+             )
   end
 
   test "a publish-only destination rejects the transition until publication succeeds" do

@@ -44,7 +44,7 @@ defmodule SymphonyElixir.PromptBuilderTest do
     )
   end
 
-  test "exposes completed prior-run stage and workpad invocation metadata" do
+  test "injects exactly one latest meaningful workpad body without prior-run lists" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Prompt handoff")})
     {todo, _} = BoardFactory.move(created, "todo")
 
@@ -55,7 +55,7 @@ defmodule SymphonyElixir.PromptBuilderTest do
         idempotency_key: BoardFactory.unique("claim")
       )
 
-    :ok = Board.write_workpad(implementation_run["id"], 3, "handoff evidence")
+    :ok = Board.write_workpad(implementation_run["id"], 3, "older-handoff-body")
 
     {:ok, %{"task" => review_ready}} =
       Board.execute(%Commands.MoveTask{task_id: implementation_task["id"], column_id: "automated_review"},
@@ -78,45 +78,71 @@ defmodule SymphonyElixir.PromptBuilderTest do
         idempotency_key: BoardFactory.unique("review-claim")
       )
 
-    on_exit(fn -> cleanup_active_run(claimed_review["id"], review_run["id"]) end)
+    :ok = Board.write_workpad(review_run["id"], 4, "only-latest-handoff-body")
+
+    {:ok, %{"task" => rework_ready}} =
+      Board.execute(%Commands.MoveTask{task_id: claimed_review["id"], column_id: "rework"},
+        actor: %{type: :agent, identity: review_run["id"]},
+        expected_revision: claimed_review["revision"],
+        idempotency_key: BoardFactory.unique("review-move")
+      )
+
+    {:ok, %{"task" => rework_task, "run" => completed_review}} =
+      Board.execute(%Commands.RunFinished{task_id: rework_ready["id"], run_id: review_run["id"], outcome: %{}},
+        actor: :system,
+        expected_revision: rework_ready["revision"],
+        idempotency_key: BoardFactory.unique("review-finish")
+      )
+
+    {:ok, %{"task" => claimed_rework, "run" => rework_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: rework_task["id"]},
+        actor: :system,
+        expected_revision: rework_task["revision"],
+        idempotency_key: BoardFactory.unique("rework-claim")
+      )
+
+    on_exit(fn -> cleanup_active_run(claimed_rework["id"], rework_run["id"]) end)
 
     context = """
-    {% for handoff in prior_handoffs %}
-    handoff={{ handoff.run_id }}:{{ handoff.stage_id }}:{{ handoff.status }}
-    {% for workpad in handoff.workpads %}workpad={{ workpad.invocation }}:{{ workpad.updated_at }}{% endfor %}
-    {% endfor %}
+    {% if latest_workpad %}
+    latest={{ latest_workpad.run_id }}:{{ latest_workpad.stage_id }}:{{ latest_workpad.status }}:{{ latest_workpad.invocation }}
+    {{ latest_workpad.content }}
+    {% endif %}
     """
 
-    review_run = put_in(review_run, ["frozen_bundle", "context_prompt"], context)
-    {:ok, task} = Board.task(claimed_review["id"])
-    prompt = PromptBuilder.build_prompt(task, review_run)
+    rework_run = put_in(rework_run, ["frozen_bundle", "context_prompt"], context)
+    {:ok, task} = Board.task(claimed_rework["id"])
+    prompt = PromptBuilder.build_prompt(task, rework_run)
 
-    assert prompt =~ "handoff=#{completed_run["id"]}:implementation:completed"
-    assert prompt =~ "workpad=3:"
+    assert completed_run["status"] == "completed"
+    assert prompt =~ "latest=#{completed_review["id"]}:automated_review:completed:4"
+    assert length(String.split(prompt, "only-latest-handoff-body")) == 2
+    refute prompt =~ "older-handoff-body"
+    refute prompt =~ "prior_handoffs"
 
-    Board.execute(%Commands.RunFailed{task_id: task.id, run_id: review_run["id"], reason: :test_complete},
+    Board.execute(%Commands.RunFailed{task_id: task.id, run_id: rework_run["id"], reason: :test_complete},
       actor: :system,
       expected_revision: task.revision,
       idempotency_key: BoardFactory.unique("cleanup")
     )
   end
 
-  test "exposes failed and stopped prior-run workpads with terminal status metadata" do
+  test "injects failed and stopped terminal workpads as the single latest body" do
     Enum.each(["failed", "stopped"], fn status ->
       {task, current_run, terminal_run} = terminal_handoff_fixture(status)
 
       context = """
-      {% for handoff in prior_handoffs %}
-      handoff={{ handoff.run_id }}:{{ handoff.status }}
-      {% for workpad in handoff.workpads %}workpad={{ workpad.invocation }}:{{ workpad.published }}{% endfor %}
-      {% endfor %}
+      {% if latest_workpad %}
+      latest={{ latest_workpad.run_id }}:{{ latest_workpad.status }}:{{ latest_workpad.invocation }}
+      {{ latest_workpad.content }}
+      {% endif %}
       """
 
       current_run = put_in(current_run, ["frozen_bundle", "context_prompt"], context)
       prompt = PromptBuilder.build_prompt(task, current_run)
 
-      assert prompt =~ "handoff=#{terminal_run["id"]}:#{status}"
-      assert prompt =~ "workpad=2:false"
+      assert prompt =~ "latest=#{terminal_run["id"]}:#{status}:2"
+      assert length(String.split(prompt, "#{status} handoff evidence")) == 2
       cleanup_active_run(task.id, current_run["id"])
     end)
   end

@@ -172,7 +172,7 @@ defmodule SymphonyElixir.BoardTest do
   end
 
   test "terminal run stats are canonical, replayable, and clear live telemetry" do
-    assert Storage.migration_version() == 2
+    assert Storage.migration_version() == 3
 
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Run stats")})
     {todo, _result} = BoardFactory.move(created, "todo")

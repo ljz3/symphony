@@ -697,48 +697,29 @@ defmodule SymphonyElixir.Workflow.Bundle do
       "id" => "criterion-id",
       "text" => "criterion",
       "completed" => false,
-      "evidence" => [],
-      "evidence_history" => []
+      "evidence" => []
     }
 
     task = %{
       "id" => "task-id",
       "identifier" => "TASK-1",
-      "number" => 1,
-      "project_id" => "project",
       "title" => "Task title",
       "type" => "feature",
       "branch" => "feature/TASK-1",
       "priority" => "normal",
       "brief" => "Task brief",
-      "acceptance_criteria" => [criterion],
-      "dependencies" => [],
-      "stage_selections" => %{},
       "column_id" => "in_progress",
-      "rank" => 1_024,
       "revision" => 1,
-      "blocked_from_column_id" => nil,
       "desired_column_id" => nil,
-      "runtime_state" => "running",
-      "active_run_id" => "run-id",
-      "source" => %{},
-      "github" => %{},
-      "metadata" => %{},
-      "created_at" => "2000-01-01T00:00:00Z",
-      "updated_at" => "2000-01-01T00:00:00Z",
-      "archived_at" => nil
+      "runtime_state" => "running"
     }
 
     run = %{
       "id" => "run-id",
-      "task_id" => "task-id",
-      "task_identifier" => "TASK-1",
       "stage_id" => "implementation",
       "status" => "running",
       "model" => "model",
       "effort" => "high",
-      "worker_host" => nil,
-      "bundle_hash" => "hash",
       "claimed_at" => "2000-01-01T00:00:00Z",
       "started_at" => "2000-01-01T00:00:00Z",
       "updated_at" => "2000-01-01T00:00:00Z"
@@ -751,24 +732,16 @@ defmodule SymphonyElixir.Workflow.Bundle do
       "github" => %{"number" => 1, "url" => "https://github.example/pull/1", "draft" => true},
       "dependencies" => [task],
       "criteria" => [criterion],
-      "prior_handoffs" => [
-        %{
-          "run_id" => "prior",
-          "stage_id" => "implementation",
-          "status" => "completed",
-          "outcome" => %{},
-          "finished_at" => "2000-01-01T00:00:00Z",
-          "workpads" => [
-            %{
-              "invocation" => 1,
-              "published" => false,
-              "publication_id" => nil,
-              "updated_at" => "2000-01-01T00:00:00Z"
-            }
-          ]
-        }
-      ],
-      "allowed_transitions" => [%{"id" => "review", "name" => "Review"}],
+      "latest_workpad" => %{
+        "run_id" => "prior",
+        "stage_id" => "implementation",
+        "status" => "completed",
+        "finished_at" => "2000-01-01T00:00:00Z",
+        "invocation" => 1,
+        "updated_at" => "2000-01-01T00:00:00Z",
+        "content" => "latest workpad"
+      },
+      "allowed_transitions" => [%{"id" => "review", "name" => "Review", "role" => "dispatch"}],
       "workpad" => "workpad",
       "turn_number" => 1
     }
@@ -777,7 +750,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
       populated
       |> Map.put("github", %{})
       |> Map.put("dependencies", [])
-      |> Map.put("prior_handoffs", [])
+      |> Map.put("latest_workpad", nil)
 
     [first_run, populated]
   end

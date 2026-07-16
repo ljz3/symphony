@@ -38,7 +38,7 @@ defmodule SymphonyElixir.WorkflowTest do
     File.write!(path, """
     {% if github %}{{ github.number }}{% endif %}
     {% if dependencies %}{{ dependencies[0].identifier }}{% endif %}
-    {% if prior_handoffs %}{{ prior_handoffs[0].run_id }}{% endif %}
+    {% if latest_workpad %}{{ latest_workpad.run_id }}{% endif %}
     """)
 
     assert {:error, {:template_parse_error, ^path, message}} = Workflow.load(source.workflow)
@@ -57,9 +57,8 @@ defmodule SymphonyElixir.WorkflowTest do
     {% if github != empty %}
     Pull request: {{ github.number }}
     {% endif %}
-    {% if prior_handoffs.size > 0 %}
-    Prior run handoffs:
-    {% for handoff in prior_handoffs %}- {{ handoff.run_id }}{% endfor %}
+    {% if latest_workpad %}
+    Latest workpad: {{ latest_workpad.run_id }}
     {% endif %}
     """
 
@@ -70,7 +69,7 @@ defmodule SymphonyElixir.WorkflowTest do
       template
       |> Solid.parse!()
       |> Solid.render!(
-        %{"github" => %{}, "dependencies" => [], "prior_handoffs" => []},
+        %{"github" => %{}, "dependencies" => [], "latest_workpad" => nil},
         strict_variables: true,
         strict_filters: true
       )
@@ -78,7 +77,7 @@ defmodule SymphonyElixir.WorkflowTest do
 
     refute rendered =~ "Dependencies:"
     refute rendered =~ "Pull request:"
-    refute rendered =~ "Prior run handoffs:"
+    refute rendered =~ "Latest workpad:"
   end
 
   test "rejects user-visible schema versions and unknown configuration" do
