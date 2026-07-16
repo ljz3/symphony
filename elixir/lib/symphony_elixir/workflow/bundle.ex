@@ -705,13 +705,11 @@ defmodule SymphonyElixir.Workflow.Bundle do
       "identifier" => "TASK-1",
       "title" => "Task title",
       "type" => "feature",
-      "branch" => "feature/TASK-1",
       "priority" => "normal",
       "brief" => "Task brief",
+      "branch" => "feature/TASK-1",
       "column_id" => "in_progress",
-      "revision" => 1,
-      "desired_column_id" => nil,
-      "runtime_state" => "running"
+      "revision" => 1
     }
 
     run = %{
@@ -725,12 +723,43 @@ defmodule SymphonyElixir.Workflow.Bundle do
       "updated_at" => "2000-01-01T00:00:00Z"
     }
 
+    populated_task =
+      Map.put(task, "block", %{
+        "from_column_id" => "in_progress",
+        "reason" => "Concrete blocker"
+      })
+
+    populated_run = Map.put(run, "worker_host", "worker.example")
+
     populated = %{
-      "task" => task,
-      "run" => run,
+      "task" => populated_task,
+      "run" => populated_run,
       "stage" => %{"id" => "implementation"},
-      "github" => %{"number" => 1, "url" => "https://github.example/pull/1", "draft" => true},
-      "dependencies" => [task],
+      "source" => %{
+        "head_sha" => String.duplicate("a", 40),
+        "base_sha" => String.duplicate("b", 40),
+        "clean" => true
+      },
+      "github" => %{
+        "number" => 1,
+        "url" => "https://github.example/pull/1",
+        "state" => "open",
+        "draft" => true,
+        "head_sha" => String.duplicate("a", 40),
+        "ready" => true,
+        "merged" => false,
+        "merge_sha" => String.duplicate("c", 40),
+        "reachable" => false
+      },
+      "dependencies" => [
+        %{
+          "id" => "dependency-id",
+          "identifier" => "TASK-0",
+          "title" => "Dependency title",
+          "column_id" => "done",
+          "satisfied" => true
+        }
+      ],
       "criteria" => [criterion],
       "latest_workpad" => %{
         "run_id" => "prior",
@@ -742,15 +771,39 @@ defmodule SymphonyElixir.Workflow.Bundle do
         "content" => "latest workpad"
       },
       "allowed_transitions" => [%{"id" => "review", "name" => "Review", "role" => "dispatch"}],
+      "preflight" => %{
+        "status" => "failed",
+        "phase" => "completed",
+        "fingerprint" => String.duplicate("d", 64),
+        "reason" => "Preflight failed",
+        "started_at" => "2000-01-01T00:00:00Z",
+        "last_activity_at" => "2000-01-01T00:00:01Z",
+        "completed_at" => "2000-01-01T00:00:02Z",
+        "next_retry_at" => "2000-01-01T00:00:32Z"
+      },
+      "job" => %{
+        "job_id" => "job-id",
+        "job" => "targeted_validation",
+        "status" => "running",
+        "started_at" => "2000-01-01T00:00:00Z",
+        "finished_at" => "2000-01-01T00:00:03Z",
+        "elapsed_ms" => 3_000,
+        "source_fingerprint" => String.duplicate("e", 64)
+      },
       "workpad" => "workpad",
       "turn_number" => 1
     }
 
     first_run =
       populated
+      |> Map.put("task", task)
+      |> Map.put("run", run)
+      |> Map.put("source", %{})
       |> Map.put("github", %{})
       |> Map.put("dependencies", [])
       |> Map.put("latest_workpad", nil)
+      |> Map.delete("preflight")
+      |> Map.delete("job")
 
     [first_run, populated]
   end
