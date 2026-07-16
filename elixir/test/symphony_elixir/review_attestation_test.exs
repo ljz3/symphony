@@ -9,6 +9,7 @@ defmodule SymphonyElixir.ReviewAttestationTest do
   alias SymphonyElixir.Config
   alias SymphonyElixir.CurrentState
   alias SymphonyElixir.DeterministicMerge
+  alias SymphonyElixir.JobManager
   alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
 
@@ -355,43 +356,7 @@ defmodule SymphonyElixir.ReviewAttestationTest do
   end
 
   test "only a canonical verified conflict can be claimed and its agent can only return to review or blocked" do
-    {review_task, review_run} = active_review()
-
-    assert %{"success" => true} =
-             DynamicTool.execute(
-               "symphony_review_complete",
-               pass_arguments(review_task),
-               review_opts(review_task, review_run, "conflict-pass")
-             )
-
-    {:ok, attested} = Board.task(review_task["id"])
-    finished = finish_run(attested, review_run)
-    target = String.duplicate("c", 40)
-    paths = ["Sources/A.swift", "Sources/B.swift"]
-    conflict_id = DeterministicMerge.conflict_id(finished["id"], @head, target, paths)
-
-    assert {:ok, %{"task" => conflicted}} =
-             Board.execute(
-               %Commands.RecordMergeConflict{
-                 task_id: finished["id"],
-                 task_head: @head,
-                 target_head: target,
-                 conflicted_paths: paths,
-                 conflict_id: conflict_id
-               },
-               actor: :system,
-               expected_revision: finished["revision"],
-               idempotency_key: BoardFactory.unique("verified-conflict")
-             )
-
-    assert conflicted["column_id"] == "merge_conflict"
-
-    assert {:ok, %{"task" => claimed, "run" => conflict_run}} =
-             Board.execute(%Commands.ClaimRun{task_id: conflicted["id"]},
-               actor: :system,
-               expected_revision: conflicted["revision"],
-               idempotency_key: BoardFactory.unique("conflict-claim")
-             )
+    {claimed, conflict_run} = active_conflict()
 
     assert conflict_run["stage_id"] == "merge_conflict"
 
@@ -402,15 +367,148 @@ defmodule SymphonyElixir.ReviewAttestationTest do
                idempotency_key: BoardFactory.unique("bad-conflict-route")
              )
 
-    assert {:ok, %{"task" => review}} =
+    assert {:error, :merge_conflict_resolution_required} =
              Board.execute(%Commands.MoveTask{task_id: claimed["id"], column_id: "automated_review"},
                actor: %{type: :agent, identity: conflict_run["id"]},
                expected_revision: claimed["revision"],
                idempotency_key: BoardFactory.unique("conflict-return-review")
              )
 
-    assert review["column_id"] == "automated_review"
-    cleanup_active_run(review["id"], conflict_run["id"])
+    assert {:ok, unchanged} = Board.task(claimed["id"])
+    assert unchanged.column_id == "merge_conflict"
+    cleanup_active_run(unchanged.id, conflict_run["id"])
+  end
+
+  test "conflict return invokes the exact-final-source and current-run job guard" do
+    {claimed, conflict_run} = active_conflict()
+    parent = self()
+
+    verifier = fn task, run, worktree, opts ->
+      send(parent, {:conflict_guard, task.id, run["id"], worktree, opts[:worker_host]})
+      {:error, :merge_conflict_validation_source_mismatch}
+    end
+
+    assert %{"success" => false, "output" => rejection} =
+             DynamicTool.execute(
+               "symphony_task_transition",
+               %{"column_id" => "automated_review", "expected_revision" => claimed["revision"]},
+               task_id: claimed["id"],
+               run_id: conflict_run["id"],
+               call_id: "guarded-conflict-return",
+               conflict_resolution_verifier: verifier
+             )
+
+    assert rejection =~ "merge_conflict_validation_source_mismatch"
+
+    claimed_id = claimed["id"]
+    conflict_run_id = conflict_run["id"]
+    worker_host = conflict_run["worker_host"]
+
+    assert_receive {:conflict_guard, ^claimed_id, ^conflict_run_id, worktree, ^worker_host}
+
+    assert is_binary(worktree)
+
+    assert {:ok, unchanged} = Board.task(claimed["id"])
+    assert unchanged.column_id == "merge_conflict"
+    cleanup_active_run(unchanged.id, conflict_run["id"])
+  end
+
+  test "verified conflict return is atomic and replays after its run is terminal" do
+    {claimed, conflict_run} = active_conflict()
+    proof = conflict_resolution_proof(claimed, conflict_run)
+    call_id = BoardFactory.unique("resolved-conflict")
+
+    args = %{
+      "column_id" => "automated_review",
+      "expected_revision" => claimed["revision"]
+    }
+
+    opts = [
+      task_id: claimed["id"],
+      run_id: conflict_run["id"],
+      call_id: call_id,
+      conflict_resolution_verifier: fn _task, _run, _worktree, _opts -> {:ok, proof} end
+    ]
+
+    assert %{"success" => true, "output" => output} =
+             DynamicTool.execute("symphony_task_transition", args, opts)
+
+    assert %{
+             "event_type" => "merge_conflict_resolved",
+             "task" => %{"column_id" => "automated_review", "revision" => _revision}
+           } = Jason.decode!(output)
+
+    assert {:ok, resolved} = Board.task(claimed["id"])
+    assert resolved.column_id == "automated_review"
+    assert resolved.source["head_sha"] == @changed
+    assert resolved.github["head_sha"] == @changed
+    assert resolved.merge_saga["checkpoint"] == "conflict_resolved"
+
+    finished = finish_run(resolved, conflict_run)
+
+    replay_opts =
+      Keyword.put(opts, :conflict_resolution_verifier, fn _task, _run, _worktree, _opts ->
+        flunk("an idempotent retry must not repeat external verification")
+      end)
+
+    assert %{"success" => true, "output" => ^output} =
+             DynamicTool.execute("symphony_task_transition", args, replay_opts)
+
+    assert 1 ==
+             Board.events(finished["id"])
+             |> Enum.count(&(&1["type"] == "merge_conflict_resolved"))
+
+    assert %{"success" => false, "output" => fresh_rejection} =
+             DynamicTool.execute(
+               "symphony_task_transition",
+               Map.put(args, "expected_revision", finished["revision"]),
+               Keyword.put(replay_opts, :call_id, BoardFactory.unique("fresh-same-column"))
+             )
+
+    assert fresh_rejection =~ "transition_must_change_column"
+  end
+
+  test "atomic conflict completion rejects forged canonical, job, remote, and PR proof" do
+    {claimed, conflict_run} = active_conflict()
+    proof = conflict_resolution_proof(claimed, conflict_run)
+
+    for forged <- [
+          Map.put(proof, "conflict_id", "stale-conflict"),
+          Map.put(proof, "remote_head_sha", String.duplicate("1", 40)),
+          put_in(proof, ["job", "status"], "failed"),
+          put_in(proof, ["job", "job_definition_fingerprint"], String.duplicate("2", 64)),
+          put_in(proof, ["pull_request", "number"], 99),
+          put_in(proof, ["pull_request", "state"], "CLOSED"),
+          put_in(proof, ["pull_request", "head_sha"], String.duplicate("3", 40))
+        ] do
+      assert {:error, :invalid_merge_conflict_resolution_proof} =
+               Board.execute(
+                 %Commands.CompleteMergeConflictResolution{
+                   task_id: claimed["id"],
+                   run_id: conflict_run["id"],
+                   proof: forged
+                 },
+                 actor: %{type: :agent, identity: conflict_run["id"]},
+                 expected_revision: claimed["revision"],
+                 idempotency_key: BoardFactory.unique("forged-conflict-proof")
+               )
+    end
+
+    assert {:error, :merge_conflict_run_not_current} =
+             Board.execute(
+               %Commands.CompleteMergeConflictResolution{
+                 task_id: claimed["id"],
+                 run_id: conflict_run["id"],
+                 proof: proof
+               },
+               actor: %{type: :agent, identity: "different-run"},
+               expected_revision: claimed["revision"],
+               idempotency_key: BoardFactory.unique("wrong-conflict-agent")
+             )
+
+    assert {:ok, unchanged} = Board.task(claimed["id"])
+    assert unchanged.column_id == "merge_conflict"
+    cleanup_active_run(unchanged.id, conflict_run["id"])
   end
 
   test "review tool schema is strict at every nested object" do
@@ -500,6 +598,46 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     {review_task, review_run}
   end
 
+  defp active_conflict do
+    {review_task, review_run} = active_review()
+
+    assert %{"success" => true} =
+             DynamicTool.execute(
+               "symphony_review_complete",
+               pass_arguments(review_task),
+               review_opts(review_task, review_run, BoardFactory.unique("conflict-pass"))
+             )
+
+    {:ok, attested} = Board.task(review_task["id"])
+    finished = finish_run(attested, review_run)
+    target = String.duplicate("c", 40)
+    paths = ["Sources/A.swift", "Sources/B.swift"]
+    conflict_id = DeterministicMerge.conflict_id(finished["id"], @head, target, paths)
+
+    assert {:ok, %{"task" => conflicted}} =
+             Board.execute(
+               %Commands.RecordMergeConflict{
+                 task_id: finished["id"],
+                 task_head: @head,
+                 target_head: target,
+                 conflicted_paths: paths,
+                 conflict_id: conflict_id
+               },
+               actor: :system,
+               expected_revision: finished["revision"],
+               idempotency_key: BoardFactory.unique("verified-conflict")
+             )
+
+    assert {:ok, %{"task" => claimed, "run" => conflict_run}} =
+             Board.execute(%Commands.ClaimRun{task_id: conflicted["id"]},
+               actor: :system,
+               expected_revision: conflicted["revision"],
+               idempotency_key: BoardFactory.unique("conflict-claim")
+             )
+
+    {claimed, conflict_run}
+  end
+
   defp finish_run(task, run) do
     task_id = task_value(task, :id)
     revision = task_value(task, :revision)
@@ -512,6 +650,38 @@ defmodule SymphonyElixir.ReviewAttestationTest do
       )
 
     finished
+  end
+
+  defp conflict_resolution_proof(task, run) do
+    conflict = task["merge_saga"]["last_conflict"]
+    job = get_in(run, ["frozen_bundle", "jobs", "full_validation"])
+    fingerprint = String.duplicate("e", 64)
+
+    %{
+      "conflict_id" => conflict["id"],
+      "task_head" => conflict["task_head"],
+      "target_head" => conflict["target_head"],
+      "conflicted_paths" => conflict["conflicted_paths"],
+      "run_id" => run["id"],
+      "final_head_sha" => @changed,
+      "remote_head_sha" => @changed,
+      "merge_commit_sha" => String.duplicate("d", 40),
+      "source_fingerprint" => fingerprint,
+      "job" => %{
+        "job_id" => Ecto.UUID.generate(),
+        "job" => "full_validation",
+        "status" => "completed",
+        "exit_code" => 0,
+        "run_id" => run["id"],
+        "source_fingerprint" => fingerprint,
+        "job_definition_fingerprint" => JobManager.job_definition_fingerprint(job)
+      },
+      "pull_request" => %{
+        "number" => task["github"]["number"],
+        "head_sha" => @changed,
+        "state" => "OPEN"
+      }
+    }
   end
 
   defp pass_arguments(task) do

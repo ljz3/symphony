@@ -213,11 +213,15 @@ deterministic merge configuration use these strict shapes:
 ```yaml
 jobs:
   targeted_validation:
-    executable: ./scripts/validate.sh
-    arguments: [targeted, --run-id, $SYMPHONY_JOB_ID]
-    passthrough_arguments: required # required | optional | forbidden
-    environment:
-      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    executable: ./elixir/scripts/symphony-targeted-validation.sh
+    arguments: []
+    passthrough_arguments: required
+    environment: {}
+  full_validation:
+    executable: ./elixir/scripts/symphony-full-validation.sh
+    arguments: []
+    passthrough_arguments: forbidden
+    environment: {}
 
 dispatch:
   preflight:
@@ -364,8 +368,14 @@ restart inspects local Git plus the actual remote PR head and resumes instead of
 already-updated remote head invalidates review without another push. A first conflict
 for one task-head/target-head pair enters Merge Conflict; recurrence of the same pair blocks. That
 agent may resolve only the recorded paths by merging the recorded target without rebase/history
-rewrite, validate through `symphony_job_run`, push, and return to Automated Review. It never lands the
-PR. After squash, the system fetches the target until the merge SHA is reachable, then atomically
+rewrite. The recorded task and target heads must be the ordered merge parents, and all follow-up
+commits remain limited to the recorded paths. The agent commits a clean final source, runs the frozen
+`full_validation` job through `symphony_job_run` to terminal success for that exact fingerprint, and
+then pushes the same head. This commit-validate-push ordering means the push cannot change the source
+fingerprint and avoids duplicating a successful validation. Symphony requires the local, remote, and
+live linked-PR heads to match before atomically returning the task to Automated Review; a retry of the
+same transition is idempotent. The agent never lands the PR. After squash, the system fetches the
+target until the merge SHA is reachable, then atomically
 records completion and moves to Done. Stale state returns to review, transient provider/process
 failure remains merge-pending, and broken invariants or a missing/closed PR block.
 

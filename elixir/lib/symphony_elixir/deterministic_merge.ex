@@ -106,9 +106,9 @@ defmodule SymphonyElixir.DeterministicMerge do
   defp run_project_readiness(task, bundle, context, boundary, opts) do
     case boundary.(:readiness, task, context) do
       {:ok, _evidence} -> revalidate_after_readiness(task, bundle, context, boundary, opts)
-      {:error, {:transient, _reason}} -> {:ok, :pending}
       {:error, {:readiness_failed, _status, _output} = reason} -> require_review(task, inspect(reason), opts)
-      {:error, reason} -> block(task, {:readiness_process_failed, reason}, opts)
+      {:error, {:invariant, _reason} = reason} -> block(task, {:readiness_process_failed, reason}, opts)
+      {:error, _reason} -> {:ok, :pending}
     end
   end
 

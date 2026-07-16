@@ -283,6 +283,23 @@ defmodule SymphonyElixir.GitHubClientTest do
     end
   end
 
+  test "returns the live pull-request identity and source head for conflict verification" do
+    source = BoardFactory.workflow_source()
+    task = task_fixture("TEST", github: %{"number" => 42})
+    expected_head = BoardFactory.git!(source.root, ["rev-parse", "HEAD"]) |> String.trim()
+
+    assert {:ok,
+            %{
+              "number" => 42,
+              "head_sha" => ^expected_head,
+              "state" => "OPEN",
+              "url" => "https://github.example/example/repository/pull/42"
+            }} = GitHub.pull_request_source_snapshot(task, source.root)
+
+    assert {:error, :pull_request_not_linked} =
+             GitHub.pull_request_source_snapshot(%{task | github: %{}}, source.root)
+  end
+
   test "creates a draft pull request for committed documentation configuration and tooling changes", %{
     fake_gh_root: fake_gh_root
   } do

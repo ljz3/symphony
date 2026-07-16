@@ -228,6 +228,27 @@ defmodule SymphonyElixir.GitHub do
     end
   end
 
+  @doc "Returns the live pull-request identity and source head for conflict-resolution verification."
+  @spec pull_request_source_snapshot(Task.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def pull_request_source_snapshot(%Task{} = task, worktree, opts \\ []) do
+    directory = github_directory(worktree, Keyword.get(opts, :worker_host))
+
+    with {:ok, number} <- pull_request_number(task),
+         {:ok, pr} <-
+           Client.json(
+             ["pr", "view", Integer.to_string(number), "--json", "number,headRefOid,state,url"],
+             cd: directory
+           ) do
+      {:ok,
+       %{
+         "number" => pr["number"],
+         "head_sha" => pr["headRefOid"],
+         "state" => pr["state"],
+         "url" => pr["url"]
+       }}
+    end
+  end
+
   @spec convert_to_draft(Task.t(), Path.t(), keyword()) :: :ok | {:error, term()}
   def convert_to_draft(%Task{} = task, worktree, opts \\ []) do
     gh_directory = github_directory(worktree, Keyword.get(opts, :worker_host))

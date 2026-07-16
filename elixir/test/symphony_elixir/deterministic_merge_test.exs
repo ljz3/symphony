@@ -122,7 +122,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert current_task().column_id == "blocked"
   end
 
-  test "failed readiness returns review and transport failure blocks without agent dispatch", %{
+  test "natural readiness failure returns review while launch and provider failures remain pending", %{
     task: task,
     bundle: bundle
   } do
@@ -130,8 +130,23 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert {:ok, :review_required} = run(task, bundle)
     assert current_task().column_id == "automated_review"
 
-    Process.put(:merge_fake_task, task)
-    scenario(%{readiness: {:error, {:readiness_transport_failed, "port closed"}}})
+    pending_failures = [
+      {:readiness_transport_failed, "port closed"},
+      {:transient, :network_down},
+      {:provider_unavailable, :authentication_failed},
+      {:process_unavailable, :launch_failed}
+    ]
+
+    Enum.each(pending_failures, fn reason ->
+      reset(task)
+      scenario(%{readiness: {:error, reason}})
+      assert {:ok, :pending} = run(task, bundle)
+      assert current_task().column_id == "merging"
+      assert count_call(:guarded_squash) == 0
+    end)
+
+    reset(task)
+    scenario(%{readiness: {:error, {:invariant, :bash_not_found}}})
     assert {:ok, :blocked} = run(task, bundle)
     assert current_task().column_id == "blocked"
   end

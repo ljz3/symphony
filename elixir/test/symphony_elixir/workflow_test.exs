@@ -151,6 +151,7 @@ defmodule SymphonyElixir.WorkflowTest do
 
     source.workflow
     |> File.read!()
+    |> strip_jobs()
     |> Kernel.<>("""
 
     jobs:
@@ -214,7 +215,7 @@ defmodule SymphonyElixir.WorkflowTest do
       {"codex", "stall_timeout_ms", insert_under(original, "codex:", "  stall_timeout_ms: 1")},
       {"hooks", "timeout_ms", insert_under(original, "hooks:", "  timeout_ms: 1")},
       {"jobs.validation", "max_output_bytes",
-       original <>
+       strip_jobs(original) <>
          """
 
          jobs:
@@ -226,7 +227,7 @@ defmodule SymphonyElixir.WorkflowTest do
              max_output_bytes: 1
          """},
       {"jobs.validation", "timeout_ms",
-       original <>
+       strip_jobs(original) <>
          """
 
          jobs:
@@ -283,12 +284,16 @@ defmodule SymphonyElixir.WorkflowTest do
         environment: {}
     """
 
-    File.write!(source.workflow, original <> job)
+    File.write!(source.workflow, strip_jobs(original) <> job)
 
     assert {:error, {:invalid_job_argument_token, "validation", "$SYMPHONY_TASK_ID"}} =
              Workflow.load(source.workflow)
 
-    File.write!(source.workflow, original <> String.replace(job, "$SYMPHONY_TASK_ID", "literal") <> "    mystery: true\n")
+    File.write!(
+      source.workflow,
+      strip_jobs(original) <>
+        String.replace(job, "$SYMPHONY_TASK_ID", "literal") <> "    mystery: true\n"
+    )
 
     assert {:error, {:unknown_workflow_keys, "jobs.validation", ["mystery"]}} =
              Workflow.load(source.workflow)
@@ -326,5 +331,6 @@ defmodule SymphonyElixir.WorkflowTest do
     String.replace(yaml, heading <> "\n", heading <> "\n" <> line <> "\n", global: false)
   end
 
+  defp strip_jobs(yaml), do: Regex.replace(~r/\njobs:\n(?:  .+\n)+(?=\nstages:\n)/, yaml, "")
   defp strip_merge(yaml), do: Regex.replace(~r/\nmerge:\n(?:  .+\n)+(?=\nhooks:\n)/, yaml, "")
 end

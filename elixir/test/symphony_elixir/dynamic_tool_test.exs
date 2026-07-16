@@ -191,7 +191,7 @@ defmodule SymphonyElixir.DynamicToolTest do
 
     File.write!(
       source.workflow,
-      File.read!(source.workflow) <>
+      Regex.replace(~r/\njobs:\n(?:  .+\n)+(?=\nstages:\n)/, File.read!(source.workflow), "") <>
         """
 
         jobs:

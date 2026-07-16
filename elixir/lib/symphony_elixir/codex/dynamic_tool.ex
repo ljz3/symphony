@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.{CurrentState, GitHub, JobManager, TaskCreateTool, Workflow, Worktree}
+  alias SymphonyElixir.{CurrentState, GitHub, JobManager, MergeConflictResolution, TaskCreateTool, Workflow, Worktree}
   alias SymphonyElixir.Workflow.Bundle
 
   @context_tool "symphony_task_context"
@@ -19,7 +19,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
-    with {:ok, scope} <- scope(opts),
+    with {:ok, scope} <- scope(tool, opts),
          {:ok, normalized_arguments} <- normalize_arguments(arguments),
          {:ok, result} <- execute_scoped(tool, normalized_arguments, scope, opts) do
       success_response(result)
@@ -161,11 +161,21 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp execute_scoped(@transition_tool, arguments, scope, opts) do
     with {:ok, column_id} <- required_string(arguments, "column_id"),
-         true <- column_id != scope.task.column_id,
          {:ok, revision} <- required_revision(arguments) do
-      transition(scope, column_id, argument(arguments, "reason"), revision, opts)
+      cond do
+        column_id == scope.task.column_id and replayable_conflict_completion?(scope, column_id) ->
+          replay_conflict_completion(scope, revision, opts)
+
+        column_id == scope.task.column_id ->
+          {:error, :transition_must_change_column}
+
+        scope.active? ->
+          transition(scope, column_id, argument(arguments, "reason"), revision, opts)
+
+        true ->
+          {:error, :tool_scope_not_active}
+      end
     else
-      false -> {:error, :transition_must_change_column}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -224,12 +234,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     with {:ok, bundle} <- Workflow.current(),
          column when not is_nil(column) <- Bundle.column(bundle, column_id),
          {:ok, revision} <- maybe_complete_external_saga(scope, column, revision, opts) do
-      board_execute(
-        %Commands.MoveTask{task_id: scope.task.id, column_id: column_id, reason: reason},
-        revision,
-        scope,
-        opts
-      )
+      if conflict_review_transition?(scope.task, column_id, bundle) do
+        complete_conflict_resolution(scope, revision, opts)
+      else
+        board_execute(
+          %Commands.MoveTask{task_id: scope.task.id, column_id: column_id, reason: reason},
+          revision,
+          scope,
+          opts
+        )
+      end
     else
       nil -> {:error, {:unknown_column, column_id}}
       {:error, reason} -> {:error, reason}
@@ -278,6 +292,58 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp maybe_complete_external_saga(_scope, _column, revision, _opts), do: {:ok, revision}
 
+  defp complete_conflict_resolution(scope, revision, opts) do
+    worktree = scope.run["workspace_path"] || Worktree.path(scope.task)
+    verifier = Keyword.get(opts, :conflict_resolution_verifier, &MergeConflictResolution.verify/4)
+    verification_opts = Keyword.put(opts, :worker_host, scope.run["worker_host"])
+
+    with {:ok, proof} <- verifier.(scope.task, scope.run, worktree, verification_opts) do
+      board_execute(
+        %Commands.CompleteMergeConflictResolution{
+          task_id: scope.task.id,
+          run_id: scope.run["id"],
+          proof: proof
+        },
+        revision,
+        scope,
+        opts
+      )
+    end
+  end
+
+  defp replay_conflict_completion(scope, revision, opts) do
+    proof = get_in(scope.task.merge_saga, ["resolution"]) || %{}
+
+    case board_execute(
+           %Commands.CompleteMergeConflictResolution{
+             task_id: scope.task.id,
+             run_id: scope.run["id"],
+             proof: proof
+           },
+           revision,
+           scope,
+           opts
+         ) do
+      {:ok, result} -> {:ok, result}
+      {:error, _reason} -> {:error, :transition_must_change_column}
+    end
+  end
+
+  defp conflict_review_transition?(task, column_id, %{merge: %{} = merge}) do
+    task.column_id == merge.conflict_column and column_id == merge.review_column
+  end
+
+  defp conflict_review_transition?(_task, _column_id, _bundle), do: false
+
+  defp replayable_conflict_completion?(scope, column_id) do
+    resolution = get_in(scope.task.merge_saga, ["resolution"])
+
+    column_id == scope.task.column_id and
+      get_in(scope.task.merge_saga, ["checkpoint"]) == "conflict_resolved" and
+      scope.run["start_column_id"] != scope.task.column_id and is_map(resolution) and
+      resolution["run_id"] == scope.run["id"]
+  end
+
   defp board_execute(command, expected_revision, scope, opts) do
     executor = Keyword.get(opts, :board_executor, &Board.execute/2)
     call_id = Keyword.fetch!(opts, :call_id) |> to_string()
@@ -295,15 +361,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp scope(opts) do
+  defp scope(tool, opts) do
     with task_id when is_binary(task_id) <- Keyword.get(opts, :task_id),
          run_id when is_binary(run_id) <- Keyword.get(opts, :run_id),
          {:ok, task} <- Board.task(task_id),
          {:ok, run} <- Board.run(run_id),
-         true <- run["task_id"] == task.id,
-         true <- task.active_run_id == run_id,
-         true <- run["status"] in ["starting", "running", "stopping"] do
-      {:ok, %{task: task, run: run}}
+         true <- run["task_id"] == task.id do
+      active? = task.active_run_id == run_id and run["status"] in ["starting", "running", "stopping"]
+
+      if active? or tool == @transition_tool,
+        do: {:ok, %{task: task, run: run, active?: active?}},
+        else: {:error, :tool_scope_not_active}
     else
       false -> {:error, :tool_scope_not_active}
       nil -> {:error, :tool_scope_required}

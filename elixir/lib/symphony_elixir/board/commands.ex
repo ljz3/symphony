@@ -195,6 +195,17 @@ defmodule SymphonyElixir.Board.Commands do
           }
   end
 
+  defmodule CompleteMergeConflictResolution do
+    @moduledoc "Atomically accept a verified conflict repair and return it to exact-head review."
+    defstruct [:task_id, :run_id, :proof]
+
+    @type t :: %__MODULE__{
+            task_id: String.t(),
+            run_id: String.t(),
+            proof: map()
+          }
+  end
+
   defmodule CompleteDeterministicMerge do
     @moduledoc "Record a reachable guarded squash merge and complete the task atomically."
     defstruct [:task_id, :reviewed_head_sha, :merge_sha, :target_head]
@@ -240,6 +251,7 @@ defmodule SymphonyElixir.Board.Commands do
           | InvalidateReviewAttestation.t()
           | RecordMergeCheckpoint.t()
           | RecordMergeConflict.t()
+          | CompleteMergeConflictResolution.t()
           | CompleteDeterministicMerge.t()
           | RecordRunStatsPublication.t()
 

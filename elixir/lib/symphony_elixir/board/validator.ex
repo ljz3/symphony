@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Board.Validator do
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.Board.Projection
   alias SymphonyElixir.Codex.RunStats
+  alias SymphonyElixir.JobManager
   alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.Bundle
@@ -361,6 +362,20 @@ defmodule SymphonyElixir.Board.Validator do
     else
       false -> {:error, :invalid_merge_conflict}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def validate(%Commands.CompleteMergeConflictResolution{} = command, actor, bundle) do
+    proof = stringify_keys(command.proof)
+
+    with {:ok, task} <- Projection.get_task(command.task_id),
+         {:ok, run} <- Projection.get_run(command.run_id),
+         :ok <- conflict_resolution_actor(actor, run),
+         :ok <- active_run(task, run),
+         {:ok, merge} <- configured_merge(bundle),
+         :ok <- active_conflict_resolution_run(task, run, bundle, merge),
+         :ok <- valid_conflict_resolution_proof(proof, task, run) do
+      complete_conflict_resolution(task, proof, bundle, merge)
     end
   end
 
@@ -767,6 +782,110 @@ defmodule SymphonyElixir.Board.Validator do
     end
   end
 
+  defp active_conflict_resolution_run(task, run, bundle, merge) do
+    with %Column{role: :dispatch, stage_id: stage_id} <- Bundle.column(bundle, merge.conflict_column),
+         true <- task.column_id == merge.conflict_column,
+         true <- run["stage_id"] == stage_id,
+         %{"checkpoint" => "conflict_recorded", "last_conflict" => %{} = _conflict} <- task.merge_saga do
+      :ok
+    else
+      _ -> {:error, :merge_conflict_run_not_current}
+    end
+  end
+
+  defp conflict_resolution_actor(%{type: :agent, identity: identity}, %{"id" => identity}), do: :ok
+  defp conflict_resolution_actor(_actor, _run), do: {:error, :merge_conflict_run_not_current}
+
+  defp valid_conflict_resolution_proof(proof, task, run) when is_map(proof) do
+    conflict = task.merge_saga["last_conflict"]
+    job = proof["job"]
+    pull_request = proof["pull_request"]
+    frozen_jobs = get_in(run, ["frozen_bundle", "jobs"])
+    frozen_job = (is_map(job) and is_map(frozen_jobs)) && frozen_jobs[job["job"]]
+
+    with true <- exact_conflict_proof_keys?(proof),
+         true <- canonical_conflict_proof?(proof, conflict, run),
+         true <- canonical_pre_resolution_heads?(task, conflict),
+         true <- valid_conflict_source_proof?(proof, conflict),
+         true <- valid_conflict_job?(job, run, frozen_job, proof),
+         true <- valid_conflict_pull_request?(pull_request, task, proof) do
+      :ok
+    else
+      _ -> {:error, :invalid_merge_conflict_resolution_proof}
+    end
+  end
+
+  defp valid_conflict_resolution_proof(_proof, _task, _run),
+    do: {:error, :invalid_merge_conflict_resolution_proof}
+
+  defp exact_conflict_proof_keys?(proof) do
+    Map.keys(proof) |> Enum.sort() ==
+      ~w(conflict_id conflicted_paths final_head_sha job merge_commit_sha pull_request remote_head_sha run_id source_fingerprint target_head task_head)
+  end
+
+  defp canonical_conflict_proof?(proof, conflict, run) do
+    is_map(conflict) and proof["conflict_id"] == conflict["id"] and
+      proof["task_head"] == conflict["task_head"] and proof["target_head"] == conflict["target_head"] and
+      proof["conflicted_paths"] == conflict["conflicted_paths"] and proof["run_id"] == run["id"]
+  end
+
+  defp canonical_pre_resolution_heads?(task, conflict) do
+    task.source["head_sha"] == conflict["task_head"] and task.source["clean"] == true and
+      task.github["head_sha"] == conflict["task_head"]
+  end
+
+  defp valid_conflict_source_proof?(proof, conflict) do
+    sha?(proof["final_head_sha"]) and proof["final_head_sha"] != conflict["task_head"] and
+      proof["remote_head_sha"] == proof["final_head_sha"] and sha?(proof["merge_commit_sha"]) and
+      sha256?(proof["source_fingerprint"])
+  end
+
+  defp valid_conflict_job?(job, run, frozen_job, proof) do
+    is_map(job) and
+      Map.keys(job) |> Enum.sort() ==
+        ~w(exit_code job job_definition_fingerprint job_id run_id source_fingerprint status) and
+      is_map(frozen_job) and nonblank?(job["job_id"]) and job["run_id"] == run["id"] and
+      job["status"] == "completed" and job["exit_code"] == 0 and
+      job["source_fingerprint"] == proof["source_fingerprint"] and
+      job["job_definition_fingerprint"] == JobManager.job_definition_fingerprint(frozen_job)
+  end
+
+  defp valid_conflict_pull_request?(pull_request, task, proof) do
+    is_map(pull_request) and Map.keys(pull_request) |> Enum.sort() == ~w(head_sha number state) and
+      is_integer(pull_request["number"]) and pull_request["number"] > 0 and
+      pull_request["number"] == task.github["number"] and pull_request["state"] == "OPEN" and
+      pull_request["head_sha"] == proof["final_head_sha"]
+  end
+
+  defp complete_conflict_resolution(task, proof, bundle, merge) do
+    timestamp = now()
+    review = Bundle.column(bundle, merge.review_column)
+
+    saga =
+      merge_saga(task)
+      |> Map.put("checkpoint", "conflict_resolved")
+      |> Map.put("resolution", stringify_keys(proof))
+      |> Map.put("updated_at", timestamp)
+
+    updated =
+      bump(task, %{
+        column_id: review.id,
+        rank: Projection.max_rank(review.id) + @rank_gap,
+        source:
+          task.source
+          |> Map.put("head_sha", proof["final_head_sha"])
+          |> Map.put("clean", true)
+          |> Map.put("recorded_at", timestamp),
+        github: Map.put(task.github, "head_sha", proof["final_head_sha"]),
+        review_attestation: nil,
+        merge_saga: saga,
+        blocked_from_column_id: nil,
+        desired_column_id: nil
+      })
+
+    mutation("merge_conflict_resolved", updated, nil)
+  end
+
   defp valid_review_attestation(command, task) do
     with true <- command.verdict in ["pass", "rework"],
          true <- sha?(command.reviewed_head_sha),
@@ -1088,9 +1207,11 @@ defmodule SymphonyElixir.Board.Validator do
 
   defp move_permission(task, target, _force, %{type: :agent}, %{merge: merge} = bundle)
        when not is_nil(merge) and task.column_id == merge.conflict_column do
-    if target.id in [merge.review_column, Bundle.blocked_column(bundle).id],
-      do: :ok,
-      else: {:error, :merge_conflict_must_return_to_review}
+    cond do
+      target.id == merge.review_column -> {:error, :merge_conflict_resolution_required}
+      target.id == Bundle.blocked_column(bundle).id -> :ok
+      true -> {:error, :merge_conflict_must_return_to_review}
+    end
   end
 
   defp move_permission(task, target, _force, actor, bundle) when actor.type in [:human, :agent] do
@@ -1533,6 +1654,7 @@ defmodule SymphonyElixir.Board.Validator do
   defp actor_json(actor), do: %{"type" => Atom.to_string(actor.type), "identity" => actor.identity}
 
   defp sha?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{40,64}\z/i, value)
+  defp sha256?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/i, value)
   defp nonblank?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp stringify_keys(value) when is_map(value) do

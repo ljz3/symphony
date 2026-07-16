@@ -121,6 +121,27 @@ defmodule SymphonyElixir.JobManager do
     GenServer.call(server, {:active_for_run, run_id}, :infinity)
   end
 
+  @spec successful_for_source(String.t(), map(), String.t(), GenServer.server()) ::
+          {:ok, map()} | {:error, term()}
+  def successful_for_source(run_id, frozen_jobs, source_fingerprint, server \\ __MODULE__)
+      when is_binary(run_id) and is_map(frozen_jobs) and is_binary(source_fingerprint) do
+    GenServer.call(
+      server,
+      {:successful_for_source, run_id, frozen_jobs, source_fingerprint},
+      :infinity
+    )
+  end
+
+  @spec job_definition_fingerprint(map()) :: String.t() | {:error, term()}
+  def job_definition_fingerprint(job) when is_map(job) do
+    with {:ok, normalized} <- normalize_job(job) do
+      normalized
+      |> :erlang.term_to_binary([:deterministic])
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+    end
+  end
+
   @spec source_fingerprint(Path.t(), String.t() | nil) :: String.t() | {:error, term()}
   def source_fingerprint(workspace, nil) when is_binary(workspace) do
     with git when is_binary(git) <- System.find_executable("git"),
@@ -202,6 +223,11 @@ defmodule SymphonyElixir.JobManager do
       |> Enum.max_by(&{&1["started_at"] || "", &1["job_id"]}, fn -> nil end)
 
     {:reply, active, state}
+  end
+
+  def handle_call({:successful_for_source, run_id, frozen_jobs, source_fingerprint}, _from, state) do
+    reply = successful_record(state.records, run_id, frozen_jobs, source_fingerprint)
+    {:reply, reply, state}
   end
 
   def handle_call({:cancel_run, run_id}, _from, state) do
@@ -343,6 +369,7 @@ defmodule SymphonyElixir.JobManager do
       "finished_at" => nil,
       "elapsed_ms" => nil,
       "source_fingerprint" => request.source_fingerprint,
+      "job_definition_fingerprint" => request.job_definition_fingerprint,
       "executable" => executable,
       "arguments" => argv,
       "environment" => request.job["environment"],
@@ -385,6 +412,8 @@ defmodule SymphonyElixir.JobManager do
          {:ok, workspace} <- required_string(request, :workspace),
          {:ok, source_fingerprint} <- required_string(request, :source_fingerprint),
          {:ok, job} <- normalize_job(request[:job]),
+         job_definition_fingerprint when is_binary(job_definition_fingerprint) <-
+           job_definition_fingerprint(job),
          {:ok, arguments} <- passthrough_arguments(job, request[:arguments]),
          {:ok, executable} <- resolve_executable(workspace, job["executable"]),
          :ok <- validate_worker_host(request[:worker_host]) do
@@ -396,6 +425,7 @@ defmodule SymphonyElixir.JobManager do
             job: job["id"],
             arguments: arguments,
             fixed_arguments: job["arguments"],
+            job_definition_fingerprint: job_definition_fingerprint,
             source_fingerprint: source_fingerprint
           })
         )
@@ -409,6 +439,7 @@ defmodule SymphonyElixir.JobManager do
          run_id: run_id,
          call_id: call_id,
          job: job,
+         job_definition_fingerprint: job_definition_fingerprint,
          executable: executable,
          arguments: arguments,
          workspace: workspace,
@@ -446,6 +477,55 @@ defmodule SymphonyElixir.JobManager do
   end
 
   defp normalize_job(_job), do: {:error, :invalid_frozen_job_definition}
+
+  defp successful_record(records, run_id, frozen_jobs, source_fingerprint) do
+    with {:ok, fingerprints} <- frozen_job_fingerprints(frozen_jobs) do
+      run_records = records |> Map.values() |> Enum.filter(&(&1["run_id"] == run_id))
+      named = Enum.filter(run_records, &Map.has_key?(fingerprints, &1["job"]))
+
+      defined =
+        Enum.filter(named, fn record ->
+          record["job_definition_fingerprint"] == fingerprints[record["job"]]
+        end)
+
+      exact = Enum.filter(defined, &(&1["source_fingerprint"] == source_fingerprint))
+      successful = Enum.filter(exact, &(&1["status"] == "completed" and &1["exit_code"] == 0))
+
+      cond do
+        successful != [] -> {:ok, successful_job_proof(successful)}
+        named == [] -> {:error, :conflict_validation_missing}
+        defined == [] -> {:error, :conflict_validation_job_mismatch}
+        exact == [] -> {:error, :conflict_validation_source_mismatch}
+        true -> {:error, :conflict_validation_failed}
+      end
+    end
+  end
+
+  defp frozen_job_fingerprints(frozen_jobs) do
+    Enum.reduce_while(frozen_jobs, {:ok, %{}}, fn {id, job}, {:ok, fingerprints} ->
+      case frozen_job_fingerprint(id, job) do
+        {:ok, fingerprint} -> {:cont, {:ok, Map.put(fingerprints, id, fingerprint)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp frozen_job_fingerprint(id, job) do
+    with true <- is_binary(id) and id != "",
+         %{} = job <- Map.new(job, fn {key, value} -> {to_string(key), value} end),
+         true <- job["id"] == id,
+         fingerprint when is_binary(fingerprint) <- job_definition_fingerprint(job) do
+      {:ok, fingerprint}
+    else
+      _ -> {:error, :invalid_frozen_job_definition}
+    end
+  end
+
+  defp successful_job_proof(records) do
+    records
+    |> Enum.max_by(&{&1["finished_at"] || "", &1["job_id"]})
+    |> Map.take(~w(job_id job status exit_code run_id source_fingerprint job_definition_fingerprint started_at finished_at))
+  end
 
   defp passthrough_arguments(job, arguments) when is_list(arguments) do
     if Enum.all?(arguments, &is_binary/1) do

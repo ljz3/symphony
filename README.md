@@ -42,7 +42,9 @@ Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merg
 ```
 
 Human Review, Blocked, and Cancelled are explicit side paths. A verified merge conflict receives a
-constrained repair run and then returns to Automated Review; recurrence of the same head pair blocks.
+constrained repair run. It commits the recorded-path-only merge, validates that exact committed
+source once through the frozen full-validation job, pushes the same head, and then returns atomically
+to Automated Review; recurrence of the same head pair blocks.
 A failed agent invocation moves the task to Blocked; there is no agent retry queue.
 
 See [SPEC.md](SPEC.md) for the behavioral contract and [elixir/README.md](elixir/README.md) for setup,

@@ -22,6 +22,18 @@ prompts:
   base: workflow/prompts/base.md
   context: workflow/prompts/context.md
 
+jobs:
+  targeted_validation:
+    executable: ./elixir/scripts/symphony-targeted-validation.sh
+    arguments: []
+    passthrough_arguments: required
+    environment: {}
+  full_validation:
+    executable: ./elixir/scripts/symphony-full-validation.sh
+    arguments: []
+    passthrough_arguments: forbidden
+    environment: {}
+
 stages:
   implementation:
     prompt: workflow/prompts/implementation.md

@@ -368,8 +368,16 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
   unmerged-path set, and successfully abort the probe before recording a canonical conflict. The
   first conflict for one task-head/target-head pair routes to the configured conflict stage and
   clears the attestation; the same pair recurring later routes to Blocked. The conflict agent may
-  resolve only those recorded paths by merging the recorded target without rebase/history rewrite,
-  validate only through managed jobs, commit/push, and return to review; it never lands the PR.
+  resolve only those recorded paths by merging the recorded target without rebase/history rewrite;
+  the recorded task head and target head must be the ordered parents of that merge, and every
+  resolution or follow-up commit may change only the recorded paths. The agent must commit a clean
+  final source, run one frozen managed job to terminal success for the current conflict run and that
+  exact source fingerprint, then push the same head before one atomic return to review. Pushing does
+  not change the source fingerprint, so a successful job is not repeated for the unchanged commit.
+  The final local, remote-branch, linked-PR, and provider-PR heads must agree. A missing, failed,
+  definition-mismatched, or stale-source job; dirty or uncommitted source; rewritten/wrong history;
+  out-of-scope path; unpushed head; stale conflict; or mismatched PR identity/state/head rejects the
+  transition. The conflict agent never lands the PR.
 - After guarded squash, fetch the target until the merge SHA is reachable. Atomically record the
   reachable merge outcome and move to Done. Done cannot be reached by an agent and is accepted only
   through this system completion event. Stale reviewed state returns to review, transient external
