@@ -472,6 +472,140 @@ defmodule SymphonyElixir.OrchestratorTest do
     on_exit(fn -> cleanup_active_run(selected_task_id, conflict_run_id) end)
   end
 
+  @tag timeout: 20_000
+  test "merge invalidation kills readiness trees and frees the sole slot for the next task" do
+    first = canonical_merge_task()
+    second = canonical_merge_task()
+    parent = self()
+    readiness_root = Path.join(System.tmp_dir!(), BoardFactory.unique("merge-readiness-owner"))
+    File.mkdir_p!(readiness_root)
+    parent_path = Path.join(readiness_root, "parent.pid")
+    child_path = Path.join(readiness_root, "child.pid")
+
+    readiness_command = """
+    trap '' TERM
+    (trap '' TERM; while :; do sleep 1; done) &
+    child=$!
+    printf %s $$ > #{shell_escape(parent_path)}
+    printf %s "$child" > #{shell_escape(child_path)}
+    wait "$child"
+    """
+
+    merge_runner = fn merge_task, _bundle, _opts ->
+      if merge_task.id == first.id do
+        DeterministicMerge.SystemBoundary.call(:readiness, merge_task, %{
+          worktree: readiness_root,
+          worker_host: nil,
+          readiness_command: readiness_command
+        })
+      else
+        send(parent, {:next_merge_started, merge_task.id})
+        {:ok, :pending}
+      end
+    end
+
+    state =
+      struct(State,
+        dispatch_enabled: true,
+        recover_orphans: false,
+        task_filter: &(&1.id in [first.id, second.id]),
+        merge_runner: merge_runner,
+        github_health: %{available: true, authenticated: true, error: nil},
+        github_health_checked_at: System.monotonic_time(:millisecond)
+      )
+
+    assert {:noreply, merging_state} = Orchestrator.handle_info(:reconcile, state)
+    eventually(fn -> File.exists?(parent_path) and File.exists?(child_path) end)
+    parent_pid = parent_path |> File.read!() |> String.trim() |> String.to_integer()
+    child_pid = child_path |> File.read!() |> String.trim() |> String.to_integer()
+    %{pid: merge_pid, ref: merge_ref} = Map.fetch!(merging_state.merging, first.id)
+
+    on_exit(fn ->
+      if Process.alive?(merge_pid), do: Process.exit(merge_pid, :kill)
+      kill_process(parent_pid)
+      kill_process(child_pid)
+    end)
+
+    assert {:ok, %{"task" => invalidated}} =
+             Board.execute(
+               %Commands.InvalidateReviewAttestation{
+                 task_id: first.id,
+                 reason: "source changed during readiness",
+                 head_sha: @target
+               },
+               actor: :system,
+               expected_revision: first.revision,
+               idempotency_key: BoardFactory.unique("cancel-merge-readiness")
+             )
+
+    assert invalidated["column_id"] == "automated_review"
+
+    assert {:noreply, cancelling_state} =
+             Orchestrator.handle_info({:task_changed, first.id}, merging_state)
+
+    assert_receive {:DOWN, ^merge_ref, :process, ^merge_pid, _reason}, 8_000
+
+    assert {:noreply, released_state} =
+             Orchestrator.handle_info(
+               {:DOWN, merge_ref, :process, merge_pid, :shutdown},
+               cancelling_state
+             )
+
+    refute process_alive?(parent_pid)
+    refute process_alive?(child_pid)
+    assert map_size(released_state.merging) == 0
+
+    assert {:noreply, _next_state} = Orchestrator.handle_info(:reconcile, released_state)
+    assert_receive {:next_merge_started, second_id}, 2_000
+    assert second_id == second.id
+  end
+
+  test "pending merge outcomes obey a per-task retry cadence" do
+    task = canonical_merge_task()
+    parent = self()
+    attempts = :atomics.new(1, [])
+
+    merge_runner = fn merge_task, _bundle, _opts ->
+      attempt = :atomics.add_get(attempts, 1, 1)
+      send(parent, {:merge_retry_attempt, attempt, merge_task.id, self()})
+      {:ok, :pending}
+    end
+
+    state =
+      struct(State,
+        dispatch_enabled: true,
+        recover_orphans: false,
+        task_filter: &(&1.id == task.id),
+        merge_runner: merge_runner,
+        github_health: %{available: true, authenticated: true, error: nil},
+        github_health_checked_at: System.monotonic_time(:millisecond)
+      )
+      |> Map.put(:merge_retry_ms, 250)
+      |> Map.put(:merge_retry_after, %{})
+
+    assert {:noreply, first_state} = Orchestrator.handle_info(:reconcile, state)
+    assert_receive {:merge_retry_attempt, 1, task_id, first_pid}, 2_000
+    assert task_id == task.id
+    %{ref: first_ref} = Map.fetch!(first_state.merging, task.id)
+    assert_receive {:DOWN, ^first_ref, :process, ^first_pid, :normal}, 2_000
+
+    assert {:noreply, waiting_state} =
+             Orchestrator.handle_info({:DOWN, first_ref, :process, first_pid, :normal}, first_state)
+
+    waiting_state =
+      Enum.reduce(1..5, waiting_state, fn _iteration, current ->
+        assert {:noreply, next} = Orchestrator.handle_info(:reconcile, current)
+        next
+      end)
+
+    refute_receive {:merge_retry_attempt, 2, ^task_id, _pid}, 100
+    assert :atomics.get(attempts, 1) == 1
+
+    Process.sleep(275)
+    assert {:noreply, _retried_state} = Orchestrator.handle_info(:reconcile, waiting_state)
+    assert_receive {:merge_retry_attempt, 2, ^task_id, _pid}, 2_000
+  end
+
   test "merge worker identity survives an Orchestrator-only restart and prevents duplicate effects" do
     assert :none = MergeWorker.active()
 
@@ -985,4 +1119,20 @@ defmodule SymphonyElixir.OrchestratorTest do
   end
 
   defp eventually(assertion, 0), do: assert(assertion.())
+
+  defp process_alive?(pid) when is_integer(pid) do
+    match?({_output, 0}, System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true))
+  end
+
+  defp kill_process(pid) do
+    if process_alive?(pid) do
+      System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+    end
+
+    :ok
+  end
+
+  defp shell_escape(value) do
+    "'" <> String.replace(to_string(value), "'", "'\"'\"'") <> "'"
+  end
 end

@@ -583,6 +583,100 @@ defmodule SymphonyElixir.JobManagerTest do
     assert duplicate == result_a
   end
 
+  test "cross-run single-flight deliveries remain namespaced and replay after restart", %{workspace: workspace} do
+    release = Path.join(workspace, "cross-run-release")
+    started = Path.join(workspace, "cross-run-started")
+    root = Path.join(workspace, "cross-run-jobs")
+
+    write_script!(workspace, "cross-run.sh", """
+    #!/bin/sh
+    printf x >> "$1"
+    while [ ! -f "$2" ]; do sleep 0.05; done
+    printf shared-result
+    """)
+
+    name = String.to_atom("job_manager_#{System.unique_integer([:positive])}")
+    assert {:ok, manager} = JobManager.start_link(name: name, root: root)
+
+    first =
+      request(workspace,
+        executable: "./cross-run.sh",
+        passthrough: [started, release],
+        run_id: "delivery-run-a",
+        call_id: "delivery-call-a"
+      )
+
+    second = %{first | run_id: "delivery-run-b", call_id: "delivery-call-b"}
+    first_task = Task.async(fn -> JobManager.run(first, name) end)
+    eventually(fn -> File.exists?(started) end)
+    second_task = Task.async(fn -> JobManager.run(second, name) end)
+    Process.sleep(100)
+    assert File.read!(started) == "x"
+
+    File.touch!(release)
+    assert {:ok, {:ok, first_result}} = Task.yield(first_task, 5_000)
+    assert {:ok, {:ok, second_result}} = Task.yield(second_task, 5_000)
+    assert first_result["job_id"] == second_result["job_id"]
+    assert first_result["output"] == "shared-result"
+
+    GenServer.stop(manager)
+    assert {:ok, restarted} = JobManager.start_link(name: name, root: root, worker_supervisor: nil)
+    assert {:ok, ^first_result} = JobManager.result("delivery-run-a", "delivery-call-a", name)
+    assert {:ok, ^second_result} = JobManager.result("delivery-run-b", "delivery-call-b", name)
+
+    record =
+      root
+      |> Path.join("#{first_result["job_id"]}/job.json")
+      |> File.read!()
+      |> Jason.decode!()
+
+    assert record["deliveries"] == [
+             %{"call_id" => "delivery-call-a", "run_id" => "delivery-run-a"},
+             %{"call_id" => "delivery-call-b", "run_id" => "delivery-run-b"}
+           ]
+
+    GenServer.stop(restarted)
+  end
+
+  @tag timeout: 20_000
+  test "a handoff replacement never attaches to a cancelling job", %{workspace: workspace} do
+    first_started = Path.join(workspace, "cancelling-first-started")
+    replacement_started = Path.join(workspace, "replacement-started")
+
+    write_script!(workspace, "handoff.sh", """
+    #!/bin/sh
+    if [ "$SYMPHONY_RUN_ID" = "cancelling-run" ]; then
+      trap '' TERM
+      touch "$1"
+      while :; do sleep 1; done
+    fi
+    touch "$2"
+    printf replacement-result
+    """)
+
+    first =
+      request(workspace,
+        executable: "./handoff.sh",
+        passthrough: [first_started, replacement_started],
+        run_id: "cancelling-run",
+        call_id: "cancelling-call"
+      )
+
+    replacement = %{first | run_id: "replacement-run", call_id: "replacement-call"}
+    first_task = Task.async(fn -> JobManager.run(first) end)
+    eventually(fn -> File.exists?(first_started) end)
+    assert :ok = JobManager.cancel_run("cancelling-run")
+
+    assert {:ok, replacement_result} = JobManager.run(replacement)
+    assert replacement_result["status"] == "completed"
+    assert replacement_result["output"] == "replacement-result"
+    assert File.exists?(replacement_started)
+
+    assert {:ok, {:ok, cancelled_result}} = Task.yield(first_task, 10_000)
+    assert cancelled_result["status"] == "cancelled"
+    refute cancelled_result["job_id"] == replacement_result["job_id"]
+  end
+
   test "active run snapshot comes from real records and selects deterministically", %{workspace: workspace} do
     release_a = Path.join(workspace, "snapshot-release-a")
     release_b = Path.join(workspace, "snapshot-release-b")

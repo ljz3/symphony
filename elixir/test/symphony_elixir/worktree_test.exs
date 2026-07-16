@@ -135,6 +135,72 @@ defmodule SymphonyElixir.WorktreeTest do
   end
 
   @tag timeout: 20_000
+  test "owner loss kills TERM-ignoring local and SSH preflight trees before returning" do
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(System.tmp_dir!(), BoardFactory.unique("preflight-fake-ssh"))
+    File.mkdir_p!(fake_bin)
+
+    fake_ssh = Path.join(fake_bin, "ssh")
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    for argument in "$@"; do command=$argument; done
+    exec /bin/sh -c "$command"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> original_path)
+    on_exit(fn -> System.put_env("PATH", original_path) end)
+
+    Enum.each([nil, "fake-worker"], fn worker_host ->
+      suffix = worker_host || "local"
+      task = task_fixture(BoardFactory.unique("SYM-PREFLIGHT-TREE-#{suffix}"))
+      assert {:ok, path} = Worktree.ensure(task)
+      parent_path = Path.join(path, "#{suffix}-parent.pid")
+      child_path = Path.join(path, "#{suffix}-child.pid")
+      owner = spawn(fn -> Process.sleep(:infinity) end)
+
+      command = """
+      trap '' TERM
+      (trap '' TERM; while :; do sleep 1; done) &
+      child=$!
+      printf %s $$ > #{shell_escape(parent_path)}
+      printf %s "$child" > #{shell_escape(child_path)}
+      wait "$child"
+      """
+
+      preflight =
+        Elixir.Task.async(fn ->
+          Worktree.run_preflight(
+            task,
+            path,
+            command,
+            "workflow-hash",
+            worker_host,
+            owner: owner
+          )
+        end)
+
+      eventually(fn -> File.exists?(parent_path) and File.exists?(child_path) end)
+      parent_pid = parent_path |> File.read!() |> String.trim() |> String.to_integer()
+      child_pid = child_path |> File.read!() |> String.trim() |> String.to_integer()
+
+      on_exit(fn ->
+        kill_process(parent_pid)
+        kill_process(child_pid)
+      end)
+
+      assert process_alive?(parent_pid)
+      assert process_alive?(child_pid)
+      Process.exit(owner, :kill)
+
+      assert {:error, :preflight_owner_down} = Elixir.Task.await(preflight, 8_000)
+      refute process_alive?(parent_pid)
+      refute process_alive?(child_pid)
+    end)
+  end
+
+  @tag timeout: 20_000
   test "waits for a worktree hook beyond the former hook deadline", %{source: source} do
     workflow =
       source.workflow
@@ -191,6 +257,18 @@ defmodule SymphonyElixir.WorktreeTest do
       Process.sleep(25)
       eventually(predicate, attempts - 1)
     end
+  end
+
+  defp process_alive?(pid) when is_integer(pid) do
+    match?({_output, 0}, System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true))
+  end
+
+  defp kill_process(pid) do
+    if process_alive?(pid) do
+      System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+    end
+
+    :ok
   end
 
   defp shell_escape(value) do
