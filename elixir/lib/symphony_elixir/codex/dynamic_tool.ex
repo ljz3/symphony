@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.{GitHub, Task, TaskCreateTool, Workflow, Worktree}
+  alias SymphonyElixir.{GitHub, JobManager, Task, TaskCreateTool, Workflow, Worktree}
   alias SymphonyElixir.Workflow.Bundle
 
   @context_tool "symphony_task_context"
@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @acceptance_tool "symphony_acceptance_complete"
   @transition_tool "symphony_task_transition"
   @create_tool "symphony_task_create"
+  @job_tool "symphony_job_run"
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
@@ -29,7 +30,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @spec tool_specs() :: [map()]
   def tool_specs do
-    [
+    tool_specs(nil)
+  end
+
+  @spec tool_specs(map() | nil) :: [map()]
+  def tool_specs(run) do
+    task_tools = [
       tool_spec(@context_tool, "Read the current task, run, dependencies, criteria, GitHub state, and allowed transitions.", %{
         "type" => "object",
         "additionalProperties" => false,
@@ -78,6 +84,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }),
       tool_spec(@create_tool, TaskCreateTool.dynamic_description(), TaskCreateTool.input_schema(false))
     ]
+
+    case frozen_jobs(run) |> Map.keys() |> Enum.sort() do
+      [] -> task_tools
+      names -> task_tools ++ [job_tool_spec(names)]
+    end
   end
 
   defp execute_scoped(@context_tool, _arguments, scope, _opts) do
@@ -161,6 +172,35 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     attrs = Map.put(arguments, "priority", argument(arguments, "priority", "Normal"))
 
     board_execute(%Commands.CreateTask{attrs: attrs}, 0, scope, opts)
+  end
+
+  defp execute_scoped(@job_tool, arguments, scope, opts) do
+    jobs = frozen_jobs(scope.run)
+
+    with {:ok, job_name} <- required_string(arguments, "job"),
+         {:ok, passthrough} <- required_string_list(arguments, "arguments"),
+         {:ok, job} <- fetch_job(jobs, job_name),
+         workspace when is_binary(workspace) <- scope.run["workspace_path"],
+         source_fingerprint when is_binary(source_fingerprint) <-
+           JobManager.source_fingerprint(workspace, scope.run["worker_host"]),
+         {:ok, result} <-
+           JobManager.run(%{
+             task_id: scope.task.id,
+             task_identifier: scope.task.identifier,
+             task_branch: scope.task.branch,
+             run_id: scope.run["id"],
+             call_id: to_string(Keyword.fetch!(opts, :call_id)),
+             job: job,
+             arguments: passthrough,
+             workspace: workspace,
+             worker_host: scope.run["worker_host"],
+             source_fingerprint: source_fingerprint
+           }) do
+      {:ok, result}
+    else
+      nil -> {:error, :job_workspace_unavailable}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp execute_scoped(tool, _arguments, _scope, _opts) do
@@ -303,6 +343,18 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
+  defp required_string_list(arguments, key) do
+    case arguments[key] do
+      values when is_list(values) ->
+        if Enum.all?(values, &is_binary/1),
+          do: {:ok, values},
+          else: {:error, {:string_list_required, key}}
+
+      _ ->
+        {:error, {:string_list_required, key}}
+    end
+  end
+
   defp required_revision(arguments) do
     case arguments["expected_revision"] do
       revision when is_integer(revision) and revision >= 0 -> {:ok, revision}
@@ -321,6 +373,32 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp tool_spec(name, description, schema) do
     %{"name" => name, "description" => description, "inputSchema" => schema}
+  end
+
+  defp job_tool_spec(names) do
+    tool_spec(
+      @job_tool,
+      "Run one configured project job and wait for its terminal result without polling.",
+      %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "required" => ["job", "arguments"],
+        "properties" => %{
+          "job" => %{"type" => "string", "enum" => names},
+          "arguments" => %{"type" => "array", "items" => %{"type" => "string"}}
+        }
+      }
+    )
+  end
+
+  defp frozen_jobs(%{"frozen_bundle" => %{"jobs" => jobs}}) when is_map(jobs), do: jobs
+  defp frozen_jobs(_run), do: %{}
+
+  defp fetch_job(jobs, name) do
+    case Map.fetch(jobs, name) do
+      {:ok, job} -> {:ok, job}
+      :error -> {:error, {:unknown_project_job, name, jobs |> Map.keys() |> Enum.sort()}}
+    end
   end
 
   defp success_response(payload), do: response(true, payload)

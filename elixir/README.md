@@ -264,6 +264,20 @@ stage schedules a new run with that stage's frozen prompt and workpad. Mutating 
 the run ID with the app-server call ID for idempotency, so call IDs may restart in a later run without
 replaying a prior run's result.
 
+Runs with configured jobs additionally advertise `symphony_job_run`, with its `job` enum derived
+only from that run's frozen bundle. The call remains pending until the command exits; there is no
+agent-facing status, sleep, tail, or polling tool. Fixed and passthrough arguments remain a literal
+argument vector, relative executables resolve in the managed worktree, and bare executables use the
+configured `PATH`. Symphony injects managed task/run/job identity, writes stdout and stderr to
+owner-only durable artifacts while the process runs, and returns complete stdout without a byte or
+line cap. Stderr remains an artifact instead of being injected into model context.
+
+The job store records identity before spawning. Delivery of the same run/call ID reattaches to or
+replays that job, while identical active task/job/arguments/source requests single-flight. A service
+restart marks an unrecoverable running record `interrupted`, never timed out. Explicit run
+cancellation terminates the job process group, with bounded force escalation used only after that
+human cancellation request.
+
 `symphony_workpad_read` defaults to the active run and selected invocation. It may also select an
 explicit completed, failed, or stopped prior run of the same task; prompt handoffs retain each
 terminal run's status, stage, finish metadata, and available workpad invocations. Cross-task and

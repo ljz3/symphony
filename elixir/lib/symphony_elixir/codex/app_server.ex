@@ -25,7 +25,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           model: String.t() | nil,
           thread_id: String.t(),
           workspace: Path.t(),
-          worker_host: String.t() | nil
+          worker_host: String.t() | nil,
+          dynamic_tool_specs: [map()]
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -44,13 +45,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     model = Keyword.get(opts, :model)
     effort = Keyword.get(opts, :effort)
+    environment = Keyword.get(opts, :environment, %{})
+    dynamic_tool_specs = Keyword.get(opts, :dynamic_tool_specs, DynamicTool.tool_specs())
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
+         {:ok, port} <- start_port(expanded_workspace, worker_host, environment) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, model) do
+           {:ok, thread_id} <-
+             do_start_session(port, expanded_workspace, session_policies, model, dynamic_tool_specs) do
         {:ok,
          %{
            port: port,
@@ -63,7 +67,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            model: model,
            thread_id: thread_id,
            workspace: expanded_workspace,
-           worker_host: worker_host
+           worker_host: worker_host,
+           dynamic_tool_specs: dynamic_tool_specs
          }}
       else
         {:error, reason} ->
@@ -78,7 +83,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     :ok = File.mkdir_p(workspace)
 
     with {:ok, expanded_workspace} <- validate_catalog_cwd(workspace),
-         {:ok, port} <- start_port(expanded_workspace, nil) do
+         {:ok, port} <- start_port(expanded_workspace, nil, %{}) do
       try do
         with :ok <- send_initialize(port),
              {:ok, models} <- list_models(port),
@@ -241,7 +246,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil) do
+  defp start_port(workspace, nil, environment) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -256,6 +261,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
             cd: String.to_charlist(workspace),
+            env: port_environment(environment),
             line: @port_line_bytes
           ]
         )
@@ -264,17 +270,33 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
+  defp start_port(workspace, worker_host, environment) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, environment)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
+  defp remote_launch_command(workspace, environment) when is_binary(workspace) do
+    exports =
+      environment
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
+
+    launch =
+      if exports == "",
+        do: "exec #{Config.settings!().codex.command}",
+        else: "exec env #{exports} #{Config.settings!().codex.command}"
+
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      launch
     ]
     |> Enum.join(" && ")
+  end
+
+  defp port_environment(environment) do
+    Enum.map(environment, fn {key, value} ->
+      {String.to_charlist(key), String.to_charlist(value)}
+    end)
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -325,10 +347,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, model) do
+  defp do_start_session(port, workspace, session_policies, model, dynamic_tool_specs) do
     with :ok <- send_initialize(port),
          :ok <- validate_model(port, model) do
-      start_thread(port, workspace, session_policies, model)
+      start_thread(port, workspace, session_policies, model, dynamic_tool_specs)
     end
   end
 
@@ -406,14 +428,15 @@ defmodule SymphonyElixir.Codex.AppServer do
          port,
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
-         model
+         model,
+         dynamic_tool_specs
        ) do
     params =
       %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
+        "dynamicTools" => dynamic_tool_specs
       }
       |> maybe_put_model(model)
 

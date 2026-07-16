@@ -85,6 +85,7 @@ defmodule SymphonyElixir.AgentRunnerDeadlineTest do
       end
 
       defp handle(%{"method" => "thread/start", "id" => id}, state) do
+        assert_managed_environment!()
         {state, %{"id" => id, "result" => %{"thread" => %{"id" => "many-turn-thread"}}}}
       end
 
@@ -141,6 +142,15 @@ defmodule SymphonyElixir.AgentRunnerDeadlineTest do
 
       defp successful_output!(%{"success" => true, "output" => output}), do: Jason.decode!(output)
       defp successful_output!(result), do: raise("tool failed: #{inspect(result)}")
+
+      defp assert_managed_environment! do
+        expected = ~w(SYMPHONY_TASK_ID SYMPHONY_TASK_IDENTIFIER SYMPHONY_TASK_BRANCH SYMPHONY_RUN_ID)
+
+        unless System.get_env("SYMPHONY_MANAGED_RUN") == "1" and
+                 Enum.all?(expected, &(is_binary(System.get_env(&1)) and System.get_env(&1) != "")) do
+          raise "managed run environment missing"
+        end
+      end
     end
 
     ManyTurnFakeCodex.main()

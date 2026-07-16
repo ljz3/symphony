@@ -7,7 +7,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.{Commands, Projection}
-  alias SymphonyElixir.Codex.{AppServer, RunStats}
+  alias SymphonyElixir.Codex.{AppServer, DynamicTool, RunStats}
   alias SymphonyElixir.{Config, GitHub, PromptBuilder, Task, Worktree}
 
   @github_retry_initial_ms 1_000
@@ -40,7 +40,9 @@ defmodule SymphonyElixir.AgentRunner do
     case AppServer.start_session(worktree,
            worker_host: worker_host,
            model: run["model"],
-           effort: run["effort"]
+           effort: run["effort"],
+           environment: managed_environment(task, run),
+           dynamic_tool_specs: DynamicTool.tool_specs(run)
          ) do
       {:ok, session} ->
         try do
@@ -367,5 +369,15 @@ defmodule SymphonyElixir.AgentRunner do
     else
       {:error, :run_scope_not_active}
     end
+  end
+
+  defp managed_environment(task, run) do
+    %{
+      "SYMPHONY_MANAGED_RUN" => "1",
+      "SYMPHONY_TASK_ID" => task.id,
+      "SYMPHONY_TASK_IDENTIFIER" => task.identifier,
+      "SYMPHONY_TASK_BRANCH" => task.branch,
+      "SYMPHONY_RUN_ID" => run["id"]
+    }
   end
 end

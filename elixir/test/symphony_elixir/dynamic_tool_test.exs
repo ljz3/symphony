@@ -103,6 +103,107 @@ defmodule SymphonyElixir.DynamicToolTest do
     refute Map.has_key?(create["inputSchema"]["properties"], "project_id")
   end
 
+  test "derives the blocking job enum only from the run's frozen definitions" do
+    run = %{
+      "frozen_bundle" => %{
+        "jobs" => %{
+          "full_validation" => %{
+            "id" => "full_validation",
+            "executable" => "./scripts/validate.sh",
+            "arguments" => ["full", "--run-id", "$SYMPHONY_JOB_ID"],
+            "passthrough_arguments" => "forbidden",
+            "environment" => %{}
+          },
+          "targeted_validation" => %{
+            "id" => "targeted_validation",
+            "executable" => "./scripts/validate.sh",
+            "arguments" => ["targeted", "--run-id", "$SYMPHONY_JOB_ID"],
+            "passthrough_arguments" => "required",
+            "environment" => %{}
+          }
+        }
+      }
+    }
+
+    spec = Enum.find(DynamicTool.tool_specs(run), &(&1["name"] == "symphony_job_run"))
+    assert get_in(spec, ["inputSchema", "properties", "job", "enum"]) == ["full_validation", "targeted_validation"]
+    assert get_in(spec, ["inputSchema", "required"]) == ["job", "arguments"]
+
+    refute Enum.any?(DynamicTool.tool_specs(%{"frozen_bundle" => %{"jobs" => %{}}}), fn tool ->
+             tool["name"] == "symphony_job_run"
+           end)
+  end
+
+  test "executes only the active run's frozen job and replays duplicate call delivery" do
+    original_workflow = Workflow.workflow_file_path()
+    source = BoardFactory.workflow_source()
+
+    File.write!(
+      source.workflow,
+      File.read!(source.workflow) <>
+        """
+
+        jobs:
+          identity:
+            executable: /usr/bin/env
+            arguments: [printf, "%s|%s|%s", $SYMPHONY_JOB_ID]
+            passthrough_arguments: required
+            environment:
+              FROZEN_JOB_VALUE: original
+        """
+    )
+
+    Workflow.set_workflow_file_path(source.workflow)
+    assert :ok = Workflow.Store.force_reload()
+
+    on_exit(fn ->
+      Workflow.set_workflow_file_path(original_workflow)
+      Workflow.Store.force_reload()
+    end)
+
+    {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Frozen job")})
+    {todo, _} = BoardFactory.move(created, "todo")
+    {task, run} = claim(todo)
+
+    assert get_in(run, ["frozen_bundle", "jobs", "identity", "environment", "FROZEN_JOB_VALUE"]) ==
+             "original"
+
+    assert {:ok, %{"task" => running_task, "run" => running_run}} =
+             Board.execute(
+               %Commands.RunStarted{
+                 task_id: task["id"],
+                 run_id: run["id"],
+                 session_id: "job-test-session",
+                 workspace_path: source.root
+               },
+               actor: :system,
+               expected_revision: task["revision"],
+               idempotency_key: BoardFactory.unique("job-start")
+             )
+
+    opts = [task_id: running_task["id"], run_id: running_run["id"], call_id: "job-call"]
+
+    assert %{"success" => true, "output" => first_json} =
+             DynamicTool.execute(
+               "symphony_job_run",
+               %{"job" => "identity", "arguments" => ["FROZEN_JOB_VALUE", "SYMPHONY_TASK_IDENTIFIER"]},
+               opts
+             )
+
+    first = Jason.decode!(first_json)
+    assert first["status"] == "completed"
+    assert first["output"] == "#{first["job_id"]}|FROZEN_JOB_VALUE|SYMPHONY_TASK_IDENTIFIER"
+
+    assert %{"success" => true, "output" => ^first_json} =
+             DynamicTool.execute(
+               "symphony_job_run",
+               %{"job" => "identity", "arguments" => ["changed", "arguments"]},
+               opts
+             )
+
+    cleanup_active_run(running_task["id"], running_run["id"])
+  end
+
   test "mutation call IDs are idempotent within one run and independent across runs" do
     {first_created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("First call namespace")})
     {first_todo, _} = BoardFactory.move(first_created, "todo")

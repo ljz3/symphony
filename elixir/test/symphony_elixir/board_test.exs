@@ -34,6 +34,7 @@ defmodule SymphonyElixir.BoardTest do
     assert claimed["column_id"] == "in_progress"
     assert claimed["runtime_state"] == "starting"
     assert run["frozen_bundle"]["stage"]["id"] == "implementation"
+    assert run["frozen_bundle"]["jobs"] == %{}
 
     assert {:ok, %{"task" => blocked, "run" => failed}} =
              Board.execute(%Commands.RunFailed{task_id: claimed["id"], run_id: run["id"], reason: :boom},

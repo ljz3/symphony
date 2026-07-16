@@ -226,8 +226,24 @@ Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
 - `symphony_acceptance_complete`
 - `symphony_task_transition`
 - `symphony_task_create`
+- `symphony_job_run` when the active run's frozen bundle defines jobs
 
 Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task.
+
+Derive the `symphony_job_run` name enum solely from the claimed run's frozen job definitions. One
+call starts or attaches to a supervised job and stays pending until a terminal result; do not expose
+model-facing polling, sleep, status, or log-tail tools. Execute the fixed vector plus validated
+literal passthrough arguments in the managed worktree. Substitute only the exact
+`$SYMPHONY_JOB_ID` item, resolve relative executables in that worktree, and resolve bare names via
+`PATH`. Inject managed task, run, branch, and job identity plus the job-executor marker.
+
+Persist the job record before spawn and stream stdout/stderr to owner-only artifacts without output
+caps. The terminal result returns complete stdout, the stderr artifact location, status/exit code,
+timestamps, elapsed observational metadata, and the source fingerprint. Namespace delivery
+idempotency by run/call ID and single-flight identical active task/job/normalized-arguments/source
+requests. Reattach while the service and run remain alive; after unrecoverable recovery mark a
+running record `interrupted`, never timed out. Explicit run cancellation terminates the supervised
+process group, with force escalation allowed only as cancellation policy.
 
 Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed, failed, or stopped prior runs with the same task ID; cross-task and active prior-run reads are rejected. Prior-run reads retain run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
 
