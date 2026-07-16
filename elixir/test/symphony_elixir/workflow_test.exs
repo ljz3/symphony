@@ -90,4 +90,209 @@ defmodule SymphonyElixir.WorkflowTest do
     File.write!(source.workflow, "mystery: true\n" <> yaml)
     assert {:error, {:unknown_workflow_keys, "workflow", ["mystery"]}} = Workflow.load(source.workflow)
   end
+
+  test "loads the deadline-free jobs, preflight, and deterministic merge foundation" do
+    source = BoardFactory.workflow_source()
+
+    source.workflow
+    |> File.read!()
+    |> String.replace(
+      "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
+      "  - id: merging\n    name: Merging\n    role: merge"
+    )
+    |> Kernel.<>("""
+
+    jobs:
+      targeted_validation:
+        executable: ./scripts/validate.sh
+        arguments: [targeted, --run-id, $SYMPHONY_JOB_ID]
+        passthrough_arguments: required
+        environment:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    dispatch:
+      preflight:
+        command: ./scripts/symphony-preflight.sh
+        retry_after_failure_ms: 30000
+    merge:
+      method: squash
+      readiness_command: ./scripts/symphony-merge-readiness.sh
+      review_column: automated_review
+      conflict_column: rework
+    """)
+    |> then(&File.write!(source.workflow, &1))
+
+    assert {:ok, bundle} = Workflow.load(source.workflow)
+
+    assert bundle.jobs["targeted_validation"].executable == "./scripts/validate.sh"
+
+    assert bundle.jobs["targeted_validation"].arguments == [
+             "targeted",
+             "--run-id",
+             "$SYMPHONY_JOB_ID"
+           ]
+
+    assert bundle.jobs["targeted_validation"].passthrough_arguments == :required
+
+    assert bundle.jobs["targeted_validation"].environment == %{
+             "DEVELOPER_DIR" => "/Applications/Xcode.app/Contents/Developer"
+           }
+
+    assert bundle.dispatch.preflight == %{
+             command: "./scripts/symphony-preflight.sh",
+             retry_after_failure_ms: 30_000
+           }
+
+    assert bundle.merge == %{
+             method: :squash,
+             readiness_command: "./scripts/symphony-merge-readiness.sh",
+             review_column: "automated_review",
+             conflict_column: "rework"
+           }
+
+    assert Workflow.Bundle.column(bundle, "merging").role == :merge
+    refute Workflow.Bundle.column(bundle, "merging").stage_id
+  end
+
+  test "rejects execution deadline and output-cap keys with a migration error" do
+    source = BoardFactory.workflow_source()
+    original = File.read!(source.workflow)
+
+    merge_workflow = fn key ->
+      original
+      |> String.replace(
+        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
+        "  - id: merging\n    name: Merging\n    role: merge"
+      )
+      |> Kernel.<>("""
+
+      merge:
+        method: squash
+        readiness_command: ./merge-readiness.sh
+        review_column: automated_review
+        conflict_column: rework
+        #{key}: 1
+      """)
+    end
+
+    cases = [
+      {"agent", "max_turns_per_run", insert_under(original, "agent:", "  max_turns_per_run: 2")},
+      {"codex", "turn_timeout_ms", insert_under(original, "codex:", "  turn_timeout_ms: 1")},
+      {"codex", "read_timeout_ms", insert_under(original, "codex:", "  read_timeout_ms: 1")},
+      {"codex", "stall_timeout_ms", insert_under(original, "codex:", "  stall_timeout_ms: 1")},
+      {"hooks", "timeout_ms", insert_under(original, "hooks:", "  timeout_ms: 1")},
+      {"jobs.validation", "max_output_bytes",
+       original <>
+         """
+
+         jobs:
+           validation:
+             executable: ./validate.sh
+             arguments: []
+             passthrough_arguments: forbidden
+             environment: {}
+             max_output_bytes: 1
+         """},
+      {"jobs.validation", "timeout_ms",
+       original <>
+         """
+
+         jobs:
+           validation:
+             executable: ./validate.sh
+             arguments: []
+             passthrough_arguments: forbidden
+             environment: {}
+             timeout_ms: 1
+         """},
+      {"dispatch.preflight", "timeout_ms",
+       original <>
+         """
+
+         dispatch:
+           preflight:
+             command: ./preflight.sh
+             retry_after_failure_ms: 1
+             timeout_ms: 1
+         """},
+      {"dispatch.preflight", "max_output_bytes",
+       original <>
+         """
+
+         dispatch:
+           preflight:
+             command: ./preflight.sh
+             retry_after_failure_ms: 1
+             max_output_bytes: 1
+         """},
+      {"merge", "readiness_timeout_ms", merge_workflow.("readiness_timeout_ms")},
+      {"merge", "max_output_bytes", merge_workflow.("max_output_bytes")}
+    ]
+
+    Enum.each(cases, fn {context, key, yaml} ->
+      File.write!(source.workflow, yaml)
+
+      assert {:error, {:execution_limits_forbidden, ^context, [^key]}} =
+               Workflow.load(source.workflow)
+    end)
+  end
+
+  test "rejects unknown nested job keys and non-reserved Symphony argument tokens" do
+    source = BoardFactory.workflow_source()
+    original = File.read!(source.workflow)
+
+    job = """
+
+    jobs:
+      validation:
+        executable: ./validate.sh
+        arguments: [$SYMPHONY_TASK_ID]
+        passthrough_arguments: forbidden
+        environment: {}
+    """
+
+    File.write!(source.workflow, original <> job)
+
+    assert {:error, {:invalid_job_argument_token, "validation", "$SYMPHONY_TASK_ID"}} =
+             Workflow.load(source.workflow)
+
+    File.write!(source.workflow, original <> String.replace(job, "$SYMPHONY_TASK_ID", "literal") <> "    mystery: true\n")
+
+    assert {:error, {:unknown_workflow_keys, "jobs.validation", ["mystery"]}} =
+             Workflow.load(source.workflow)
+  end
+
+  test "requires merge policy for a merge role and dispatch targets for that policy" do
+    source = BoardFactory.workflow_source()
+
+    merge_role_workflow =
+      source.workflow
+      |> File.read!()
+      |> String.replace(
+        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
+        "  - id: merging\n    name: Merging\n    role: merge"
+      )
+
+    File.write!(source.workflow, merge_role_workflow)
+    assert {:error, {:merge_columns_require_configuration, ["merging"]}} = Workflow.load(source.workflow)
+
+    File.write!(
+      source.workflow,
+      merge_role_workflow <>
+        """
+
+        merge:
+          method: squash
+          readiness_command: ./merge-readiness.sh
+          review_column: human_review
+          conflict_column: rework
+        """
+    )
+
+    assert {:error, {:merge_target_not_dispatchable, :review, "human_review", :pause}} =
+             Workflow.load(source.workflow)
+  end
+
+  defp insert_under(yaml, heading, line) do
+    String.replace(yaml, heading <> "\n", heading <> "\n" <> line <> "\n", global: false)
+  end
 end

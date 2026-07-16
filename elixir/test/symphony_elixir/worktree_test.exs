@@ -70,6 +70,24 @@ defmodule SymphonyElixir.WorktreeTest do
     assert File.read!(sentinel) == "safe"
   end
 
+  @tag timeout: 20_000
+  test "waits for a worktree hook beyond the former hook deadline", %{source: source} do
+    workflow =
+      source.workflow
+      |> File.read!()
+      |> String.replace("hooks:\n", "hooks:\n  before_run: sleep 5.2\n", global: false)
+
+    File.write!(source.workflow, workflow)
+    assert :ok = Workflow.Store.force_reload()
+
+    task = task_fixture(BoardFactory.unique("SYM-LONG-HOOK"))
+    assert {:ok, path} = Worktree.ensure(task)
+
+    started_at = System.monotonic_time(:millisecond)
+    assert :ok = Worktree.run_hook(:before_run, task, path)
+    assert System.monotonic_time(:millisecond) - started_at >= 5_100
+  end
+
   defp task_fixture(identifier) do
     %Task{
       id: Ecto.UUID.generate(),

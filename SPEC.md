@@ -72,12 +72,22 @@ Keep only genuine project choices:
 - Required immutable `project.id` and uppercase `project.key`.
 - Optional source remote override, defaulting to `origin`; derive source Git root and remote default branch.
 - Optional board-history remote.
-- Codex command, project-wide sandbox/approval/network/timeouts.
-- Agent concurrency, turns per run, shared base/context prompt paths.
+- Codex command and project-wide sandbox/approval/network policy.
+- Agent concurrency and shared base/context prompt paths.
+- Optional named blocking jobs with an executable, literal fixed argument vector, required/optional/forbidden passthrough policy, and string environment map. `$SYMPHONY_JOB_ID` is the only reserved argument token.
+- Optional pre-claim dispatch preflight command and retry delay after explicit failure.
+- Optional deterministic squash-merge readiness command plus review and conflict dispatch-column IDs.
 - Named stages with prompt, workpad template, and stage-specific allowed model/effort map.
 - Ordered columns and workflow-specific flags.
 - Human/agent transition edges.
-- Project-specific worktree hooks and timeout.
+- Project-specific worktree hooks.
+
+Do not expose execution deadlines or output caps in project configuration. Reject former turn-count,
+Codex read/turn/stall timeout, hook timeout, job timeout/output-cap, preflight timeout, and merge
+timeout/output-cap keys with an explicit migration error rather than applying compatibility defaults.
+Elapsed time and inactivity are observational only: managed work ends on completion, explicit
+failure/process or protocol termination, invalidating task movement, service shutdown, or explicit
+human cancellation. Retry/reconciliation cadence and cancellation escalation may remain bounded.
 
 Load the YAML and every referenced template as one strict bundle. Parse all templates with strict Solid variables/filters before activation, and render validation fixtures for both realistic empty first-run values and populated values.
 
@@ -123,12 +133,12 @@ With Rework, Blocked, and Cancelled branches.
 - `Automated Review`: separately prompted review stage.
 - `Human Review`: pause; entering publishes workpads and marks the draft PR ready.
 - `Rework`: separately prompted rework stage, returning to Automated Review.
-- `Merging`: merge/land stage.
+- `Merging`: system-owned deterministic merge column when a merge policy is configured.
 - `Blocked`: unique special role; records prior column and resumes there.
 - `Done`: successful terminal state and the only dependency-satisfying terminal.
 - `Cancelled`: unsuccessful terminal state.
 
-Support only `dispatch`, `pause`, `blocked`, and `terminal` roles. A dispatch column must reference a named stage. An optional `on_claim` target must be dispatchable and use the same stage.
+Support `dispatch`, `merge`, `pause`, `blocked`, and `terminal` roles. A dispatch column must reference a named stage. An optional `on_claim` target must be dispatchable and use the same stage. A `merge` column must not reference a stage and cannot be agent-claimed. Merge configuration requires exactly one merge column and distinct review/conflict targets that are dispatch columns.
 
 Configure human/agent transitions in YAML. Hard-code system transitions for claim, any dispatch failure to Blocked, and terminal cleanup.
 
@@ -181,7 +191,7 @@ Replace tracker polling with event-driven candidate dispatch plus periodic runti
 4. Run hooks.
 5. Resolve and validate the frozen stage model/effort.
 6. Render prompt/workpad and start Codex app-server in the worktree.
-7. Run up to `max_turns_per_run`, reusing the same session and workpad.
+7. Run continuation turns without a count or elapsed-time limit, reusing the same session and workpad.
 8. Require an agent transition before the invocation ends.
 
 Apply the configured Codex sandbox mode to every turn. For local `workspace-write` runs, grant write
@@ -193,7 +203,7 @@ Outcomes:
 
 - Transition to a different dispatch stage ends the current stage successfully and schedules a fresh run with the new stage prompt/workpad.
 - Transition to pause/terminal finishes the run.
-- Ending in the unchanged dispatch stage, exhausting turns, requesting input, hook/process/protocol failure, or abnormal exit moves immediately to Blocked.
+- Ending in the unchanged dispatch stage after an explicit invocation failure, requesting input, hook/process/protocol failure, or abnormal exit moves immediately to Blocked. Elapsed time, silence, and continuation count are not failures.
 - There is no agent retry queue.
 - On restart, any durable run without a live process is considered failed and moved to Blocked.
 - Human movement of a running card initiates graceful stop, then forced termination if needed; show the desired column separately from observed `stopping` runtime state.

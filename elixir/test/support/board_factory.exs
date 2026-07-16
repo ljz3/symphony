@@ -53,7 +53,7 @@ defmodule SymphonyElixir.BoardFactory do
     workflow = File.read!(Path.join(source_root, "WORKFLOW.yml"))
     unique_concurrency = 1_000 + System.unique_integer([:positive, :monotonic])
     workflow = String.replace(workflow, "max_concurrent_agents: 10", "max_concurrent_agents: #{unique_concurrency}")
-    workflow = Regex.replace(~r/hooks:\n(?:  .+\n)+\z/, workflow, "hooks:\n  timeout_ms: 5000\n")
+    workflow = Regex.replace(~r/hooks:\n(?:  .+\n?)+\z/, workflow, "hooks:\n")
     File.write!(Path.join(root, "WORKFLOW.yml"), workflow)
     File.cp_r!(Path.join(source_root, "workflow"), Path.join(root, "workflow"))
     File.write!(Path.join(root, "sample.txt"), "sample\n")

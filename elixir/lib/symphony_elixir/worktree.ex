@@ -130,7 +130,7 @@ defmodule SymphonyElixir.Worktree do
 
     case Map.get(hooks, kind) do
       nil -> :ok
-      command -> execute_hook(command, kind, task, worktree, worker_host, hooks.timeout_ms)
+      command -> execute_hook(command, kind, task, worktree, worker_host)
     end
   end
 
@@ -379,7 +379,7 @@ defmodule SymphonyElixir.Worktree do
     printf '\nSYMPHONY_RESULT\t%s\t%s\n' "$created" "$worktree"
     """
 
-    case SSH.run(host, script, timeout: bundle.hooks.timeout_ms) do
+    case SSH.run(host, script) do
       {:ok, {output, 0}} -> complete_remote_ensure(output, task, host)
       {:ok, {output, 42}} -> {:error, {:remote_branch_collision, host, task.branch, output}}
       {:ok, {output, 43}} -> {:error, {:unmanaged_remote_worktree, host, worktree, output}}
@@ -396,15 +396,15 @@ defmodule SymphonyElixir.Worktree do
     marker = remote_marker_path(root, task)
     marker_value = remote_marker_value(task, worktree, mirror)
 
-    case validate_remote_marker(host, worktree, marker, marker_value, bundle.hooks.timeout_ms) do
+    case validate_remote_marker(host, worktree, marker, marker_value) do
       :missing ->
         :ok
 
       :worktree_missing ->
-        remove_remote_branch(task, host, mirror, marker, marker_value, bundle)
+        remove_remote_branch(task, host, mirror, marker, marker_value)
 
       :ok ->
-        remove_managed_remote(task, host, worktree, mirror, marker, marker_value, bundle)
+        remove_managed_remote(task, host, worktree, mirror, marker, marker_value)
 
       {:error, reason} ->
         {:error, reason}
@@ -439,7 +439,7 @@ defmodule SymphonyElixir.Worktree do
 
   defp maybe_after_create_remote(false, _task, _worktree, _host), do: :ok
 
-  defp validate_remote_marker(host, worktree, marker, marker_value, timeout) do
+  defp validate_remote_marker(host, worktree, marker, marker_value) do
     script = """
     set -eu
     worktree=#{shell_escape(worktree)}
@@ -455,7 +455,7 @@ defmodule SymphonyElixir.Worktree do
     test "$(cat "$marker")" = "$marker_value"
     """
 
-    case SSH.run(host, script, timeout: timeout) do
+    case SSH.run(host, script) do
       {:ok, {_output, 0}} -> :ok
       {:ok, {_output, 44}} -> :missing
       {:ok, {_output, 45}} -> :worktree_missing
@@ -464,7 +464,7 @@ defmodule SymphonyElixir.Worktree do
     end
   end
 
-  defp remove_managed_remote(task, host, worktree, mirror, marker, marker_value, bundle) do
+  defp remove_managed_remote(task, host, worktree, mirror, marker, marker_value) do
     with {:ok, true} <- clean?(worktree, host),
          :ok <- run_hook(:before_remove, task, worktree, host) do
       script = """
@@ -481,7 +481,7 @@ defmodule SymphonyElixir.Worktree do
       rm -f "$marker"
       """
 
-      case SSH.run(host, script, timeout: bundle.hooks.timeout_ms) do
+      case SSH.run(host, script) do
         {:ok, {_output, 0}} -> :ok
         {:ok, {output, status}} -> {:error, {:remote_worktree_remove_failed, host, status, output}}
         {:error, reason} -> {:error, reason}
@@ -492,7 +492,7 @@ defmodule SymphonyElixir.Worktree do
     end
   end
 
-  defp remove_remote_branch(task, host, mirror, marker, marker_value, bundle) do
+  defp remove_remote_branch(task, host, mirror, marker, marker_value) do
     script = """
     set -eu
     marker=#{shell_escape(marker)}
@@ -506,7 +506,7 @@ defmodule SymphonyElixir.Worktree do
     rm -f "$marker"
     """
 
-    case SSH.run(host, script, timeout: bundle.hooks.timeout_ms) do
+    case SSH.run(host, script) do
       {:ok, {_output, 0}} -> :ok
       {:ok, {output, status}} -> {:error, {:remote_branch_remove_failed, host, status, output}}
       {:error, reason} -> {:error, reason}
@@ -521,26 +521,20 @@ defmodule SymphonyElixir.Worktree do
     Enum.join([task.id, task.identifier, task.branch, worktree, mirror], "\n")
   end
 
-  defp execute_hook(command, kind, task, worktree, nil, timeout_ms) do
+  defp execute_hook(command, kind, task, worktree, nil) do
     env = hook_env(task)
 
-    hook_task =
-      Elixir.Task.async(fn ->
-        System.cmd("bash", ["-lc", command], cd: worktree, env: env, stderr_to_stdout: true)
-      end)
-
-    case Elixir.Task.yield(hook_task, timeout_ms) || Elixir.Task.shutdown(hook_task, :brutal_kill) do
-      {:ok, {_output, 0}} -> :ok
-      {:ok, {output, status}} -> {:error, {:worktree_hook_failed, kind, status, output}}
-      nil -> {:error, {:worktree_hook_timeout, kind, timeout_ms}}
+    case System.cmd("bash", ["-lc", command], cd: worktree, env: env, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> {:error, {:worktree_hook_failed, kind, status, output}}
     end
   end
 
-  defp execute_hook(command, kind, task, worktree, host, timeout_ms) do
+  defp execute_hook(command, kind, task, worktree, host) do
     exports = hook_env(task) |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
     script = "cd #{shell_escape(worktree)} && env #{exports} bash -lc #{shell_escape(command)}"
 
-    case SSH.run(host, script, timeout: timeout_ms) do
+    case SSH.run(host, script) do
       {:ok, {_output, 0}} -> :ok
       {:ok, {output, status}} -> {:error, {:worktree_hook_failed, kind, host, status, output}}
       {:error, reason} -> {:error, reason}
@@ -572,7 +566,7 @@ defmodule SymphonyElixir.Worktree do
   defp remote_git(host, worktree, args) do
     command = "git -C #{shell_escape(worktree)} " <> Enum.map_join(args, " ", &shell_escape/1)
 
-    case SSH.run(host, command, timeout: Config.settings!().hooks.timeout_ms) do
+    case SSH.run(host, command) do
       {:ok, {output, 0}} -> {:ok, output}
       {:ok, {output, status}} -> {:error, {:remote_git_failed, host, args, status, output}}
       {:error, reason} -> {:error, reason}

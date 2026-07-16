@@ -29,7 +29,7 @@ Symphony separates durable task authority from rebuildable runtime state:
   all-time project/task usage, exact-model, stage, and effort breakdowns, live agent time, safe
   activity, and current per-worker rate limits.
 - `WORKFLOW.yml` plus strict Solid Markdown templates define columns, transitions, stages, prompts,
-  model policy, and hooks.
+  model policy, deadline-free hooks, optional blocking jobs/preflight, and deterministic merge policy.
 
 The standard flow is:
 
