@@ -101,6 +101,8 @@ defmodule SymphonyElixir.Board do
       safe_status(Orchestrator, :status, %{
         dispatch_gate: :orchestrator_unavailable,
         github: %{available: false, error: :orchestrator_unavailable},
+        preflights: [],
+        worker_health: [],
         publication_errors: %{}
       })
 
@@ -110,6 +112,7 @@ defmodule SymphonyElixir.Board do
       projection: writer_status,
       board_sync: sync,
       github: orchestrator[:github] || %{available: false, error: :not_checked},
+      preflights: orchestrator[:preflights] || [],
       publication_errors: orchestrator[:publication_errors] || %{},
       codex_catalog: safe_status(Catalog, :status, %{available: false, error: :unavailable}),
       workers: orchestrator
