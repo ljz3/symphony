@@ -334,14 +334,16 @@ The configured review run receives `symphony_review_complete`. Its strict nested
 evidence, structured findings, route, and expected task revision. Symphony independently observes
 the clean source worktree, current source and PR heads, PR state, aggregate GitHub review decision,
 every paginated review thread and comment, and every required check. It stores system-derived
-reviewer/run/time/PR fields and deterministic feedback/check fingerprints in the canonical task
-event; raw provider payloads are not copied into prompt state.
+reviewer/run/time/PR fields, deterministic feedback/check fingerprints, and a canonical fingerprint
+of the exact acceptance-criterion set and current evidence in the canonical task event; raw provider
+payloads are not copied into prompt state.
 
 A pass requires matching source/task/PR heads, completed criteria with evidence, a followed or
 not-required plan, no blocker/high findings, aggregate `APPROVED`, no unresolved threads, and green
 required checks. Only that command may route to the system-owned `role: merge` column. Rework
 requires findings and a configured non-review dispatch or Blocked route. Any later canonical source
-or PR-head change clears the pass and sends merge-pending work back to review.
+or PR-head change, linked PR identity change, or acceptance-criterion/evidence change clears the pass
+and sends merge-pending work back to review.
 
 The orchestrator runs at most one deterministic merge worker separately from normal AgentRunner
 capacity; no model or run is claimed for Merging. The worker revalidates the exact reviewed state,
@@ -355,8 +357,11 @@ branch, and then either:
 - verifies a real Git conflict, collects the complete sorted unmerged-path set, aborts the probe,
   and records the conflict before dispatching the Merge Conflict agent.
 
+After readiness exits, and again immediately before a clean-update push or guarded squash, the
+worker reloads canonical task state and re-observes the clean local source and provider PR state.
 External effects have canonical checkpoints before the clean-update push and guarded squash, so a
-restart inspects current Git/PR state and resumes instead of blindly repeating them. A first conflict
+restart inspects local Git plus the actual remote PR head and resumes instead of repeating them; an
+already-updated remote head invalidates review without another push. A first conflict
 for one task-head/target-head pair enters Merge Conflict; recurrence of the same pair blocks. That
 agent may resolve only the recorded paths by merging the recorded target without rebase/history
 rewrite, validate through `symphony_job_run`, push, and return to Automated Review. It never lands the

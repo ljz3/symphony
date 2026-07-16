@@ -10,6 +10,7 @@ defmodule SymphonyElixir.DeterministicMerge do
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.DeterministicMerge.SystemBoundary
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.Bundle
 
@@ -86,9 +87,11 @@ defmodule SymphonyElixir.DeterministicMerge do
 
   defp review_gate(task, %{snapshot: snapshot} = context) do
     [
+      {changed_pull_request_identity?(task, snapshot), "linked or observed pull-request identity changed after review"},
       {stale_review_head?(task, context), "reviewed source or pull-request head changed"},
       {changed_feedback?(task, snapshot), "pull-request feedback changed after review"},
       {changed_checks?(task, snapshot), "required check contexts changed after review"},
+      {changed_criteria?(task), "acceptance criteria or evidence changed after review"},
       {not criteria_complete?(task), "acceptance criteria or evidence changed after review"},
       {snapshot_value(snapshot, :approved) != true, "pull-request approval is missing or changed"},
       {snapshot_value(snapshot, :unresolved_review_threads) != 0, "pull-request review threads are unresolved"},
@@ -102,10 +105,45 @@ defmodule SymphonyElixir.DeterministicMerge do
 
   defp run_project_readiness(task, bundle, context, boundary, opts) do
     case boundary.(:readiness, task, context) do
-      {:ok, _evidence} -> fetch_target(task, bundle, context, boundary, opts)
+      {:ok, _evidence} -> revalidate_after_readiness(task, bundle, context, boundary, opts)
       {:error, {:transient, _reason}} -> {:ok, :pending}
       {:error, {:readiness_failed, _status, _output} = reason} -> require_review(task, inspect(reason), opts)
       {:error, reason} -> block(task, {:readiness_process_failed, reason}, opts)
+    end
+  end
+
+  defp revalidate_after_readiness(task, bundle, context, boundary, opts) do
+    case refresh_merge_state(task, context, boundary, opts) do
+      {:ok, current, refreshed} ->
+        case merge_entry_invariants(current, bundle) do
+          :ok -> route_refreshed_after_readiness(current, bundle, refreshed, boundary, opts)
+          {:error, _reason} -> {:ok, :review_required}
+        end
+
+      {:error, _current, {:transient, _reason}} ->
+        {:ok, :pending}
+
+      {:error, current, :pull_request_not_linked} ->
+        require_review(current, "pull request identity changed after readiness", opts)
+
+      {:error, current, reason} ->
+        block(current, {:post_readiness_revalidation_failed, reason}, opts)
+    end
+  end
+
+  defp route_refreshed_after_readiness(task, bundle, %{snapshot: snapshot} = context, boundary, opts) do
+    case snapshot_state(snapshot) do
+      :open ->
+        case review_gate(task, context) do
+          :ready -> fetch_target(task, bundle, context, boundary, opts)
+          {:review, reason} -> require_review(task, reason, opts)
+        end
+
+      :merged ->
+        recover_merged_pull_request(task, bundle, context, boundary, opts)
+
+      {:not_open, state} ->
+        block(task, {:pull_request_not_open, state}, opts)
     end
   end
 
@@ -148,34 +186,109 @@ defmodule SymphonyElixir.DeterministicMerge do
     original_head = attrs["task_head"]
     target_head = attrs["target_head"]
 
-    with true <- git_sha?(original_head) and git_sha?(target_head),
-         {:ok, current_head} <- boundary.(:source_head, task, context) do
-      context = Map.merge(context, %{source_head: current_head, target_head: target_head})
-      continue_clean_update_recovery(task, bundle, context, original_head, boundary, opts)
+    if valid_clean_update_checkpoint?(task, original_head, target_head) do
+      resume_clean_update_checkpoint(
+        task,
+        bundle,
+        Map.put(context, :target_head, target_head),
+        original_head,
+        boundary,
+        opts
+      )
     else
-      false -> block(task, :invalid_clean_update_checkpoint, opts)
-      {:error, {:transient, _reason}} -> {:ok, :pending}
-      {:error, reason} -> block(task, {:clean_update_recovery_failed, reason}, opts)
+      block(task, :invalid_clean_update_checkpoint, opts)
     end
   end
 
-  defp continue_clean_update_recovery(task, bundle, %{source_head: head} = context, head, boundary, opts) do
-    perform_clean_update(task, bundle, context, boundary, opts)
+  defp valid_clean_update_checkpoint?(task, original_head, target_head) do
+    git_sha?(original_head) and git_sha?(target_head) and original_head == reviewed_head(task)
   end
 
-  defp continue_clean_update_recovery(task, _bundle, context, _original_head, boundary, opts) do
-    case boundary.(:target_ancestor, task, context) do
-      {:ok, true} -> push_clean_update(task, context, boundary, opts)
-      {:ok, false} -> require_review(task, "source head changed during target update", opts)
-      {:error, {:transient, _reason}} -> {:ok, :pending}
-      {:error, reason} -> block(task, {:clean_update_recovery_failed, reason}, opts)
+  defp resume_clean_update_checkpoint(task, bundle, context, original_head, boundary, opts) do
+    case refresh_merge_state(task, context, boundary, opts) do
+      {:ok, current, refreshed} ->
+        continue_clean_update_recovery(
+          current,
+          bundle,
+          refreshed,
+          original_head,
+          boundary,
+          opts
+        )
+
+      {:error, _current, {:transient, _reason}} ->
+        {:ok, :pending}
+
+      {:error, current, :pull_request_not_linked} ->
+        require_review(current, "pull request identity changed during clean-update recovery", opts)
+
+      {:error, current, reason} ->
+        block(current, {:clean_update_recovery_failed, reason}, opts)
+    end
+  end
+
+  defp continue_clean_update_recovery(task, bundle, context, original_head, boundary, opts) do
+    with :ok <- merge_entry_invariants(task, bundle),
+         :open <- snapshot_state(context.snapshot),
+         :ready <- clean_update_identity_gate(task, context) do
+      remote_head = snapshot_value(context.snapshot, :head_sha)
+
+      cond do
+        not git_sha?(remote_head) ->
+          block(task, :invalid_clean_update_remote_head, opts)
+
+        remote_head != original_head ->
+          require_review(
+            task,
+            "remote pull-request head changed during clean-update recovery",
+            opts,
+            remote_head
+          )
+
+        context.source_head == original_head ->
+          resume_original_clean_update(task, bundle, context, original_head, boundary, opts)
+
+        true ->
+          continue_local_clean_update_recovery(task, context, boundary, opts)
+      end
+    else
+      {:error, _reason} -> {:ok, :review_required}
+      {:not_open, state} -> block(task, {:pull_request_not_open, state}, opts)
+      {:review, reason} -> require_review(task, reason, opts)
+    end
+  end
+
+  defp resume_original_clean_update(task, bundle, context, original_head, boundary, opts) do
+    case clean_update_push_gate(task, context, original_head) do
+      :ready -> perform_clean_update(task, bundle, context, boundary, opts)
+      {:review, reason} -> require_review(task, reason, opts)
+    end
+  end
+
+  defp continue_local_clean_update_recovery(task, context, boundary, opts) do
+    case clean_update_push_gate(task, context, context.source_head) do
+      :ready ->
+        case boundary.(:target_ancestor, task, context) do
+          {:ok, true} -> revalidate_clean_update(task, context, boundary, opts)
+          {:ok, false} -> require_review(task, "source head changed during target update", opts)
+          {:error, {:transient, _reason}} -> {:ok, :pending}
+          {:error, reason} -> block(task, {:clean_update_recovery_failed, reason}, opts)
+        end
+
+      {:review, reason} ->
+        require_review(task, reason, opts)
     end
   end
 
   defp perform_clean_update(task, bundle, context, boundary, opts) do
     case boundary.(:merge_target, task, context) do
       {:ok, updated_head} when is_binary(updated_head) ->
-        push_clean_update(task, Map.put(context, :source_head, updated_head), boundary, opts)
+        revalidate_clean_update(
+          task,
+          Map.put(context, :source_head, updated_head),
+          boundary,
+          opts
+        )
 
       {:conflict, paths} ->
         record_conflict(task, bundle, context, paths, opts)
@@ -188,6 +301,57 @@ defmodule SymphonyElixir.DeterministicMerge do
 
       {:error, reason} ->
         block(task, {:target_merge_failed, reason}, opts)
+    end
+  end
+
+  defp revalidate_clean_update(task, context, boundary, opts) do
+    expected_local_head = context.source_head
+
+    case refresh_merge_state(task, context, boundary, opts) do
+      {:ok, current, refreshed} ->
+        route_revalidated_clean_update(current, refreshed, expected_local_head, boundary, opts)
+
+      {:error, _current, {:transient, _reason}} ->
+        {:ok, :pending}
+
+      {:error, current, :pull_request_not_linked} ->
+        require_review(current, "pull request identity changed before clean-update push", opts)
+
+      {:error, current, reason} ->
+        block(current, {:clean_update_revalidation_failed, reason}, opts)
+    end
+  end
+
+  defp route_revalidated_clean_update(task, context, expected_local_head, boundary, opts) do
+    with :ok <- merge_entry_invariants(task, context.bundle),
+         :open <- snapshot_state(context.snapshot),
+         :ready <- clean_update_identity_gate(task, context),
+         :ready <- clean_update_push_gate(task, context, expected_local_head) do
+      reviewed = reviewed_head(task)
+      remote_head = snapshot_value(context.snapshot, :head_sha)
+
+      cond do
+        remote_head == reviewed ->
+          push_clean_update(task, context, boundary, opts)
+
+        remote_head == expected_local_head ->
+          require_review(
+            task,
+            "target branch update was already pushed; exact-head review required",
+            opts,
+            remote_head
+          )
+
+        git_sha?(remote_head) ->
+          require_review(task, "remote pull-request head changed before clean-update push", opts, remote_head)
+
+        true ->
+          block(task, :invalid_clean_update_remote_head, opts)
+      end
+    else
+      {:error, _reason} -> {:ok, :review_required}
+      {:not_open, state} -> block(task, {:pull_request_not_open, state}, opts)
+      {:review, reason} -> require_review(task, reason, opts)
     end
   end
 
@@ -259,7 +423,48 @@ defmodule SymphonyElixir.DeterministicMerge do
     attrs = %{"reviewed_head_sha" => reviewed_head(task), "target_head" => context.target_head}
 
     with {:ok, checkpointed} <- checkpoint(task, "squash_started", attrs, opts) do
-      guarded_squash(checkpointed, bundle, context, boundary, opts)
+      revalidate_before_squash(checkpointed, bundle, context, boundary, opts)
+    end
+  end
+
+  defp revalidate_before_squash(task, bundle, context, boundary, opts) do
+    case refresh_merge_state(task, context, boundary, opts) do
+      {:ok, current, refreshed} ->
+        route_revalidated_squash(current, bundle, refreshed, boundary, opts)
+
+      {:error, _current, {:transient, _reason}} ->
+        {:ok, :pending}
+
+      {:error, current, :pull_request_not_linked} ->
+        require_review(current, "pull request identity changed before guarded squash", opts)
+
+      {:error, current, reason} ->
+        block(current, {:guarded_squash_revalidation_failed, reason}, opts)
+    end
+  end
+
+  defp route_revalidated_squash(task, bundle, %{snapshot: snapshot} = context, boundary, opts) do
+    case merge_entry_invariants(task, bundle) do
+      :ok ->
+        route_current_squash_snapshot(task, bundle, context, snapshot, boundary, opts)
+
+      {:error, _reason} ->
+        {:ok, :review_required}
+    end
+  end
+
+  defp route_current_squash_snapshot(task, bundle, context, snapshot, boundary, opts) do
+    case snapshot_state(snapshot) do
+      :open -> route_open_revalidated_squash(task, bundle, context, boundary, opts)
+      :merged -> recover_merged_pull_request(task, bundle, context, boundary, opts)
+      {:not_open, state} -> block(task, {:pull_request_not_open, state}, opts)
+    end
+  end
+
+  defp route_open_revalidated_squash(task, bundle, context, boundary, opts) do
+    case review_gate(task, context) do
+      :ready -> guarded_squash(task, bundle, context, boundary, opts)
+      {:review, reason} -> require_review(task, reason, opts)
     end
   end
 
@@ -279,7 +484,7 @@ defmodule SymphonyElixir.DeterministicMerge do
     merge_sha = snapshot_value(context.snapshot, :merge_sha)
 
     if checkpoint in ["squash_started", "reachability_pending"] and git_sha?(merge_sha) and
-         not stale_review_head?(task, context) do
+         matching_review_attestation?(task, context) do
       verify_reachability(task, bundle, context, merge_sha, boundary, opts)
     else
       block(task, :pull_request_merged_without_matching_saga_checkpoint, opts)
@@ -381,8 +586,15 @@ defmodule SymphonyElixir.DeterministicMerge do
          %{} <- bundle.merge,
          nil <- task.active_run_id,
          nil <- task.runtime_state,
-         %{"verdict" => "pass", "reviewed_head_sha" => head} <- task.review_attestation,
-         true <- git_sha?(head) do
+         %{
+           "verdict" => "pass",
+           "reviewed_head_sha" => head,
+           "criteria_fingerprint" => criteria_fingerprint,
+           "pull_request_number" => pull_request_number
+         } <- task.review_attestation,
+         true <- git_sha?(head),
+         true <- is_binary(criteria_fingerprint),
+         true <- is_integer(pull_request_number) and pull_request_number > 0 do
       :ok
     else
       _ -> {:error, :invalid_system_merge_entry}
@@ -398,12 +610,66 @@ defmodule SymphonyElixir.DeterministicMerge do
       task.github["head_sha"] != reviewed
   end
 
+  defp matching_review_attestation?(task, context) do
+    not changed_pull_request_identity?(task, context.snapshot) and
+      not changed_criteria?(task) and
+      not changed_feedback?(task, context.snapshot) and
+      not changed_checks?(task, context.snapshot) and
+      not stale_review_head?(task, context)
+  end
+
+  defp changed_pull_request_identity?(task, snapshot) do
+    attested = task.review_attestation["pull_request_number"]
+
+    not (is_integer(attested) and attested > 0 and task.github["number"] == attested and
+           snapshot_value(snapshot, :number) == attested)
+  end
+
   defp changed_feedback?(task, snapshot) do
     snapshot_value(snapshot, :feedback_fingerprint) != task.review_attestation["feedback_fingerprint"]
   end
 
   defp changed_checks?(task, snapshot) do
     snapshot_value(snapshot, :checks_fingerprint) != task.review_attestation["checks_fingerprint"]
+  end
+
+  defp changed_criteria?(task) do
+    task.review_attestation["criteria_fingerprint"] !=
+      ReviewAttestation.criteria_fingerprint(task.acceptance_criteria)
+  end
+
+  defp clean_update_identity_gate(task, context) do
+    reviewed = reviewed_head(task)
+
+    [
+      {changed_pull_request_identity?(task, context.snapshot), "linked or observed pull-request identity changed during clean update"},
+      {changed_criteria?(task), "acceptance criteria or evidence changed during clean update"},
+      {task.source["head_sha"] != reviewed or task.github["head_sha"] != reviewed, "canonical source or pull-request head changed during clean update"}
+    ]
+    |> first_review_reason()
+  end
+
+  defp clean_update_push_gate(task, context, expected_local_head) do
+    snapshot = context.snapshot
+
+    [
+      {context.source_head != expected_local_head or
+         snapshot_value(snapshot, :source_head_sha) != expected_local_head, "local source head changed before clean-update push"},
+      {changed_feedback?(task, snapshot), "pull-request feedback changed after review"},
+      {changed_checks?(task, snapshot), "required check contexts changed after review"},
+      {not criteria_complete?(task), "acceptance criteria or evidence changed after review"},
+      {snapshot_value(snapshot, :approved) != true, "pull-request approval is missing or changed"},
+      {snapshot_value(snapshot, :unresolved_review_threads) != 0, "pull-request review threads are unresolved"},
+      {snapshot_value(snapshot, :required_checks_green) != true, "required checks are not green"}
+    ]
+    |> first_review_reason()
+  end
+
+  defp first_review_reason(checks) do
+    Enum.find_value(checks, :ready, fn
+      {true, reason} -> {:review, reason}
+      {false, _reason} -> nil
+    end)
   end
 
   defp criteria_complete?(task) do
@@ -413,6 +679,33 @@ defmodule SymphonyElixir.DeterministicMerge do
   end
 
   defp reviewed_head(task), do: task.review_attestation["reviewed_head_sha"]
+
+  defp refresh_merge_state(task, context, boundary, opts) do
+    loader = Keyword.get(opts, :task_loader, &Board.task/1)
+
+    case loader.(task.id) do
+      {:ok, %Task{} = current} ->
+        refresh_external_state(current, context, boundary)
+
+      {:ok, task_map} when is_map(task_map) ->
+        refresh_external_state(Task.from_map(task_map), context, boundary)
+
+      {:error, reason} ->
+        {:error, task, {:task_reload_failed, reason}}
+
+      other ->
+        {:error, task, {:invalid_task_reload_result, other}}
+    end
+  end
+
+  defp refresh_external_state(task, context, boundary) do
+    with {:ok, source_head} <- boundary.(:source_head, task, context),
+         {:ok, snapshot} <- boundary.(:review_snapshot, task, context) do
+      {:ok, task, Map.merge(context, %{source_head: source_head, snapshot: snapshot})}
+    else
+      {:error, reason} -> {:error, task, reason}
+    end
+  end
 
   defp base_context(task, bundle, opts) do
     location =

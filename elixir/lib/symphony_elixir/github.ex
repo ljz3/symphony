@@ -194,7 +194,7 @@ defmodule SymphonyElixir.GitHub do
                "view",
                Integer.to_string(number),
                "--json",
-               "headRefOid,mergeCommit,mergeable,reviewDecision,state,statusCheckRollup,url"
+               "number,headRefOid,mergeCommit,mergeable,reviewDecision,state,statusCheckRollup,url"
              ],
              cd: directory
            ),
@@ -208,7 +208,7 @@ defmodule SymphonyElixir.GitHub do
 
       {:ok,
        %{
-         number: number,
+         number: pr["number"],
          url: pr["url"],
          state: pr["state"],
          head_sha: pr["headRefOid"],

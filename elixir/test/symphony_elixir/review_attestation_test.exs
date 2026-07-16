@@ -9,10 +9,37 @@ defmodule SymphonyElixir.ReviewAttestationTest do
   alias SymphonyElixir.Config
   alias SymphonyElixir.CurrentState
   alias SymphonyElixir.DeterministicMerge
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
 
   @head String.duplicate("a", 40)
   @changed String.duplicate("b", 40)
+
+  test "acceptance fingerprint is canonical across criterion and map-key order" do
+    first = %{
+      "id" => "first",
+      "text" => "First criterion",
+      "completed" => true,
+      "evidence" => [%{"result" => "pass", "details" => %{"count" => 1}}]
+    }
+
+    second = %{
+      id: "second",
+      text: "Second criterion",
+      completed: true,
+      evidence: [%{details: %{count: 2}, result: "pass"}]
+    }
+
+    fingerprint = ReviewAttestation.criteria_fingerprint([first, second])
+
+    assert fingerprint == ReviewAttestation.criteria_fingerprint([second, first])
+
+    refute fingerprint ==
+             ReviewAttestation.criteria_fingerprint([
+               first,
+               put_in(second, [:evidence, Access.at(0), :details, :count], 3)
+             ])
+  end
 
   test "strict review tool records a canonical exact-head pass and replays idempotently" do
     {review_task, review_run} = active_review()
@@ -36,6 +63,7 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     assert attested.review_attestation["reviewer_identity"] == review_run["id"]
     assert attested.review_attestation["run_id"] == review_run["id"]
     assert attested.review_attestation["feedback_fingerprint"] == "feedback-v1"
+    assert is_binary(attested.review_attestation["criteria_fingerprint"])
     refute Map.has_key?(attested.metadata, "review_attestation")
 
     [event] = Board.events(attested.id) |> Enum.filter(&(&1["type"] == "review_attestation_recorded"))
@@ -45,6 +73,126 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     assert :ok = Writer.reload_history()
     assert {:ok, replayed} = Board.task(attested.id)
     assert replayed.review_attestation == attested.review_attestation
+  end
+
+  test "human acceptance-set removal replacement and addition invalidate an exact pass" do
+    mutations = [
+      removal: fn [first, _second] -> [first] end,
+      replacement: fn [first, second] -> [%{first | "text" => "Replacement criterion"}, second] end,
+      addition: fn criteria -> criteria ++ [%{"id" => Ecto.UUID.generate(), "text" => "Added criterion"}] end
+    ]
+
+    Enum.each(mutations, fn {_name, mutate} ->
+      {review_task, review_run} = active_review(["Keep this criterion", "Change this criterion"])
+
+      assert %{"success" => true} =
+               DynamicTool.execute(
+                 "symphony_review_complete",
+                 pass_arguments(review_task),
+                 review_opts(review_task, review_run, BoardFactory.unique("criteria-pass"))
+               )
+
+      {:ok, attested} = Board.task(review_task["id"])
+      finished = finish_run(attested, review_run)
+
+      criteria =
+        finished["acceptance_criteria"]
+        |> Enum.map(&Map.take(&1, ~w(id text)))
+        |> mutate.()
+
+      assert {:ok, %{"task" => updated}} =
+               Board.execute(
+                 %Commands.UpdateTask{
+                   task_id: finished["id"],
+                   attrs: %{acceptance_criteria: criteria}
+                 },
+                 actor: %{type: :human, identity: "criteria-editor"},
+                 expected_revision: finished["revision"],
+                 idempotency_key: BoardFactory.unique("criteria-change")
+               )
+
+      assert updated["column_id"] == "automated_review"
+      assert is_nil(updated["review_attestation"])
+      assert get_in(updated, ["merge_saga", "reason"]) == "acceptance_criteria_changed"
+    end)
+  end
+
+  test "canonical acceptance evidence completion and reopening invalidate an exact pass" do
+    commands = [
+      fn task, criterion_id ->
+        %Commands.CompleteAcceptance{
+          task_id: task["id"],
+          criterion_id: criterion_id,
+          evidence: [%{"result" => "new evidence"}]
+        }
+      end,
+      fn task, criterion_id ->
+        %Commands.ReopenAcceptance{
+          task_id: task["id"],
+          criterion_id: criterion_id,
+          reason: "require new evidence"
+        }
+      end
+    ]
+
+    Enum.each(commands, fn command ->
+      {review_task, review_run} = active_review()
+
+      assert %{"success" => true} =
+               DynamicTool.execute(
+                 "symphony_review_complete",
+                 pass_arguments(review_task),
+                 review_opts(review_task, review_run, BoardFactory.unique("criteria-evidence-pass"))
+               )
+
+      {:ok, attested} = Board.task(review_task["id"])
+      finished = finish_run(attested, review_run)
+      criterion_id = get_in(finished, ["acceptance_criteria", Access.at(0), "id"])
+
+      assert {:ok, %{"task" => updated}} =
+               Board.execute(command.(finished, criterion_id),
+                 actor: %{type: :human, identity: "criteria-editor"},
+                 expected_revision: finished["revision"],
+                 idempotency_key: BoardFactory.unique("criteria-evidence-change")
+               )
+
+      assert updated["column_id"] == "automated_review"
+      assert is_nil(updated["review_attestation"])
+      assert get_in(updated, ["merge_saga", "reason"]) == "acceptance_criteria_changed"
+    end)
+  end
+
+  test "same-head pull-request relink invalidates the attested pull-request identity" do
+    {review_task, review_run} = active_review()
+
+    assert %{"success" => true} =
+             DynamicTool.execute(
+               "symphony_review_complete",
+               pass_arguments(review_task),
+               review_opts(review_task, review_run, "pass-before-pr-relink")
+             )
+
+    {:ok, attested} = Board.task(review_task["id"])
+    assert attested.review_attestation["pull_request_number"] == 1
+
+    assert {:ok, %{"task" => relinked}} =
+             Board.execute(
+               %Commands.LinkPullRequest{
+                 task_id: attested.id,
+                 run_id: review_run["id"],
+                 number: 2,
+                 url: "https://github.test/pull/2",
+                 head_sha: @head,
+                 state: "open",
+                 draft: false
+               },
+               actor: :system,
+               expected_revision: attested.revision,
+               idempotency_key: BoardFactory.unique("same-head-pr-relink")
+             )
+
+    assert relinked["column_id"] == "automated_review"
+    assert is_nil(relinked["review_attestation"])
   end
 
   test "pass rejects stale source/PR heads while rework records only a rework verdict and permitted route" do
@@ -198,7 +346,7 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     attestation = projection["review_attestation"]
 
     assert Map.keys(attestation) |> Enum.sort() ==
-             ~w(checks_fingerprint feedback_fingerprint findings plan_policy pull_request_number reviewed_at reviewed_head_sha reviewer_identity route run_id validation_evidence verdict)
+             ~w(checks_fingerprint criteria_fingerprint feedback_fingerprint findings plan_policy pull_request_number reviewed_at reviewed_head_sha reviewer_identity route run_id validation_evidence verdict)
 
     assert Map.keys(attestation["plan_policy"]) |> Enum.sort() == ~w(status summary)
     assert Enum.all?(attestation["validation_evidence"], &(Map.keys(&1) -- ~w(command result artifact exit_status) == []))
@@ -276,8 +424,13 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     assert get_in(schema, ["properties", "verdict", "enum"]) == ["pass", "rework"]
   end
 
-  defp active_review do
-    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Attestation")})
+  defp active_review(criteria \\ ["The behavior is verified."]) do
+    {created, _key} =
+      BoardFactory.create_task(%{
+        title: BoardFactory.unique("Attestation"),
+        acceptance_criteria: criteria
+      })
+
     {todo, _result} = BoardFactory.move(created, "todo")
 
     {:ok, %{"task" => implementation, "run" => implementation_run}} =
@@ -287,19 +440,22 @@ defmodule SymphonyElixir.ReviewAttestationTest do
         idempotency_key: BoardFactory.unique("implementation-claim")
       )
 
-    criterion_id = implementation["acceptance_criteria"] |> hd() |> Map.fetch!("id")
+    evidenced =
+      Enum.reduce(implementation["acceptance_criteria"], implementation, fn criterion, current ->
+        {:ok, %{"task" => updated}} =
+          Board.execute(
+            %Commands.CompleteAcceptance{
+              task_id: current["id"],
+              criterion_id: criterion["id"],
+              evidence: [%{"command" => "mix test", "result" => "passed"}]
+            },
+            actor: %{type: :agent, identity: implementation_run["id"]},
+            expected_revision: current["revision"],
+            idempotency_key: BoardFactory.unique("acceptance")
+          )
 
-    {:ok, %{"task" => evidenced}} =
-      Board.execute(
-        %Commands.CompleteAcceptance{
-          task_id: implementation["id"],
-          criterion_id: criterion_id,
-          evidence: [%{"command" => "mix test", "result" => "passed"}]
-        },
-        actor: %{type: :agent, identity: implementation_run["id"]},
-        expected_revision: implementation["revision"],
-        idempotency_key: BoardFactory.unique("acceptance")
-      )
+        updated
+      end)
 
     {:ok, %{"task" => sourced}} =
       Board.execute(%Commands.RecordSourceHead{task_id: evidenced["id"], head_sha: @head, clean: true},

@@ -2,7 +2,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.{Config, DeterministicMerge, Task}
+  alias SymphonyElixir.{Config, DeterministicMerge, ReviewAttestation, Task}
 
   @head String.duplicate("a", 40)
   @target String.duplicate("b", 40)
@@ -175,6 +175,280 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert {:ok, :review_required} = run(recovering, bundle)
     assert count_call(:merge_target) == 0
     assert count_call(:push_head) == 1
+  end
+
+  test "clean-update recovery observes a successful remote push and never repeats it", %{
+    task: task,
+    bundle: bundle
+  } do
+    recovering = %{
+      task
+      | merge_saga: %{
+          "checkpoint" => "clean_update_started",
+          "attrs" => %{"task_head" => @head, "target_head" => @target}
+        }
+    }
+
+    Process.put(:merge_fake_task, recovering)
+
+    scenario(%{
+      source_head: @updated,
+      snapshot: %{head_sha: @updated, source_head_sha: @updated},
+      target_ancestor: true
+    })
+
+    assert {:ok, :review_required} = run(recovering, bundle)
+    assert count_call(:review_snapshot) == 1
+    assert count_call(:push_head) == 0
+    assert current_task().source["head_sha"] == @updated
+    assert current_task().github["head_sha"] == @updated
+  end
+
+  test "post-readiness provider source and worktree changes are revalidated before effects", %{
+    task: task,
+    bundle: bundle
+  } do
+    review_cases = [
+      %{snapshot: %{approved: false}},
+      %{snapshot: %{unresolved_review_threads: 1}},
+      %{snapshot: %{required_checks_green: false}},
+      %{snapshot: %{feedback_fingerprint: "changed"}},
+      %{snapshot: %{checks_fingerprint: "changed"}},
+      %{source_head: @updated}
+    ]
+
+    Enum.each(review_cases, fn changes ->
+      reset(task)
+
+      scenario(%{
+        readiness: fn ->
+          scenario(changes)
+          {:ok, "ready"}
+        end
+      })
+
+      assert {:ok, :review_required} = run(task, bundle)
+      assert count_call(:readiness) == 1
+      assert count_call(:review_snapshot) == 2
+      assert count_call(:push_head) == 0
+      assert count_call(:guarded_squash) == 0
+    end)
+
+    reset(task)
+
+    scenario(%{
+      readiness: fn ->
+        scenario(%{review_snapshot: {:error, :worktree_not_clean}})
+        {:ok, "ready"}
+      end
+    })
+
+    assert {:ok, :blocked} = run(task, bundle)
+    assert count_call(:push_head) == 0
+    assert count_call(:guarded_squash) == 0
+  end
+
+  test "post-readiness criteria evidence and pull-request identity changes return to review", %{
+    task: task,
+    bundle: bundle
+  } do
+    changes = [
+      fn current ->
+        criterion = hd(current.acceptance_criteria)
+        %{current | acceptance_criteria: [%{criterion | "evidence" => [%{"result" => "changed"}]}]}
+      end,
+      fn current ->
+        %{current | github: Map.put(current.github, "number", 8)}
+      end
+    ]
+
+    Enum.each(changes, fn change_task ->
+      reset(task)
+
+      scenario(%{
+        readiness: fn ->
+          changed = change_task.(current_task())
+          Process.put(:merge_fake_task, changed)
+          scenario(%{snapshot: %{number: changed.github["number"]}})
+          {:ok, "ready"}
+        end
+      })
+
+      assert {:ok, :review_required} = run(task, bundle)
+      assert count_call(:readiness) == 1
+      assert count_call(:push_head) == 0
+      assert count_call(:guarded_squash) == 0
+    end)
+  end
+
+  test "current and observed pull-request identity must match the attested pull request", %{
+    task: task,
+    bundle: bundle
+  } do
+    attested = put_in(task.review_attestation["pull_request_number"], 7)
+
+    cases = [
+      {%{attested | github: Map.put(attested.github, "number", 8)}, %{number: 8}},
+      {attested, %{number: 8}}
+    ]
+
+    Enum.each(cases, fn {candidate, snapshot} ->
+      reset(candidate)
+      scenario(%{snapshot: snapshot})
+
+      assert {:ok, :review_required} = run(candidate, bundle)
+      assert count_call(:readiness) == 0
+      assert count_call(:guarded_squash) == 0
+    end)
+  end
+
+  test "post-readiness reload and provider classifications remain effect-free", %{
+    task: task,
+    bundle: bundle
+  } do
+    cases = [
+      {%{source_head: {:error, {:transient, :head_busy}}}, {:ok, :pending}, "merging"},
+      {%{review_snapshot: {:error, :pull_request_not_linked}}, {:ok, :review_required}, "automated_review"},
+      {%{snapshot: %{state: "MERGED", merge_sha: @merge}}, {:ok, :blocked}, "blocked"},
+      {%{snapshot: %{state: "CLOSED"}}, {:ok, :blocked}, "blocked"},
+      {%{task_loader: {:error, :not_found}}, {:ok, :blocked}, "blocked"},
+      {%{task_loader: :invalid_reload}, {:ok, :blocked}, "blocked"},
+      {%{task_loader: fn -> {:ok, Task.to_map(current_task())} end}, {:ok, :completed}, "done"}
+    ]
+
+    Enum.each(cases, fn {after_readiness, expected, column} ->
+      reset(task)
+      scenario(%{readiness: change_after_readiness(after_readiness)})
+
+      assert ^expected = run(task, bundle)
+      assert current_task().column_id == column
+      assert count_call(:readiness) == 1
+    end)
+
+    reset(task)
+
+    scenario(%{
+      readiness: fn ->
+        changed = %{current_task() | column_id: "automated_review", review_attestation: nil}
+        Process.put(:merge_fake_task, changed)
+        {:ok, "ready"}
+      end
+    })
+
+    assert {:ok, :review_required} = run(task, bundle)
+    assert count_call(:push_head) == 0
+    assert count_call(:guarded_squash) == 0
+  end
+
+  test "clean-update recovery revalidates canonical provider and local state", %{
+    task: task,
+    bundle: bundle
+  } do
+    recovering = recovering_task(task)
+
+    invalid_task_loader = fn ->
+      {:ok, %{current_task() | column_id: "automated_review", review_attestation: nil}}
+    end
+
+    cases = [
+      {%{review_snapshot: {:error, :pull_request_not_linked}}, {:ok, :review_required}},
+      {%{snapshot: %{head_sha: "invalid"}}, {:ok, :blocked}},
+      {%{snapshot: %{approved: false}}, {:ok, :review_required}},
+      {%{task_loader: invalid_task_loader}, {:ok, :review_required}},
+      {%{snapshot: %{state: "CLOSED"}}, {:ok, :blocked}},
+      {%{snapshot: %{number: 8}}, {:ok, :review_required}},
+      {
+        %{source_head: @updated, snapshot: %{source_head_sha: @updated, approved: false}},
+        {:ok, :review_required}
+      }
+    ]
+
+    Enum.each(cases, fn {values, expected} ->
+      reset(recovering)
+      scenario(values)
+
+      assert ^expected = run(recovering, bundle)
+      assert count_call(:push_head) == 0
+    end)
+  end
+
+  test "the final clean-update push gate classifies every fresh remote state", %{
+    task: task,
+    bundle: bundle
+  } do
+    fresh_updated = fn overrides ->
+      {:ok, snapshot(Map.merge(%{source_head_sha: @updated}, overrides))}
+    end
+
+    cases = [
+      {third_snapshot({:error, {:transient, :snapshot_busy}}), {:ok, :pending}, "merging"},
+      {third_snapshot({:error, :pull_request_not_linked}), {:ok, :review_required}, "automated_review"},
+      {third_snapshot({:error, :worktree_not_clean}), {:ok, :blocked}, "blocked"},
+      {third_snapshot(fresh_updated.(%{head_sha: @updated})), {:ok, :review_required}, "automated_review"},
+      {third_snapshot(fresh_updated.(%{head_sha: @merge})), {:ok, :review_required}, "automated_review"},
+      {third_snapshot(fresh_updated.(%{head_sha: "invalid"})), {:ok, :blocked}, "blocked"},
+      {third_snapshot(fresh_updated.(%{state: "CLOSED"})), {:ok, :blocked}, "blocked"},
+      {third_snapshot(fresh_updated.(%{number: 8})), {:ok, :review_required}, "automated_review"}
+    ]
+
+    Enum.each(cases, fn {review_snapshot, expected, column} ->
+      reset(task)
+      scenario(%{target_ancestor: false, review_snapshot: review_snapshot})
+
+      assert ^expected = run(task, bundle)
+      assert current_task().column_id == column
+      assert count_call(:push_head) == 0
+    end)
+
+    reset(task)
+
+    task_loader = fn ->
+      current = current_task()
+
+      if count_call(:merge_target) == 1,
+        do: {:ok, %{current | column_id: "automated_review", review_attestation: nil}},
+        else: {:ok, current}
+    end
+
+    scenario(%{target_ancestor: false, task_loader: task_loader})
+    assert {:ok, :review_required} = run(task, bundle)
+    assert count_call(:push_head) == 0
+  end
+
+  test "the final guarded-squash gate classifies every fresh state", %{
+    task: task,
+    bundle: bundle
+  } do
+    cases = [
+      {%{source_head: third_source({:error, {:transient, :head_busy}})}, {:ok, :pending}, "merging"},
+      {%{review_snapshot: third_snapshot({:error, :pull_request_not_linked})}, {:ok, :review_required}, "automated_review"},
+      {%{review_snapshot: third_snapshot({:error, :worktree_not_clean})}, {:ok, :blocked}, "blocked"},
+      {%{review_snapshot: third_snapshot({:ok, snapshot(%{approved: false})})}, {:ok, :review_required}, "automated_review"},
+      {%{review_snapshot: third_snapshot({:ok, snapshot(%{state: "MERGED", merge_sha: @merge})})}, {:ok, :completed}, "done"},
+      {%{review_snapshot: third_snapshot({:ok, snapshot(%{state: "CLOSED"})})}, {:ok, :blocked}, "blocked"}
+    ]
+
+    Enum.each(cases, fn {values, expected, column} ->
+      reset(task)
+      scenario(values)
+
+      assert ^expected = run(task, bundle)
+      assert current_task().column_id == column
+    end)
+
+    reset(task)
+
+    task_loader = fn ->
+      current = current_task()
+
+      if count_call(:target_ancestor) == 1,
+        do: {:ok, %{current | column_id: "automated_review", review_attestation: nil}},
+        else: {:ok, current}
+    end
+
+    scenario(%{task_loader: task_loader})
+    assert {:ok, :review_required} = run(task, bundle)
+    assert count_call(:guarded_squash) == 0
   end
 
   test "entry, snapshot, readiness, fetch, and comparison failures route deterministically", %{
@@ -368,6 +642,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     DeterministicMerge.run(task, bundle,
       boundary: &boundary/3,
       board_executor: &board_execute/2,
+      task_loader: &load_task/1,
       location: %{worktree: "/tmp/fake-worktree", worker_host: nil}
     )
   end
@@ -376,6 +651,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     DeterministicMerge.run(task, bundle,
       boundary: &boundary/3,
       board_executor: &board_execute/2,
+      task_loader: &load_task/1,
       run_history: history
     )
   end
@@ -383,7 +659,8 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   defp run_from_board_history(task, bundle) do
     DeterministicMerge.run(task, bundle,
       boundary: &boundary/3,
-      board_executor: &board_execute/2
+      board_executor: &board_execute/2,
+      task_loader: &load_task/1
     )
   end
 
@@ -400,22 +677,41 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   end
 
   defp boundary_result(:source_head, _context, scenario),
-    do: wrap_ok(Map.get(scenario, :source_head, @head))
+    do: wrap_ok(resolve_scenario_value(scenario, :source_head, @head))
 
-  defp boundary_result(:review_snapshot, _context, scenario),
-    do: Map.get(scenario, :review_snapshot, {:ok, snapshot(scenario[:snapshot] || %{})})
+  defp boundary_result(:review_snapshot, _context, scenario) do
+    local_head = if is_binary(scenario[:source_head]), do: scenario[:source_head], else: @head
+    default = {:ok, snapshot(Map.put_new(scenario[:snapshot] || %{}, :source_head_sha, local_head))}
+    resolve_scenario_value(scenario, :review_snapshot, default)
+  end
 
-  defp boundary_result(:readiness, _context, scenario),
-    do: Map.get(scenario, :readiness, {:ok, "ready"})
+  defp boundary_result(:readiness, _context, scenario) do
+    case Map.get(scenario, :readiness, {:ok, "ready"}) do
+      callback when is_function(callback, 0) -> callback.()
+      result -> result
+    end
+  end
 
   defp boundary_result(:fetch_target, _context, scenario),
     do: wrap_ok(Map.get(scenario, :fetch_target, @target))
 
   defp boundary_result(:target_ancestor, _context, scenario),
-    do: wrap_ok(Map.get(scenario, :target_ancestor, true))
+    do: wrap_ok(resolve_scenario_value(scenario, :target_ancestor, true))
 
-  defp boundary_result(:merge_target, _context, scenario),
-    do: Map.get(scenario, :merge_target, {:ok, @updated})
+  defp boundary_result(:merge_target, _context, scenario) do
+    result = resolve_scenario_value(scenario, :merge_target, {:ok, @updated})
+
+    case result do
+      {:ok, updated_head} ->
+        latest = Process.get(:merge_scenario, scenario)
+        Process.put(:merge_scenario, Map.put(latest, :source_head, updated_head))
+
+      _other ->
+        :ok
+    end
+
+    result
+  end
 
   defp boundary_result(:probe_conflict, _context, scenario),
     do: Map.get(scenario, :probe_conflict, {:conflict, ["conflict.swift"]})
@@ -431,6 +727,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   defp snapshot(overrides) do
     Map.merge(
       %{
+        number: 7,
         state: "OPEN",
         head_sha: @head,
         source_head_sha: @head,
@@ -543,8 +840,41 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   defp bump(task, attrs), do: task |> Map.merge(attrs) |> Map.put(:revision, task.revision + 1)
 
   defp current_task, do: Process.get(:merge_fake_task)
+
+  defp load_task(_task_id) do
+    resolve_scenario_value(Process.get(:merge_scenario, %{}), :task_loader, {:ok, current_task()})
+  end
+
   defp count_call(operation), do: Enum.count(Process.get(:merge_fake_calls, []), &(&1 == operation))
   defp scenario(values), do: Process.put(:merge_scenario, values)
+
+  defp change_after_readiness(values) do
+    fn ->
+      scenario(values)
+      {:ok, "ready"}
+    end
+  end
+
+  defp third_snapshot(result) do
+    fn ->
+      if count_call(:review_snapshot) == 3,
+        do: result,
+        else: {:ok, snapshot(%{})}
+    end
+  end
+
+  defp third_source(result) do
+    fn ->
+      if count_call(:source_head) == 3, do: result, else: @head
+    end
+  end
+
+  defp resolve_scenario_value(scenario, key, default) do
+    case Map.get(scenario, key, default) do
+      callback when is_function(callback, 0) -> callback.()
+      value -> value
+    end
+  end
 
   defp reset(task) do
     Process.put(:merge_fake_task, task)
@@ -557,7 +887,21 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   defp wrap_ok({tag, _reason} = result) when tag in [:error, :conflict], do: result
   defp wrap_ok(value), do: {:ok, value}
 
+  defp recovering_task(task) do
+    %{
+      task
+      | merge_saga: %{
+          "checkpoint" => "clean_update_started",
+          "attrs" => %{"task_head" => @head, "target_head" => @target}
+        }
+    }
+  end
+
   defp merge_task do
+    acceptance_criteria = [
+      %{"id" => "criterion", "text" => "Verified", "completed" => true, "evidence" => [%{"result" => "pass"}]}
+    ]
+
     %Task{
       id: "task-merge",
       identifier: "SYM-1",
@@ -568,9 +912,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       branch: "feature/SYM-1",
       priority: :normal,
       brief: "Merge safely",
-      acceptance_criteria: [
-        %{"id" => "criterion", "text" => "Verified", "completed" => true, "evidence" => [%{"result" => "pass"}]}
-      ],
+      acceptance_criteria: acceptance_criteria,
       column_id: "merging",
       rank: 1_024,
       revision: 7,
@@ -580,7 +922,9 @@ defmodule SymphonyElixir.DeterministicMergeTest do
         "verdict" => "pass",
         "reviewed_head_sha" => @head,
         "feedback_fingerprint" => "feedback-v1",
-        "checks_fingerprint" => "checks-v1"
+        "checks_fingerprint" => "checks-v1",
+        "criteria_fingerprint" => ReviewAttestation.criteria_fingerprint(acceptance_criteria),
+        "pull_request_number" => 7
       },
       created_at: "2026-01-01T00:00:00Z",
       updated_at: "2026-01-01T00:00:00Z"

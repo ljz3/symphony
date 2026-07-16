@@ -16,7 +16,7 @@ defmodule SymphonyElixir.CurrentState do
   @github_fields ~w(number url state draft head_sha)
   @preflight_fields ~w(status phase fingerprint reason started_at last_activity_at completed_at next_retry_at)
   @job_fields ~w(job_id job status started_at finished_at elapsed_ms source_fingerprint)
-  @attestation_fields ~w(verdict reviewed_head_sha route feedback_fingerprint checks_fingerprint pull_request_number reviewer_identity run_id reviewed_at)
+  @attestation_fields ~w(verdict reviewed_head_sha route feedback_fingerprint checks_fingerprint criteria_fingerprint pull_request_number reviewer_identity run_id reviewed_at)
   @plan_policy_fields ~w(status summary)
   @validation_evidence_fields ~w(command result artifact exit_status)
   @finding_fields ~w(severity summary path line)

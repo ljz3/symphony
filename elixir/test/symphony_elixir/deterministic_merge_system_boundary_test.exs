@@ -5,6 +5,7 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
   alias SymphonyElixir.Config
   alias SymphonyElixir.DeterministicMerge
   alias SymphonyElixir.DeterministicMerge.SystemBoundary
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
 
   defmodule FakeWorktree do
@@ -227,6 +228,16 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
       refute_receive {^tag, %_{}}, 25
       refute_receive {^tag, :readiness}, 25
     end
+  end
+
+  test "review snapshot reports the provider-observed pull-request identity" do
+    {worktree, head} = linear_repository()
+    linked = put_in(task_fixture(head).github["number"], 41)
+
+    assert {:ok, snapshot} =
+             SystemBoundary.call(:review_snapshot, linked, %{worktree: worktree, worker_host: nil})
+
+    assert snapshot.number == 42
   end
 
   test "worktree setup and source-head failures retain their transient or invariant class" do
@@ -604,6 +615,7 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
     DeterministicMerge.run(task, Config.bundle!(),
       boundary: boundary,
       board_executor: board_executor,
+      task_loader: fn _task_id -> {:ok, task} end,
       location: %{worktree: worktree, worker_host: nil}
     )
   end
@@ -632,6 +644,10 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
   end
 
   defp task_fixture(head, branch \\ "feature/system-boundary") do
+    acceptance_criteria = [
+      %{"id" => Ecto.UUID.generate(), "text" => "Verified", "completed" => true, "evidence" => [%{"result" => "passed"}]}
+    ]
+
     %Task{
       id: Ecto.UUID.generate(),
       identifier: "SYM-BOUNDARY",
@@ -642,9 +658,7 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
       branch: branch,
       priority: :normal,
       brief: "Exercise real command boundaries",
-      acceptance_criteria: [
-        %{"id" => Ecto.UUID.generate(), "text" => "Verified", "completed" => true, "evidence" => [%{"result" => "passed"}]}
-      ],
+      acceptance_criteria: acceptance_criteria,
       column_id: "merging",
       rank: 1_024,
       revision: 1,
@@ -654,7 +668,9 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
         "verdict" => "pass",
         "reviewed_head_sha" => head,
         "feedback_fingerprint" => "feedback",
-        "checks_fingerprint" => "checks"
+        "checks_fingerprint" => "checks",
+        "criteria_fingerprint" => ReviewAttestation.criteria_fingerprint(acceptance_criteria),
+        "pull_request_number" => 42
       },
       created_at: "2026-07-16T00:00:00Z",
       updated_at: "2026-07-16T00:00:00Z"

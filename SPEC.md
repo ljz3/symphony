@@ -259,7 +259,8 @@ reviewed head, `pass` or `rework` verdict, route, plan-policy status and summary
 evidence, and structured findings. The service, not the model, reads the current clean worktree,
 source head, PR head/state, aggregate review decision, every paginated review thread and comment,
 and every required check context. It stores the reviewer/run identity, observation time, PR number,
-and deterministic feedback/check fingerprints in a canonical review-attestation event. Current-state
+and deterministic feedback/check fingerprints plus a canonical fingerprint of the exact acceptance-
+criterion multiset and its current evidence in a canonical review-attestation event. Current-state
 projection exposes only the explicit nested attestation allowlist, never raw provider payloads.
 
 A passing attestation requires the exact source/task/PR head, completed criteria with evidence, a
@@ -267,7 +268,8 @@ non-deviating plan policy, no blocker/high findings, aggregate GitHub `APPROVED`
 threads, and green required checks, and routes only to the unique system merge column. A rework
 attestation requires findings and routes only along a configured agent edge to a non-review dispatch
 column or Blocked. Direct agent movement into the merge column is rejected. A later canonical source
-or PR-head change clears a passing attestation and returns a merge-pending task to review.
+or PR-head change, linked PR identity change, or acceptance-criterion/evidence change clears a
+passing attestation and returns a merge-pending task to review.
 
 Derive the `symphony_job_run` name enum solely from the claimed run's frozen job definitions. One
 call starts or attaches to a supervised job and stays pending until a terminal result; do not expose
@@ -352,9 +354,15 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
   reviewed task head. If the task branch is behind, commit and push a normal merge of the target into
   the task branch, then invalidate the attestation and require exact-head review again. Never rebase
   or rewrite history.
+- After readiness exits, reload the canonical task and re-observe the clean local source plus the
+  provider PR identity, head, approval, threads, checks, and fingerprints before continuing. Repeat
+  that observation immediately before either clean-update push or guarded squash; any attested
+  criteria/evidence, linked PR identity, local source, or provider-state change returns to review or
+  blocks on an unsafe invariant.
 - Before the external clean-update push and guarded squash merge, record a canonical checkpoint.
-  Recovery observes current Git/PR state and resumes the same effect rather than repeating a
-  completed one. Use literal Git/`gh` argument vectors locally and safely quoted arguments over SSH.
+  Recovery observes both local Git and the actual remote PR head and resumes the same effect rather
+  than repeating a completed one; an already-updated remote head invalidates review without another
+  push. Use literal Git/`gh` argument vectors locally and safely quoted arguments over SSH.
   Squash merge through `gh pr merge --squash --match-head-commit <reviewed-head>`.
 - Treat provider-reported conflict as a hint only. Reproduce it with Git, collect the complete sorted
   unmerged-path set, and successfully abort the probe before recording a canonical conflict. The

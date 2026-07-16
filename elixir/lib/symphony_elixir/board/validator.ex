@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Board.Validator do
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.Board.Projection
   alias SymphonyElixir.Codex.RunStats
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.Bundle
   alias SymphonyElixir.Workflow.Bundle.Column
@@ -32,6 +33,7 @@ defmodule SymphonyElixir.Board.Validator do
          :ok <- mutable_contract?(task, actor),
          :ok <- reject_immutable_fields(attrs),
          {:ok, updated} <- update_task(task, attrs, bundle, actor) do
+      updated = invalidate_attestation_for_criteria(updated, bundle)
       mutation("task_updated", updated, nil)
     end
   end
@@ -61,7 +63,7 @@ defmodule SymphonyElixir.Board.Validator do
     end
   end
 
-  def validate(%Commands.CompleteAcceptance{} = command, actor, _bundle) do
+  def validate(%Commands.CompleteAcceptance{} = command, actor, bundle) do
     with {:ok, task} <- Projection.get_task(command.task_id),
          :ok <- agent_evidence(actor, command.evidence),
          {:ok, criteria} <-
@@ -71,16 +73,16 @@ defmodule SymphonyElixir.Board.Validator do
              command.evidence,
              actor
            ) do
-      task = bump(task, %{acceptance_criteria: criteria})
+      task = task |> bump(%{acceptance_criteria: criteria}) |> invalidate_attestation_for_criteria(bundle)
       mutation("acceptance_completed", task, nil)
     end
   end
 
-  def validate(%Commands.ReopenAcceptance{} = command, actor, _bundle) do
+  def validate(%Commands.ReopenAcceptance{} = command, actor, bundle) do
     with :ok <- human_actor(actor),
          {:ok, task} <- Projection.get_task(command.task_id),
          {:ok, criteria} <- reopen_criterion(task.acceptance_criteria, command.criterion_id, command.reason, actor) do
-      task = bump(task, %{acceptance_criteria: criteria})
+      task = task |> bump(%{acceptance_criteria: criteria}) |> invalidate_attestation_for_criteria(bundle)
       mutation("acceptance_reopened", task, nil)
     end
   end
@@ -223,7 +225,7 @@ defmodule SymphonyElixir.Board.Validator do
       task =
         task
         |> bump(%{github: Map.merge(task.github, github)})
-        |> invalidate_attestation_for_head(command.head_sha, bundle, "pull_request_head_changed")
+        |> invalidate_attestation_for_pull_request(command.number, command.head_sha, bundle)
 
       run = pull_request_creator_run(task.id, run, command.created_by_run_id)
 
@@ -279,6 +281,7 @@ defmodule SymphonyElixir.Board.Validator do
         "findings" => stringify_keys(command.findings),
         "feedback_fingerprint" => value(command.provider_snapshot, :feedback_fingerprint),
         "checks_fingerprint" => value(command.provider_snapshot, :checks_fingerprint),
+        "criteria_fingerprint" => ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
         "pull_request_number" => value(command.provider_snapshot, :number),
         "reviewer_identity" => actor.identity,
         "run_id" => run["id"],
@@ -367,6 +370,9 @@ defmodule SymphonyElixir.Board.Validator do
          :ok <- task_in_merge_column(task, bundle),
          %{"verdict" => "pass", "reviewed_head_sha" => reviewed_head} <- task.review_attestation,
          true <- reviewed_head == command.reviewed_head_sha,
+         true <-
+           task.review_attestation["criteria_fingerprint"] ==
+             ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
          true <- sha?(command.merge_sha) and sha?(command.target_head),
          %Column{} = done <- Bundle.done_column(bundle) do
       recorded_at = now()
@@ -911,26 +917,53 @@ defmodule SymphonyElixir.Board.Validator do
     if task.review_attestation["reviewed_head_sha"] == head do
       task
     else
-      task = %{task | review_attestation: nil}
+      invalidate_attestation(task, bundle, reason)
+    end
+  end
 
-      case {bundle.merge, Bundle.column(bundle, task.column_id)} do
-        {%{} = merge, %Column{role: :merge}} ->
-          review = Bundle.column(bundle, merge.review_column)
+  defp invalidate_attestation_for_pull_request(%Task{review_attestation: nil} = task, _number, _head, _bundle),
+    do: task
 
-          %{
-            task
-            | column_id: review.id,
-              rank: Projection.max_rank(review.id) + @rank_gap,
-              merge_saga:
-                merge_saga(task)
-                |> Map.put("checkpoint", "review_required")
-                |> Map.put("reason", reason)
-                |> Map.put("updated_at", now())
-          }
+  defp invalidate_attestation_for_pull_request(task, number, head, bundle) do
+    if task.review_attestation["reviewed_head_sha"] == head and
+         task.review_attestation["pull_request_number"] == number do
+      task
+    else
+      invalidate_attestation(task, bundle, "pull_request_identity_changed")
+    end
+  end
 
-        _ ->
+  defp invalidate_attestation_for_criteria(%Task{review_attestation: nil} = task, _bundle), do: task
+
+  defp invalidate_attestation_for_criteria(task, bundle) do
+    if task.review_attestation["criteria_fingerprint"] ==
+         ReviewAttestation.criteria_fingerprint(task.acceptance_criteria) do
+      task
+    else
+      invalidate_attestation(task, bundle, "acceptance_criteria_changed")
+    end
+  end
+
+  defp invalidate_attestation(task, bundle, reason) do
+    task = %{task | review_attestation: nil}
+
+    case {bundle.merge, Bundle.column(bundle, task.column_id)} do
+      {%{} = merge, %Column{role: :merge}} ->
+        review = Bundle.column(bundle, merge.review_column)
+
+        %{
           task
-      end
+          | column_id: review.id,
+            rank: Projection.max_rank(review.id) + @rank_gap,
+            merge_saga:
+              merge_saga(task)
+              |> Map.put("checkpoint", "review_required")
+              |> Map.put("reason", reason)
+              |> Map.put("updated_at", now())
+        }
+
+      _ ->
+        task
     end
   end
 
