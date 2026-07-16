@@ -81,11 +81,20 @@ Pass a workflow path as the final argument when the file lives elsewhere:
 
 ## Connect Codex to the MCP endpoint
 
-Symphony exposes exactly one external MCP tool, `symphony_task_create`, on `/mcp`. The tool creates
-an execution-ready task in the workflow's initial Backlog column through the same serialized board
-writer used by the UI and internal tools. Its required `project_id` must exactly match the active
-workflow project before any mutation occurs; a mismatch creates nothing and does not disclose the
-active project ID.
+Symphony exposes exactly three external MCP tools on `/mcp`:
+
+- `symphony_task_create` creates an execution-ready task in the workflow's initial Backlog column
+  through the same serialized board writer used by the UI and internal tools.
+- `symphony_task_get` returns one actionable task view by exact human identifier, including safe
+  status, criteria/evidence, dependencies, PR projection, aggregate statistics, and bounded run/event history.
+- `symphony_tasks_by_state` lists current, non-archived tasks in one exact workflow column using
+  canonical priority/rank/number ordering.
+
+All three tools require a `project_id` that exactly matches the caller's independently known active
+workflow project. A mismatch is rejected before other arguments are processed, creates no event, and
+does not disclose the active project ID. The read tools are read-only, idempotent, non-destructive,
+and closed-world. The MCP surface never exposes workpads, raw task metadata, workspace paths, or
+raw event/protocol payloads.
 
 Register the listener globally in `~/.codex/config.toml` for a service running on port 4000:
 
@@ -94,7 +103,7 @@ Register the listener globally in `~/.codex/config.toml` for a service running o
 url = "http://127.0.0.1:4000/mcp"
 enabled = true
 required = false
-enabled_tools = ["symphony_task_create"]
+enabled_tools = ["symphony_task_create", "symphony_task_get", "symphony_tasks_by_state"]
 default_tools_approval_mode = "writes"
 ```
 
@@ -161,15 +170,11 @@ Task execution contracts cannot be edited while starting, running, or stopping. 
 criteria require evidence. Humans may reopen criteria, and editing criterion text preserves prior
 evidence history.
 
-The REST-style JSON interface is diagnostic and intentionally read-only:
-
-- `GET /api/v1/state`
-- `GET /api/v1/tasks/:identifier`
-- `POST /api/v1/refresh`
-
-All other REST mutation methods are rejected. LiveView and MCP mutations call the same validated
-board command boundary used by internal tools; `/mcp` is a separate Streamable HTTP protocol route,
-not a general-purpose task API. Workpad content is intentionally absent from these JSON responses.
+There is no REST-style JSON API. Former `/api/v1/state`, `/api/v1/tasks/:identifier`, and
+`/api/v1/refresh` paths (and every HTTP method on them) return the generic `404 not_found` response.
+LiveView uses internal Elixir boundaries, while `/mcp` is the sole machine-facing protocol endpoint
+and exposes only the three guarded task tools above. Workpad content and raw board/protocol data are
+never exposed through MCP.
 
 ## `WORKFLOW.yml`
 
@@ -265,7 +270,7 @@ event and removes the transient row. Symphony accepts
 `thread/tokenUsage/updated.params.tokenUsage.total`, with the legacy nested
 `total_token_usage` as a fallback; delta, generic `usage`, and turn-completion payloads are ignored.
 
-The board, task detail, `/stats`, and read-only JSON API merge that transient active-run snapshot
+The board, task detail, `/stats`, and read-only MCP task views merge that transient active-run snapshot
 with canonical terminal `stats`. Task and project totals cover all runs, including archived tasks;
 they sum input, cached-input, output, and reported total fields independently. Cached input remains
 a subset of input and is not added again. Aggregates are marked `complete`, `partial`, or
@@ -285,11 +290,11 @@ concurrently. Project age runs from the earliest claim and continues while idle.
 safe latest-activity labels, and rate limits keyed by local/SSH worker are operational values that
 reset when the orchestrator process restarts; token, turn, and terminal-duration history does not.
 
-`GET /api/v1/state` exposes the public model/stage snapshot under `stats`, including `models` with
-nested `stages`, per-group `session_count` and `active_session_count`, and project `session_count`
-and `completed_task_count` values. Effort rows are private to the loopback HTML stats view. Task responses expose aggregate
-`stats`, preserve each run's canonical `stats`, and add `effective_stats` plus safe active
-`activity`. Session IDs remain confined to the loopback UI/API and are never published to GitHub.
+Project-wide state and statistics remain internal to the LiveView/UI boundaries. `symphony_task_get`
+exposes aggregate task `stats`, the three newest compact runs with effective statistics, and the ten
+newest compact events with totals/truncation flags. It omits canonical run internals, workspaces,
+workpads, source/GitHub maps, persistence metadata, and session IDs. Session IDs remain confined to
+the loopback UI and are never published to GitHub.
 
 GitHub receives one compact, marker-managed stats block after the run terminates. The run that
 created a Symphony-managed PR is appended to the PR body. Other runs are appended to the existing
@@ -361,7 +366,7 @@ migration signal and does not discover or import Linear state.
 ## Project layout
 
 - `lib/symphony_elixir/` — domain, event history, projection, orchestration, worktrees, Codex, GitHub
-- `lib/symphony_elixir_web/` — loopback LiveView board and read-only API
+- `lib/symphony_elixir_web/` — loopback LiveView board, MCP dispatch, and generic HTTP fallback
 - `workflow/prompts/` and `workflow/workpads/` — strict standard templates
-- `test/` — unit, integration, UI/API, Git, fake-`gh`, and opt-in live coverage
+- `test/` — unit, integration, UI/MCP, Git, fake-`gh`, and opt-in live coverage
 - `WORKFLOW.yml` — standard project workflow contract

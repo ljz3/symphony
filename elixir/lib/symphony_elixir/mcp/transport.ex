@@ -9,9 +9,10 @@ defmodule SymphonyElixir.MCP.Transport do
   alias SymphonyElixir.MCP.Handler
 
   @instructions """
-                Symphony exposes one write tool that creates an execution-ready Backlog task. Supply the exact
-                project_id you independently intend to modify. If it does not match, stop and verify the project;
-                never guess, substitute, or retry with a project ID learned from the server.
+                Symphony exposes exactly three task tools: guarded task creation, exact task lookup, and current
+                task listing by workflow state. Supply the exact project_id you independently intend to access or
+                modify. If it does not match, stop and verify the project; never guess, substitute, or retry with
+                a project ID learned from the server.
                 """
                 |> String.replace("\n", " ")
                 |> String.trim()

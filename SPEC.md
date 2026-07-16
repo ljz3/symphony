@@ -221,17 +221,34 @@ Pass app-server call metadata to the executor and combine the active run ID with
 
 Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed, failed, or stopped prior runs with the same task ID; cross-task and active prior-run reads are rejected. Prior-run reads retain run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
 
-### External MCP task creation
+### External MCP task interface
 
-Serve Streamable HTTP MCP at the exact `/mcp` path on the existing loopback UI listener. Expose only
-`symphony_task_create`; do not expose MCP resources, prompts, or other board tools. The external
-schema matches the run-scoped creation schema and additionally requires `project_id`.
+Serve Streamable HTTP MCP at the exact `/mcp` path on the existing loopback UI listener. Expose exactly
+three external tools: `symphony_task_create`, `symphony_task_get`, and `symphony_tasks_by_state`.
+Do not expose MCP resources, prompts, board-wide state/statistics, refresh, or other external tools.
 
-Compare `project_id` exactly with the active workflow project before invoking the board. Missing or
-mismatched identity must create no event and must not disclose the active project ID. Reject unknown
-top-level arguments server-side. Valid calls use the live serialized board writer, an agent actor,
-and a per-MCP-session/request idempotency key so retransmission of one JSON-RPC request creates at
-most one canonical task event. A fresh tool invocation creates a new task.
+All three strict object schemas require `project_id` and reject additional properties. Compare the
+value exactly with the active workflow project before validating or processing any other argument.
+Missing or mismatched identity must return an `isError=true` tool result, create no event, and must
+not disclose the active project ID. Creation retains its live serialized board-writer mutation and
+per-MCP-session/request idempotency key, so retransmission of one JSON-RPC request creates at most
+one canonical task event. The two read tools are read-only, non-destructive, idempotent, and
+closed-world. Expected validation, lookup, project, and workflow failures are safe `isError=true`
+text results; unexpected failures use a generic safe error.
+
+`symphony_task_get` accepts an exact human identifier and returns a compact actionable task view with
+status/column names, criteria evidence/history, stage selections, resolved `{id, identifier}`
+dependencies, branch, a safe `{number, url, draft}` pull-request projection or `null`, active run
+ID, timestamps, aggregate task statistics, the three newest compact runs, and the ten newest compact
+events. Runs and events use `{items, total, truncated}` envelopes. Run activity is limited to the
+existing safe activity summary; workpads, workspace paths, raw task metadata/source/GitHub maps, raw
+event payloads, persistence/idempotency metadata, and protocol data remain private. Archived tasks
+remain directly addressable; absent tasks return `task_not_found`.
+
+`symphony_tasks_by_state` accepts an exact, case-sensitive workflow column ID. Tool discovery
+advertises the active workflow's column IDs as the state enum. It searches current, non-archived
+tasks only and preserves canonical priority/rank/number order. Each result contains only the lean
+task fields, status, resolved dependency references, branch, and safe pull-request projection.
 
 The MCP route runs before general Phoenix body parsing, binds only through the UI's loopback server,
 and accepts only localhost Host and Origin values. It has no independent port or listener lifecycle.
@@ -269,26 +286,15 @@ Replace the read-only dashboard with a loopback-only LiveView application:
 - Human moves are limited to configured transition edges; stopping/cancelling active work requires confirmation.
 - Header health covers workflow validity/pending activation, lease, board projection/history, remote sync, GitHub, per-task workpad publication failures, Codex catalog, and workers.
 - Kanban cards show per-task token, agent-time, and turn summaries. Project and task totals include archived history and overlay active telemetry without changing canonical events.
-- Model and model-stage summaries reuse the same effective runs, combine effort levels, count distinct all-time and active thread IDs, and preserve missing dimensions as Unknown. The `/stats` HTML view additionally renders effort-level summaries beneath each model-stage row, while the public stats JSON remains model/stage-shaped. Completed-task participation counts distinct current or archived Done tasks per group only for runs with a canonical start time or an effective session ID, deduplicates within each model aggregate, and is intentionally non-additive across models and stages.
+- Model and model-stage summaries reuse the same effective runs, combine effort levels, count distinct all-time and active thread IDs, and preserve missing dimensions as Unknown. The `/stats` HTML view additionally renders effort-level summaries beneath each model-stage row, while the internal stats snapshot remains model/stage-shaped. Completed-task participation counts distinct current or archived Done tasks per group only for runs with a canonical start time or an effective session ID, deduplicates within each model aggregate, and is intentionally non-additive across models and stages.
 - Sum reported input, cached-input, output, and total fields independently. Mark aggregates complete, partial, or unavailable; cached input is a subset of input, partial totals are lower bounds, and authoritative zero remains distinct from missing usage.
 - Agent time sums run durations and may exceed project age or current service uptime under concurrency. Project age begins at the earliest claim; uptime, safe latest activity, and per-worker rate limits reset with the orchestrator.
-- `/mcp`: Streamable HTTP MCP sharing the configured UI port and exposing only guarded Backlog task creation.
+- `/mcp`: Streamable HTTP MCP sharing the configured UI port and exposing only the three guarded task tools.
 
-Keep JSON APIs read-only and loopback-only:
-
-- `GET /api/v1/state`
-- `GET /api/v1/tasks/:identifier`
-- `POST /api/v1/refresh`
-
-`GET /api/v1/state` includes a `stats` snapshot with counts, project/runtime summaries, active runs,
-and per-task totals. `GET /api/v1/tasks/:identifier` includes aggregate `stats` and adds
-`effective_stats` plus optional safe `activity` to each run without replacing canonical run `stats`.
-Workpad content remains private to the loopback HTML task view and run-scoped tool boundary and is
-not included in either public JSON response.
-
-LiveView calls the board context directly, and there is no general-purpose mutation REST API. The
-loopback MCP route is the only external model-facing write interface and is constrained by its exact
-project-ID guard and one-tool allowlist.
+There is no REST JSON API. Former `/api/v1/state`, `/api/v1/tasks/:identifier`, and
+`/api/v1/refresh` paths fall through to the generic `404 not_found` response for every HTTP method.
+LiveView calls the board context directly, and the loopback MCP route is the only machine-facing
+protocol endpoint, constrained by its exact project-ID guard and three-tool allowlist.
 
 Expose a public Elixir boundary with adjacent specs:
 
@@ -312,7 +318,7 @@ Update CLI behavior:
 ### Clean removal
 
 - Delete Linear client/adapter/issue modules, tracker adapters, `linear_graphql`, Linear-specific tests/live fixtures, API-key/project config, and the repository Linear skill.
-- Rename issue terminology to task throughout runtime state, logs, APIs, UI, and templates.
+- Rename issue terminology to task throughout runtime state, logs, interfaces, UI, and templates.
 - Remove tracker polling and retry queues.
 - Replace the checked-in workflow with `WORKFLOW.yml`, shared policy/context prompts, stage prompts, and stage workpad templates.
 - Update the root specification, root README, Elixir README, AGENTS instructions, logging documentation, token accounting, and PR/live-test instructions in the same change.
@@ -329,13 +335,17 @@ Add targeted coverage for:
 - Actor-aware transitions and all external-effect saga crash windows.
 - Local and SSH worktree creation/reuse/removal, path/symlink safety, branch collisions, dirty worktrees, source fetch failures, and terminal cleanup.
 - Run-scoped dynamic-tool schemas, current/prior invocation selection, completed/failed/stopped same-task prior-workpad reads, active/cross-task isolation, expected revisions, call-id idempotency, transition requirements, and follow-up creation.
-- Shared-listener MCP handshake/tool discovery, exact-path dispatch, project-ID fail-closed behavior, Host/Origin rejection, canonical task creation, and per-request idempotency.
+- Shared-listener MCP handshake/tool discovery for exactly three tools, strict schemas and read
+  annotations, dynamic state enum discovery, exact-path dispatch, project-ID fail-closed behavior,
+  safe task/run/event projections, Host/Origin rejection, canonical task creation, and per-request
+  idempotency.
 - Orchestrator claim/on-claim behavior, stage handoffs, no-retry blocking, orphan recovery, human stop, GitHub-wait exception, capacity, and dependency gating.
 - Cumulative-only token extraction, camel/snake-case token fields, cached tokens, high-water behavior, unique turns, telemetry migration/recovery/cleanup, terminal stats for completion/stop/failure, and `null` unavailable usage.
 - Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, meaningful-diff draft PR creation including documentation-only and zero-diff cases, publication markers, readiness prerequisites, rework-to-draft, cancellation, and merge validation.
 - Creator-run PR-body routing, existing workpad-comment routing before or after finalization, unpublished failed-run locality, retry-after-GitHub-failure, and crash-after-publication idempotency.
 - LiveView creation/editing, model selectors, drag/reorder, invalid transitions, active-stop confirmation, Blocked resume, archive, and health states.
-- Read-only API response compatibility and method rejection.
+- Former REST paths returning generic 404s for every method, LiveView routing, and the complete MCP
+  contract including bounded history and raw-data exclusion.
 
 Replace the Linear live E2E with:
 
@@ -355,7 +365,7 @@ Run targeted tests during implementation, then `mix specs.check` and the full `m
 - One active Symphony instance owns one project.
 - The source repository is GitHub-hosted; Git, `gh`, and Codex are installed and authenticated where needed.
 - Board remotes are optional; local-only operation is fully supported.
-- Board UI/API/MCP bind only to loopback and require no authentication in v1.
+- Board UI/MCP bind only to loopback and require no authentication in v1.
 - Workpads are intentionally less durable than task/event history.
 - There is no historical token backfill; only runs finalized after this behavior is deployed have complete stats. Cached-input tokens are shown separately and remain a subset of input tokens.
 - User-facing workflow configuration has no schema-version field; internal SQLite migrations and event-format compatibility remain implementation details.

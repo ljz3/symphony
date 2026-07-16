@@ -2,6 +2,7 @@ defmodule SymphonyElixirWebTest do
   use ExUnit.Case, async: false
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
+  import Plug.Conn, only: [put_req_header: 3]
 
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.{Commands, Projection}
@@ -16,7 +17,7 @@ defmodule SymphonyElixirWebTest do
     :ok
   end
 
-  test "renders the Kanban, task detail, archive, and read-only JSON routes" do
+  test "renders the Kanban, task detail, archive, and generic former-API 404s" do
     {task, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Web")})
 
     board = build_conn() |> get("/")
@@ -29,16 +30,22 @@ defmodule SymphonyElixirWebTest do
     assert html_response(build_conn() |> get("/archive"), 200) =~ "Archive"
     assert html_response(build_conn() |> get("/stats"), 200) =~ "Symphony stats"
 
-    state = build_conn() |> get("/api/v1/state")
-    assert json_response(state, 200)["project"] == %{"id" => "symphony", "key" => "SYM"}
-    assert get_in(json_response(state, 200), ["stats", "project", "token_usage_state"]) in ["complete", "partial", "unavailable"]
+    former_api_paths = [
+      "/api/v1/state",
+      "/api/v1/tasks/#{task["identifier"]}",
+      "/api/v1/refresh"
+    ]
 
-    task_response = build_conn() |> get("/api/v1/tasks/#{task["identifier"]}")
-    assert json_response(task_response, 200)["task"]["id"] == task["id"]
-    assert json_response(task_response, 200)["stats"]["run_count"] == 0
+    Enum.each(former_api_paths, fn path ->
+      Enum.each([:get, :post, :put, :patch, :delete, :head, :options], fn method ->
+        response = former_api_request(method, path)
+        assert response.status == 404
 
-    assert json_response(build_conn() |> post("/api/v1/state"), 405)["error"]["code"] == "method_not_allowed"
-    assert json_response(build_conn() |> post("/api/v1/refresh"), 202) == %{"accepted" => true}
+        if method != :head do
+          assert json_response(response, 404)["error"]["code"] == "not_found"
+        end
+      end)
+    end)
   end
 
   test "LiveView creation enforces the complete task form" do
@@ -61,7 +68,7 @@ defmodule SymphonyElixirWebTest do
     assert path =~ "/tasks/SYM-"
   end
 
-  test "live run telemetry appears in task, stats, board, and JSON surfaces" do
+  test "live run telemetry appears in task, stats, and board surfaces" do
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Live telemetry")})
     {todo, _result} = BoardFactory.move(created, "todo")
 
@@ -144,23 +151,6 @@ defmodule SymphonyElixirWebTest do
     assert detail =~ "1,000"
     assert detail =~ "Copy session ID"
 
-    response = build_conn() |> get("/api/v1/tasks/#{created["identifier"]}") |> json_response(200)
-    assert response["stats"]["token_usage"]["total_tokens"] == 1_000
-    assert hd(response["runs"])["stats"] == nil
-    assert hd(response["runs"])["effective_stats"]["source"] == "live"
-    assert hd(response["runs"])["effective_stats"]["token_usage"]["cached_input_tokens"] == 600
-
-    state = build_conn() |> get("/api/v1/state") |> json_response(200)
-    model = Enum.find(state["stats"]["models"], &(&1["model"] == run["model"]))
-    stage = Enum.find(model["stages"], &(&1["stage_id"] == run["stage_id"]))
-    refute Map.has_key?(stage, "efforts")
-    assert state["stats"]["counts"]["session_count"] >= 1
-    assert model["session_count"] >= 1
-    assert model["active_session_count"] >= 1
-    assert model["active_run_count"] >= 1
-    assert stage["active_session_count"] >= 1
-    assert stage["token_usage"]["total_tokens"] >= 1_000
-
     assert {:ok, _result} =
              Board.execute(
                %Commands.RunFailed{task_id: running["id"], run_id: run["id"], reason: :test_cleanup},
@@ -170,7 +160,7 @@ defmodule SymphonyElixirWebTest do
              )
   end
 
-  test "task HTML renders every workpad invocation for completed, failed, and stopped runs without exposing content in JSON" do
+  test "task HTML renders every workpad invocation for completed, failed, and stopped runs" do
     Enum.each(["completed", "failed", "stopped"], fn status ->
       {task, run, contents} = terminal_run_with_workpads(status)
       detail = html_response(build_conn() |> get("/tasks/#{task["identifier"]}"), 200)
@@ -181,14 +171,6 @@ defmodule SymphonyElixirWebTest do
       assert detail =~ "Invocation 2"
       assert detail =~ Enum.at(contents, 0)
       assert detail =~ Enum.at(contents, 1)
-
-      payload =
-        build_conn()
-        |> get("/api/v1/tasks/#{task["identifier"]}")
-        |> json_response(200)
-        |> Jason.encode!()
-
-      Enum.each(contents, &refute(payload =~ &1))
     end)
   end
 
@@ -196,6 +178,16 @@ defmodule SymphonyElixirWebTest do
     assert {:error, {:non_loopback_http_host, "0.0.0.0"}} =
              HttpServer.start_link(host: "0.0.0.0", port: 0)
   end
+
+  defp former_api_request(:get, path), do: get(build_conn(), path)
+  defp former_api_request(:post, path), do: post(json_conn(), path, "{}")
+  defp former_api_request(:put, path), do: put(json_conn(), path, "{}")
+  defp former_api_request(:patch, path), do: patch(json_conn(), path, "{}")
+  defp former_api_request(:delete, path), do: delete(build_conn(), path)
+  defp former_api_request(:head, path), do: head(build_conn(), path)
+  defp former_api_request(:options, path), do: options(build_conn(), path)
+
+  defp json_conn, do: put_req_header(build_conn(), "content-type", "application/json")
 
   defp terminal_run_with_workpads(status) do
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("#{status} HTML workpad")})

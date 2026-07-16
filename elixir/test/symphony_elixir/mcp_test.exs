@@ -17,20 +17,60 @@ defmodule SymphonyElixir.MCPTest do
     :ok
   end
 
-  test "performs the MCP handshake and advertises only guarded task creation" do
+  test "performs the MCP handshake and advertises exactly the three guarded task tools" do
     session_id = initialize_session()
     response = request(session_id, 2, "tools/list", %{})
 
     assert response.status == 200
-    assert %{"result" => %{"tools" => [tool]}} = json_response(response, 200)
-    assert tool["name"] == "symphony_task_create"
-    assert tool["inputSchema"]["additionalProperties"] == false
-    assert tool["inputSchema"]["required"] == ["project_id", "title", "type", "brief", "acceptance_criteria"]
-    assert tool["inputSchema"]["properties"]["project_id"]["type"] == "string"
-    assert tool["annotations"]["readOnlyHint"] == false
-    assert tool["annotations"]["destructiveHint"] == false
-    assert tool["annotations"]["idempotentHint"] == false
-    assert tool["annotations"]["openWorldHint"] == false
+    assert %{"result" => %{"tools" => tools}} = json_response(response, 200)
+
+    assert Enum.map(tools, & &1["name"]) == [
+             "symphony_task_create",
+             "symphony_task_get",
+             "symphony_tasks_by_state"
+           ]
+
+    assert Enum.all?(tools, &(&1["inputSchema"]["additionalProperties"] == false))
+
+    create = Enum.at(tools, 0)
+    assert create["inputSchema"]["required"] == ["project_id", "title", "type", "brief", "acceptance_criteria"]
+    assert create["inputSchema"]["properties"]["project_id"]["type"] == "string"
+    assert create["annotations"]["readOnlyHint"] == false
+    assert create["annotations"]["destructiveHint"] == false
+    assert create["annotations"]["idempotentHint"] == false
+    assert create["annotations"]["openWorldHint"] == false
+
+    get_tool = Enum.at(tools, 1)
+    assert get_tool["inputSchema"]["required"] == ["project_id", "identifier"]
+
+    assert get_tool["annotations"] == %{
+             "title" => "Get Symphony task",
+             "readOnlyHint" => true,
+             "destructiveHint" => false,
+             "idempotentHint" => true,
+             "openWorldHint" => false
+           }
+
+    state_tool = Enum.at(tools, 2)
+    assert state_tool["inputSchema"]["required"] == ["project_id", "state"]
+
+    assert state_tool["inputSchema"]["properties"]["state"]["enum"] == [
+             "backlog",
+             "todo",
+             "in_progress",
+             "automated_review",
+             "human_review",
+             "rework",
+             "merging",
+             "blocked",
+             "done",
+             "cancelled"
+           ]
+
+    assert state_tool["annotations"]["readOnlyHint"] == true
+    assert state_tool["annotations"]["destructiveHint"] == false
+    assert state_tool["annotations"]["idempotentHint"] == true
+    assert state_tool["annotations"]["openWorldHint"] == false
 
     close_session(session_id)
   end
@@ -67,8 +107,119 @@ defmodule SymphonyElixir.MCPTest do
       )
 
     assert listed.status == 200
-    assert get_in(listed.body, ["result", "tools"]) |> Enum.map(& &1["name"]) == ["symphony_task_create"]
+
+    assert get_in(listed.body, ["result", "tools"]) |> Enum.map(& &1["name"]) == [
+             "symphony_task_create",
+             "symphony_task_get",
+             "symphony_tasks_by_state"
+           ]
+
     assert Req.delete!(url, headers: session_headers).status == 200
+  end
+
+  test "gets an actionable task view without raw task, GitHub, or workpad data" do
+    {dependency, _} = BoardFactory.create_task(%{title: BoardFactory.unique("MCP dependency")})
+
+    {task, _} =
+      BoardFactory.create_task(%{
+        title: BoardFactory.unique("MCP lookup"),
+        dependencies: [dependency["id"]],
+        stage_selections: %{"implementation" => %{"model" => "gpt-5.5", "effort" => "xhigh"}}
+      })
+
+    session_id = initialize_session()
+
+    payload =
+      call_tool(session_id, 40, "symphony_task_get", %{
+        "project_id" => "symphony",
+        "identifier" => task["identifier"]
+      })
+
+    assert payload["task"] == %{
+             "id" => task["id"],
+             "identifier" => task["identifier"],
+             "title" => task["title"],
+             "type" => "feature",
+             "priority" => "normal",
+             "status" => %{
+               "column_id" => "backlog",
+               "column_name" => "Backlog",
+               "runtime_state" => nil,
+               "blocked_from_column_id" => nil,
+               "desired_column_id" => nil
+             },
+             "brief" => task["brief"],
+             "acceptance_criteria" => task["acceptance_criteria"],
+             "stage_selections" => task["stage_selections"],
+             "dependencies" => [%{"id" => dependency["id"], "identifier" => dependency["identifier"]}],
+             "branch" => task["branch"],
+             "pull_request" => nil,
+             "active_run_id" => nil,
+             "created_at" => task["created_at"],
+             "updated_at" => task["updated_at"],
+             "archived_at" => nil
+           }
+
+    assert payload["stats"]["run_count"] == 0
+    assert payload["runs"] == %{"items" => [], "total" => 0, "truncated" => false}
+    assert payload["events"]["total"] == 1
+    assert length(payload["events"]["items"]) == 1
+
+    event = hd(payload["events"]["items"])
+    assert Map.keys(event) |> Enum.sort() == ["actor", "run_id", "sequence", "task_revision", "timestamp", "type"]
+    refute Map.has_key?(event, "payload")
+    refute Map.has_key?(event, "idempotency_key")
+    refute Map.has_key?(payload["task"], "source")
+    refute Map.has_key?(payload["task"], "github")
+    refute Map.has_key?(payload["task"], "metadata")
+    refute Jason.encode!(payload) =~ "workspace_path"
+    refute Jason.encode!(payload) =~ "workpad"
+
+    close_session(session_id)
+  end
+
+  test "lists current tasks by exact workflow state in canonical order" do
+    {archived, _} = BoardFactory.create_task(%{title: BoardFactory.unique("MCP archived")})
+    {cancelled, _} = BoardFactory.move(archived, "cancelled")
+
+    assert {:ok, %{"task" => archived_task}} =
+             Board.execute(%SymphonyElixir.Board.Commands.ArchiveTask{task_id: cancelled["id"]},
+               actor: :human,
+               expected_revision: cancelled["revision"],
+               idempotency_key: BoardFactory.unique("mcp-archive")
+             )
+
+    {current, _} = BoardFactory.create_task(%{title: BoardFactory.unique("MCP current")})
+    session_id = initialize_session()
+
+    payload =
+      call_tool(session_id, 50, "symphony_tasks_by_state", %{
+        "project_id" => "symphony",
+        "state" => "backlog"
+      })
+
+    assert payload["state"] == %{"id" => "backlog", "name" => "Backlog"}
+    assert payload["count"] == length(payload["tasks"])
+    assert Enum.any?(payload["tasks"], &(&1["id"] == current["id"]))
+    refute Enum.any?(payload["tasks"], &(&1["id"] == archived_task["id"]))
+
+    listed = Enum.find(payload["tasks"], &(&1["id"] == current["id"]))
+
+    assert Map.keys(listed) |> Enum.sort() == [
+             "branch",
+             "dependencies",
+             "id",
+             "identifier",
+             "priority",
+             "pull_request",
+             "status",
+             "title",
+             "type"
+           ]
+
+    assert Map.keys(listed["status"]) |> Enum.sort() == ["column_id", "column_name", "runtime_state"]
+
+    close_session(session_id)
   end
 
   test "creates one canonical Backlog task and deduplicates a repeated MCP request" do
@@ -77,8 +228,8 @@ defmodule SymphonyElixir.MCPTest do
     before_events = length(Board.events())
     arguments = valid_arguments(BoardFactory.unique("Created through MCP"))
 
-    first = call_tool(session_id, 10, arguments)
-    second = call_tool(session_id, 10, arguments)
+    first = call_tool(session_id, 10, "symphony_task_create", arguments)
+    second = call_tool(session_id, 10, "symphony_task_create", arguments)
 
     assert first == second
     assert %{"event_type" => "task_created", "task" => task_result} = first
@@ -108,22 +259,79 @@ defmodule SymphonyElixir.MCPTest do
     before_events = length(Board.events())
     valid = valid_arguments(BoardFactory.unique("Rejected MCP task"))
 
-    mismatch = call_tool_error(session_id, 20, %{valid | "project_id" => "another-project"})
+    mismatch =
+      call_tool_error(session_id, 20, "symphony_task_create", %{valid | "project_id" => "another-project"})
+
     assert mismatch["error"]["code"] == "project_id_mismatch"
     refute mismatch["error"]["message"] =~ "symphony"
 
-    missing = call_tool_error(session_id, 21, Map.delete(valid, "project_id"))
+    missing = call_tool_error(session_id, 21, "symphony_task_create", Map.delete(valid, "project_id"))
     assert missing["error"]["code"] == "project_id_mismatch"
 
-    unknown = call_tool_error(session_id, 22, Map.put(valid, "unexpected", true))
+    unknown = call_tool_error(session_id, 22, "symphony_task_create", Map.put(valid, "unexpected", true))
     assert unknown["error"]["code"] == "invalid_arguments"
     assert unknown["error"]["message"] =~ "unexpected"
 
-    invalid = call_tool_error(session_id, 23, Map.put(valid, "type", "Incident"))
+    invalid = call_tool_error(session_id, 23, "symphony_task_create", Map.put(valid, "type", "Incident"))
     assert invalid["error"]["code"] == "invalid_arguments"
 
     assert length(Board.tasks()) == before_tasks
     assert length(Board.events()) == before_events
+
+    close_session(session_id)
+  end
+
+  test "guards every read tool before validating other arguments" do
+    {task, _} = BoardFactory.create_task(%{title: BoardFactory.unique("MCP guard")})
+    session_id = initialize_session()
+
+    read_calls = [
+      {"symphony_task_get", %{"project_id" => "symphony", "identifier" => task["identifier"]}},
+      {"symphony_tasks_by_state", %{"project_id" => "symphony", "state" => "backlog"}}
+    ]
+
+    Enum.each(read_calls, fn {name, arguments} ->
+      mismatch =
+        call_tool_error(
+          session_id,
+          System.unique_integer([:positive]),
+          name,
+          Map.put(arguments, "project_id", "other")
+        )
+
+      assert mismatch["error"]["code"] == "project_id_mismatch"
+      refute mismatch["error"]["message"] =~ "symphony"
+
+      missing =
+        call_tool_error(
+          session_id,
+          System.unique_integer([:positive]),
+          name,
+          Map.delete(arguments, "project_id")
+        )
+
+      assert missing["error"]["code"] == "project_id_mismatch"
+
+      unknown =
+        call_tool_error(
+          session_id,
+          System.unique_integer([:positive]),
+          name,
+          Map.put(arguments, "unexpected", true)
+        )
+
+      assert unknown["error"]["code"] == "invalid_arguments"
+    end)
+
+    assert call_tool_error(session_id, 61, "symphony_task_get", %{
+             "project_id" => "symphony",
+             "identifier" => "SYM-999999"
+           })["error"]["code"] == "task_not_found"
+
+    assert call_tool_error(session_id, 62, "symphony_tasks_by_state", %{
+             "project_id" => "symphony",
+             "state" => "BACKLOG"
+           })["error"]["code"] == "unknown_state"
 
     close_session(session_id)
   end
@@ -188,10 +396,10 @@ defmodule SymphonyElixir.MCPTest do
     )
   end
 
-  defp call_tool(session_id, id, arguments) do
+  defp call_tool(session_id, id, name, arguments) do
     response =
       request(session_id, id, "tools/call", %{
-        "name" => "symphony_task_create",
+        "name" => name,
         "arguments" => arguments
       })
 
@@ -200,10 +408,10 @@ defmodule SymphonyElixir.MCPTest do
     body |> get_in(["result", "content"]) |> List.first() |> Map.fetch!("text") |> Jason.decode!()
   end
 
-  defp call_tool_error(session_id, id, arguments) do
+  defp call_tool_error(session_id, id, name, arguments) do
     response =
       request(session_id, id, "tools/call", %{
-        "name" => "symphony_task_create",
+        "name" => name,
         "arguments" => arguments
       })
 

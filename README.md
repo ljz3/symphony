@@ -17,7 +17,8 @@ Symphony separates durable task authority from rebuildable runtime state:
 - SQLite is the replaceable local board/workpad projection; private versioned sidecars outside the
   runtime database are authoritative for non-canonical local workpad history and publication state.
 - Phoenix LiveView serves the loopback-only Kanban board, task editor, and live project statistics.
-- The same loopback listener exposes one guarded MCP tool for creating Backlog tasks from Codex.
+- The same loopback listener exposes exactly three guarded MCP task tools for Codex: creation,
+  exact task lookup, and current-task listing by workflow state.
 - One persistent Git worktree and immutable branch belong to each task.
 - A service-owned `gh` client creates draft pull requests, publishes workpads, checks review
   readiness, and verifies merges. Publish-only transitions are accepted only after their workpad

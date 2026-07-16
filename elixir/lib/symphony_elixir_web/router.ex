@@ -1,5 +1,5 @@
 defmodule SymphonyElixirWeb.Router do
-  @moduledoc "Loopback-only Kanban UI and read-only JSON API router."
+  @moduledoc "Loopback-only Kanban UI router."
 
   use Phoenix.Router
   import Phoenix.LiveView.Router
@@ -30,14 +30,6 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
-    get("/api/v1/state", BoardApiController, :state)
-    get("/api/v1/tasks/:identifier", BoardApiController, :task)
-    post("/api/v1/refresh", BoardApiController, :refresh)
-
-    match(:*, "/", BoardApiController, :method_not_allowed)
-    match(:*, "/api/v1/state", BoardApiController, :method_not_allowed)
-    match(:*, "/api/v1/tasks/:identifier", BoardApiController, :method_not_allowed)
-    match(:*, "/api/v1/refresh", BoardApiController, :method_not_allowed)
-    match(:*, "/*path", BoardApiController, :not_found)
+    match(:*, "/*path", NotFoundController, :not_found)
   end
 end

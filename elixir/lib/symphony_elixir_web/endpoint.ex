@@ -1,6 +1,6 @@
 defmodule SymphonyElixirWeb.Endpoint do
   @moduledoc """
-  Phoenix endpoint for Symphony's loopback Kanban UI and read-only API.
+  Phoenix endpoint for Symphony's loopback Kanban UI and MCP transport.
   """
 
   use Phoenix.Endpoint, otp_app: :symphony_elixir

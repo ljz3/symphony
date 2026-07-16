@@ -19,7 +19,8 @@ Include these fields whenever they apply:
 - `run_id`: durable stage-run UUID.
 - `stage_id`: named workflow stage.
 - `session_id`: Codex thread ID, or the established thread/turn correlation value.
-- `mcp_request_key`: non-sensitive hash used to correlate one MCP JSON-RPC request and its idempotent replay.
+- `mcp_request_key`: non-sensitive hash used to correlate one MCP JSON-RPC request; creation also
+  uses its session/request hash for idempotent replay.
 - `worker_host`: `local` or the selected SSH host.
 
 For canonical board writes and recovery, also include:
@@ -51,8 +52,9 @@ For external effects, include the durable saga/effect identifier and PR number w
 - `AgentRunner`: invocation start/completion/blocking with task/run/stage/worker context and
   `session_id` once known.
 - `Codex.AppServer`: session/turn lifecycle and protocol errors with task/run/session context.
-- `MCP.Handler`: guarded task-creation completion/failure with MCP session/request correlation and
-  created task identifiers; never log tool arguments or task content.
+- `MCP.Handler`: guarded completion/failure for the three external task tools with MCP
+  session/request correlation; never log tool arguments, task content, task briefs, workpads, or
+  raw lookup/list results. Creation retains its hashed session/request idempotency key.
 - `Worktree`: managed path, branch, source head, hook, cleanup, and safety rejection with task and
   worker context.
 - `Board.Sync` and `GitHub`: remote/OID state, publication wait, readiness gates, and PR effects.

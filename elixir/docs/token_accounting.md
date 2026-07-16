@@ -209,7 +209,7 @@ Track usage per active Codex thread.
 For each thread, keep:
 
 - `absolute_total`: latest accepted absolute total snapshot
-- `accumulated_total`: the total you expose in UI/API
+- `accumulated_total`: the total you expose in the UI and permitted MCP task views
 - `last_seen_turn_id`
 
 ### Preferred source order
@@ -269,7 +269,7 @@ When reading raw app-server events:
 - `codex/event/token_count`
   - useful if you are inspecting nested `info.total_token_usage`
 - `thread/tokenUsage/updated`
-  - best source for live board and API totals
+  - best source for live board and permitted MCP task-view totals
 - `turn/completed`
   - best used as end-of-turn state, not as an unconditional additive token event
 
@@ -331,13 +331,15 @@ The board builds effective run statistics without adding a second durable accoun
 - Rate limits are retained per local/SSH worker. Activity summaries expose bounded lifecycle labels,
   never raw prompts, reasoning, command output, workpads, or arbitrary protocol payloads.
 
-`GET /api/v1/state` exposes project/runtime/task summaries under `stats`, plus model summaries with
-nested stage summaries and project session/completion counts. Effort summaries are private to the
-HTML stats view. Task responses retain canonical run
-`stats` and add `effective_stats` plus optional safe `activity` for live display.
+Project-wide state and statistics remain internal to the LiveView/UI boundaries. The external
+`symphony_task_get` MCP tool exposes only aggregate task `stats` plus compact run projections with
+`effective_stats` and optional safe `activity`; it does not expose project-wide totals, session IDs,
+workspaces, workpads, or canonical run payloads. Its history is bounded to the three newest runs and
+ten newest events, with `{items, total, truncated}` envelopes. `symphony_tasks_by_state` exposes no
+statistics and returns only the lean current-task fields documented by the MCP contract.
 
 Completed, stopped, and failed runs expose duration, turn count, and cumulative usage through the
-board/API. After termination, the run that created the PR is appended once to the managed PR body;
+board and permitted MCP task views. After termination, the run that created the PR is appended once to the managed PR body;
 other runs are appended once to the existing GitHub comment identified by their workpad publication
 marker. Runs without a published workpad remain local. Hidden per-run markers make GitHub retries
 idempotent, and a successful destination/publication ID/timestamp is recorded canonically. Symphony
