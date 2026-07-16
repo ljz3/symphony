@@ -94,7 +94,7 @@ defmodule SymphonyElixir.AgentRunner do
          {:ok, run} <- Board.run(context.run_id),
          :ok <- validate_scope(task, run),
          prompt <- turn_prompt(task, run, turn, context.opts),
-         {:ok, _turn_result} <-
+         {:ok, %{session: active_session}} <-
            AppServer.run_turn(session, prompt, task,
              on_message:
                message_handler(
@@ -104,6 +104,15 @@ defmodule SymphonyElixir.AgentRunner do
                  context.worktree,
                  run["worker_host"]
                ),
+             on_session_reconnected: fn reconnected_session ->
+               notify_session(
+                 context.recipient,
+                 task,
+                 run,
+                 reconnected_session,
+                 context.worktree
+               )
+             end,
              dynamic_tool_opts: [
                task_id: context.task_id,
                run_id: context.run_id,
@@ -121,7 +130,7 @@ defmodule SymphonyElixir.AgentRunner do
           finish_run(refreshed, context.run_id, %{turns: turn, transitioned_to: refreshed.column_id})
 
         true ->
-          do_run_turns(session, context, turn + 1)
+          do_run_turns(active_session, context, turn + 1)
       end
     else
       {:error, :graceful_stop_requested} ->

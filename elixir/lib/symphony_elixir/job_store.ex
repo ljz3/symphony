@@ -87,13 +87,16 @@ defmodule SymphonyElixir.JobStore do
   def result(record) when is_map(record) do
     case File.read(record["stdout_path"]) do
       {:ok, output} ->
+        {encoded_output, output_encoding} = encode_output(output)
+
         {:ok,
          %{
            "job_id" => record["job_id"],
            "job" => record["job"],
            "status" => record["status"],
            "exit_code" => record["exit_code"],
-           "output" => output,
+           "output" => encoded_output,
+           "output_encoding" => output_encoding,
            "stderr_artifact" => record["stderr_artifact"],
            "started_at" => record["started_at"],
            "finished_at" => record["finished_at"],
@@ -104,6 +107,10 @@ defmodule SymphonyElixir.JobStore do
       {:error, reason} ->
         {:error, {:job_stdout_unreadable, record["job_id"], record["stdout_path"], reason}}
     end
+  end
+
+  defp encode_output(output) do
+    if String.valid?(output), do: {output, "utf8"}, else: {Base.encode64(output), "base64"}
   end
 
   defp read_record(path) do

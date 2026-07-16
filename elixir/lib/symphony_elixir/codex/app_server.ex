@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @model_list_id 4
+  @thread_resume_id 5
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -26,6 +27,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
+          environment: %{optional(String.t()) => String.t()},
           dynamic_tool_specs: [map()]
         }
 
@@ -33,7 +35,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   def run(workspace, prompt, task, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
       try do
-        run_turn(session, prompt, task, opts)
+        case run_turn(session, prompt, task, opts) do
+          {:ok, %{session: active_session} = turn_result} ->
+            if active_session.port != session.port, do: stop_session(active_session)
+            {:ok, Map.delete(turn_result, :session)}
+
+          other ->
+            other
+        end
       after
         stop_session(session)
       end
@@ -68,6 +77,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
+           environment: environment,
            dynamic_tool_specs: dynamic_tool_specs
          }}
       else
@@ -108,12 +118,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           model: model,
           thread_id: thread_id,
           workspace: workspace
-        },
+        } = session,
         prompt,
         task,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    on_session_reconnected = Keyword.get(opts, :on_session_reconnected, fn _session -> :ok end)
     dynamic_tool_opts = Keyword.get(opts, :dynamic_tool_opts, [])
 
     tool_executor =
@@ -140,15 +151,16 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(
-               port,
+        case await_turn_with_reconnect(
+               session,
                thread_id,
                turn_id,
                on_message,
                tool_executor,
-               auto_approve_requests
+               auto_approve_requests,
+               on_session_reconnected
              ) do
-          {:ok, result} ->
+          {:ok, result, active_session} ->
             Logger.info("Codex session completed for #{task_context(task)} session_id=#{session_id}")
 
             {:ok,
@@ -158,10 +170,13 @@ defmodule SymphonyElixir.Codex.AppServer do
                thread_id: thread_id,
                turn_id: turn_id,
                effort: effort,
-               model: model
+               model: model,
+               session: active_session
              }}
 
-          {:error, reason} ->
+          {:error, reason, active_session} ->
+            if active_session.port != session.port, do: stop_session(active_session)
+
             Logger.warning("Codex session ended with error for #{task_context(task)} session_id=#{session_id}: #{inspect(reason)}")
 
             emit_message(
@@ -458,6 +473,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp resume_thread(port, thread_id) do
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" => %{"threadId" => thread_id}
+    })
+
+    case await_response(port, @thread_resume_id) do
+      {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} ->
+        {:ok, thread}
+
+      {:ok, %{"thread" => thread}} ->
+        {:error, {:resumed_thread_mismatch, thread_id, thread}}
+
+      {:ok, payload} ->
+        {:error, {:invalid_thread_resume_payload, payload}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp maybe_put_model(params, nil), do: params
   defp maybe_put_model(params, model), do: Map.put(params, "model", model)
 
@@ -521,6 +558,166 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     receive_loop(port, "", context)
   end
+
+  defp await_turn_with_reconnect(
+         session,
+         thread_id,
+         turn_id,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         on_session_reconnected
+       ) do
+    case await_turn_completion(
+           session.port,
+           thread_id,
+           turn_id,
+           on_message,
+           tool_executor,
+           auto_approve_requests
+         ) do
+      {:ok, result} ->
+        {:ok, result, session}
+
+      {:error, reason} ->
+        reconnect_turn(
+          session,
+          thread_id,
+          turn_id,
+          reason,
+          on_message,
+          tool_executor,
+          auto_approve_requests,
+          on_session_reconnected
+        )
+    end
+  end
+
+  defp reconnect_turn(
+         session,
+         thread_id,
+         turn_id,
+         reason,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         on_session_reconnected
+       ) do
+    if reconnectable_transport_error?(reason) do
+      case resume_session(session) do
+        {:ok, resumed_session, thread} ->
+          case notify_session_reconnected(on_session_reconnected, resumed_session) do
+            :ok ->
+              continue_resumed_turn(
+                resumed_session,
+                thread,
+                thread_id,
+                turn_id,
+                on_message,
+                tool_executor,
+                auto_approve_requests,
+                on_session_reconnected
+              )
+
+            {:error, callback_reason} ->
+              stop_session(resumed_session)
+              {:error, {:app_server_reconnect_callback_failed, callback_reason}, session}
+          end
+
+        {:error, reconnect_reason} ->
+          {:error, {:app_server_reconnect_failed, reason, reconnect_reason}, session}
+      end
+    else
+      {:error, reason, session}
+    end
+  end
+
+  defp continue_resumed_turn(
+         resumed_session,
+         thread,
+         thread_id,
+         turn_id,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         on_session_reconnected
+       ) do
+    case resumed_turn_result(thread, turn_id) do
+      {:terminal, {:ok, result}} ->
+        {:ok, result, resumed_session}
+
+      {:terminal, {:error, reason}} ->
+        {:error, reason, resumed_session}
+
+      :active ->
+        await_turn_with_reconnect(
+          resumed_session,
+          thread_id,
+          turn_id,
+          on_message,
+          tool_executor,
+          auto_approve_requests,
+          on_session_reconnected
+        )
+    end
+  end
+
+  defp resume_session(session) do
+    stop_port(session.port)
+
+    with {:ok, port} <- start_port(session.workspace, session.worker_host, session.environment) do
+      result =
+        try do
+          with :ok <- send_initialize(port),
+               {:ok, thread} <- resume_thread(port, session.thread_id) do
+            {:ok, %{session | port: port, metadata: port_metadata(port, session.worker_host)}, thread}
+          end
+        rescue
+          error -> {:error, {:app_server_resume_exception, Exception.message(error)}}
+        end
+
+      case result do
+        {:ok, _session, _thread} = success ->
+          success
+
+        {:error, _reason} = error ->
+          stop_port(port)
+          error
+      end
+    end
+  end
+
+  defp notify_session_reconnected(callback, session) when is_function(callback, 1) do
+    case callback.(session) do
+      :ok -> :ok
+      other -> {:error, other}
+    end
+  rescue
+    error -> {:error, {:callback_exception, Exception.message(error)}}
+  end
+
+  defp resumed_turn_result(%{"turns" => turns}, turn_id) when is_list(turns) do
+    case Enum.find(turns, &(Map.get(&1, "id") == turn_id)) do
+      %{"status" => "completed"} ->
+        {:terminal, {:ok, :turn_completed}}
+
+      %{"status" => "failed"} = turn ->
+        {:terminal, {:error, {:turn_failed, Map.get(turn, "error")}}}
+
+      %{"status" => status} = turn when status in ["interrupted", "cancelled"] ->
+        {:terminal, {:error, {:turn_interrupted, turn}}}
+
+      _ ->
+        :active
+    end
+  end
+
+  defp resumed_turn_result(_thread, _turn_id), do: :active
+
+  defp reconnectable_transport_error?({:port_exit, _status}), do: true
+  defp reconnectable_transport_error?(:port_closed), do: true
+  defp reconnectable_transport_error?({:tool_result_delivery_failed, _call_id, _reason}), do: true
+  defp reconnectable_transport_error?(_reason), do: false
 
   defp receive_loop(port, pending_line, context) do
     receive do
@@ -799,6 +996,9 @@ defmodule SymphonyElixir.Codex.AppServer do
       :approved ->
         continue_receiving(port, context)
 
+      {:transport_lost, reason} ->
+        {:error, reason}
+
       :approval_required ->
         emit_message(
           on_message,
@@ -878,21 +1078,21 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> execute_dynamic_tool(tool_name, arguments, call_metadata)
       |> normalize_dynamic_tool_result()
 
-    send_message(port, %{
-      "id" => id,
-      "result" => result
-    })
+    case deliver_message(port, %{"id" => id, "result" => result}) do
+      :ok ->
+        event =
+          case result do
+            %{"success" => true} -> :tool_call_completed
+            _ when is_nil(tool_name) -> :unsupported_tool_call
+            _ -> :tool_call_failed
+          end
 
-    event =
-      case result do
-        %{"success" => true} -> :tool_call_completed
-        _ when is_nil(tool_name) -> :unsupported_tool_call
-        _ -> :tool_call_failed
-      end
+        emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
+        :approved
 
-    emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
-
-    :approved
+      {:error, reason} ->
+        {:transport_lost, {:tool_result_delivery_failed, id, reason}}
+    end
   end
 
   defp maybe_handle_approval_request(
@@ -1386,6 +1586,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+  end
+
+  defp deliver_message(port, message) do
+    case send_message(port, message) do
+      true -> :ok
+      false -> {:error, :port_closed}
+    end
+  rescue
+    ArgumentError -> {:error, :port_closed}
   end
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true

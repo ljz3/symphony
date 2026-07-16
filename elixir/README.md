@@ -270,13 +270,18 @@ agent-facing status, sleep, tail, or polling tool. Fixed and passthrough argumen
 argument vector, relative executables resolve in the managed worktree, and bare executables use the
 configured `PATH`. Symphony injects managed task/run/job identity, writes stdout and stderr to
 owner-only durable artifacts while the process runs, and returns complete stdout without a byte or
-line cap. Stderr remains an artifact instead of being injected into model context.
+line cap. UTF-8 stdout is returned verbatim; arbitrary binary stdout is returned losslessly as
+Base64, distinguished by `output_encoding`. Stderr remains an artifact instead of being injected
+into model context. Source identity includes HEAD, complete staged and unstaged binary diffs, and
+the paths and contents of untracked files.
 
 The job store records identity before spawning. Delivery of the same run/call ID reattaches to or
-replays that job, while identical active task/job/arguments/source requests single-flight. A service
-restart marks an unrecoverable running record `interrupted`, never timed out. Explicit run
-cancellation terminates the job process group, with bounded force escalation used only after that
-human cancellation request.
+replays that job, while identical active task/job/arguments/source requests single-flight. A dropped
+app-server transport resumes the same thread and active turn; a re-delivered call replays the durable
+result without a second OS process or model continuation. A service restart marks an unrecoverable
+running record `interrupted`, never timed out. Explicit run cancellation terminates the job process
+group, with bounded force escalation used only after that human cancellation request; local or
+remote signal delivery never blocks cancellation progress.
 
 `symphony_workpad_read` defaults to the active run and selected invocation. It may also select an
 explicit completed, failed, or stopped prior run of the same task; prompt handoffs retain each

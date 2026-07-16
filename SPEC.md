@@ -239,11 +239,17 @@ literal passthrough arguments in the managed worktree. Substitute only the exact
 
 Persist the job record before spawn and stream stdout/stderr to owner-only artifacts without output
 caps. The terminal result returns complete stdout, the stderr artifact location, status/exit code,
-timestamps, elapsed observational metadata, and the source fingerprint. Namespace delivery
+timestamps, elapsed observational metadata, and the source fingerprint. Valid UTF-8 stdout is
+returned verbatim with `output_encoding: utf8`; otherwise every byte is returned as Base64 with
+`output_encoding: base64`. The source fingerprint covers HEAD, the complete staged and unstaged
+binary diffs, and length-framed untracked paths, types, and contents. Namespace delivery
 idempotency by run/call ID and single-flight identical active task/job/normalized-arguments/source
-requests. Reattach while the service and run remain alive; after unrecoverable recovery mark a
+requests. If the app-server transport disconnects while a blocking call is pending, resume the same
+thread and active turn and replay the same durable call result; do not start a second OS job or a new
+model turn. Reattach while the service and run remain alive; after unrecoverable recovery mark a
 running record `interrupted`, never timed out. Explicit run cancellation terminates the supervised
-process group, with force escalation allowed only as cancellation policy.
+process group, with force escalation allowed only as cancellation policy; signal delivery must not
+block the worker or delay terminal cancellation.
 
 Agents cannot edit the running task contract or reopen criteria. `symphony_workpad_read` defaults to the current run/invocation and may select only completed, failed, or stopped prior runs with the same task ID; cross-task and active prior-run reads are rejected. Prior-run reads retain run, stage, status, finish-time, and invocation metadata with the content. Human UI actions use the same command validator and event writer.
 

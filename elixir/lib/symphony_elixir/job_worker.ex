@@ -14,6 +14,21 @@ defmodule SymphonyElixir.JobWorker do
   wait "$child"
   exit $?
   """
+  @remote_wrapper """
+  set -e
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    export "$1"
+    shift
+  done
+  [ "$#" -gt 0 ] || exit 125
+  shift
+  set -m
+  "$@" > "$SYMPHONY_JOB_STDOUT" 2> "$SYMPHONY_JOB_STDERR" &
+  child=$!
+  printf 'child:%s\n' "$child"
+  wait "$child"
+  exit $?
+  """
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -50,6 +65,7 @@ defmodule SymphonyElixir.JobWorker do
       workspace: request.workspace,
       worker_host: request.worker_host,
       port: nil,
+      transport_pid: nil,
       child_pgid: nil,
       cancel_requested: false,
       escalation_timer: nil,
@@ -62,22 +78,21 @@ defmodule SymphonyElixir.JobWorker do
   @impl true
   def handle_continue(:start, %{worker_host: nil} = state) do
     case open_local_port(state) do
-      {:ok, port} -> {:noreply, %{state | port: port}}
+      {:ok, port} -> {:noreply, attach_port(state, port)}
       {:error, reason} -> stop_with_terminal(state, "interrupted", nil, reason)
     end
   end
 
   def handle_continue(:start, state) do
     case open_remote_port(state) do
-      {:ok, port} -> {:noreply, %{state | port: port}}
+      {:ok, port} -> {:noreply, attach_port(state, port)}
       {:error, reason} -> stop_with_terminal(state, "interrupted", nil, reason)
     end
   end
 
   @impl true
   def handle_cast(:cancel, state) do
-    state = %{state | cancel_requested: true}
-    {:noreply, maybe_signal_group(state, "TERM")}
+    {:noreply, request_cancel(state)}
   end
 
   @impl true
@@ -107,11 +122,17 @@ defmodule SymphonyElixir.JobWorker do
   end
 
   def handle_info({:escalate_cancel, job_id}, %{record: %{"job_id" => job_id}} = state) do
-    {:noreply, maybe_signal_group(%{state | escalation_timer: nil}, "KILL")}
+    state =
+      state
+      |> Map.put(:escalation_timer, nil)
+      |> signal_group_async("KILL")
+      |> signal_transport("KILL")
+
+    stop_with_terminal(state, "cancelled", nil, :cancel_escalated)
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{manager_ref: ref} = state) do
-    state = state |> Map.put(:cancel_requested, true) |> maybe_signal_group("TERM")
+    state = request_cancel(state)
     {:stop, :normal, state}
   end
 
@@ -123,10 +144,14 @@ defmodule SymphonyElixir.JobWorker do
 
     if is_port(state.port) and Port.info(state.port) do
       unless state.terminal_sent do
-        _ = maybe_signal_group(%{state | cancel_requested: true}, "KILL")
+        _ =
+          state
+          |> Map.put(:cancel_requested, true)
+          |> signal_group_async("KILL")
+          |> signal_transport("KILL")
       end
 
-      Port.close(state.port)
+      close_port(state.port)
     end
 
     :ok
@@ -164,10 +189,10 @@ defmodule SymphonyElixir.JobWorker do
       |> Map.put("SYMPHONY_JOB_STDOUT", remote_stdout)
       |> Map.put("SYMPHONY_JOB_STDERR", remote_stderr)
 
-    exports =
+    environment_arguments =
       environment
       |> Enum.sort_by(&elem(&1, 0))
-      |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
+      |> Enum.map(fn {key, value} -> "#{key}=#{value}" end)
 
     command =
       [
@@ -176,7 +201,8 @@ defmodule SymphonyElixir.JobWorker do
         "> #{shell_escape(remote_stdout)}",
         "> #{shell_escape(remote_stderr)}",
         "cd #{shell_escape(state.workspace)}",
-        "env #{exports} bash -c #{shell_escape(@wrapper)} symphony-job #{shell_join([state.executable | state.argv])}"
+        "/bin/bash -c #{shell_escape(@remote_wrapper)} symphony-job " <>
+          shell_join(environment_arguments ++ ["--", state.executable | state.argv])
       ]
       |> Enum.join(" && ")
 
@@ -187,7 +213,7 @@ defmodule SymphonyElixir.JobWorker do
     case Integer.parse(String.trim(pid)) do
       {pgid, ""} when pgid > 0 ->
         state = %{state | child_pgid: pgid}
-        if state.cancel_requested, do: maybe_signal_group(state, "TERM"), else: state
+        if state.cancel_requested, do: signal_group_async(state, "TERM"), else: state
 
       _ ->
         state
@@ -196,17 +222,34 @@ defmodule SymphonyElixir.JobWorker do
 
   defp handle_control_line(_line, state), do: state
 
-  defp maybe_signal_group(%{child_pgid: nil} = state, _signal), do: state
+  defp request_cancel(state) do
+    state
+    |> Map.put(:cancel_requested, true)
+    |> schedule_escalation()
+    |> signal_group_async("TERM")
+  end
 
-  defp maybe_signal_group(state, signal) do
-    _ = signal_process_group(state.child_pgid, signal, state.worker_host)
+  defp schedule_escalation(%{escalation_timer: nil} = state) do
+    timer = Process.send_after(self(), {:escalate_cancel, state.record["job_id"]}, @cancel_escalation_ms)
+    %{state | escalation_timer: timer}
+  end
 
-    if signal == "TERM" and is_nil(state.escalation_timer) do
-      timer = Process.send_after(self(), {:escalate_cancel, state.record["job_id"]}, @cancel_escalation_ms)
-      %{state | escalation_timer: timer}
-    else
-      state
-    end
+  defp schedule_escalation(state), do: state
+
+  defp signal_group_async(%{child_pgid: nil} = state, _signal), do: state
+
+  defp signal_group_async(state, signal) do
+    pgid = state.child_pgid
+    worker_host = state.worker_host
+    _ = Task.start(fn -> signal_process_group(pgid, signal, worker_host) end)
+    state
+  end
+
+  defp signal_transport(%{transport_pid: nil} = state, _signal), do: state
+
+  defp signal_transport(state, signal) do
+    _ = signal_process(state.transport_pid, signal)
+    state
   end
 
   defp signal_process_group(pgid, signal, nil) do
@@ -218,6 +261,31 @@ defmodule SymphonyElixir.JobWorker do
 
   defp signal_process_group(pgid, signal, worker_host) do
     SSH.run(worker_host, "kill -#{signal} -- -#{pgid}")
+  end
+
+  defp signal_process(pid, signal) do
+    kill = if File.exists?("/bin/kill"), do: "/bin/kill", else: System.find_executable("kill")
+
+    case kill do
+      nil -> {:error, :kill_not_found}
+      kill -> System.cmd(kill, ["-#{signal}", "--", to_string(pid)], stderr_to_stdout: true)
+    end
+  end
+
+  defp attach_port(state, port) do
+    transport_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+
+    %{state | port: port, transport_pid: transport_pid}
+  end
+
+  defp close_port(port) do
+    Port.close(port)
+  rescue
+    ArgumentError -> :ok
   end
 
   defp fetch_remote_artifacts(%{worker_host: nil}), do: :ok

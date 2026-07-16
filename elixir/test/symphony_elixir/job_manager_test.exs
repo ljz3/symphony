@@ -41,10 +41,11 @@ defmodule SymphonyElixir.JobManagerTest do
     assert {:ok, result} = JobManager.run(request)
 
     assert Map.keys(result) |> Enum.sort() ==
-             ~w(elapsed_ms exit_code finished_at job job_id output source_fingerprint started_at status stderr_artifact)
+             ~w(elapsed_ms exit_code finished_at job job_id output output_encoding source_fingerprint started_at status stderr_artifact)
 
     assert result["status"] == "completed"
     assert result["exit_code"] == 0
+    assert result["output_encoding"] == "utf8"
     assert String.starts_with?(result["output"], payload)
 
     assert result["output"] =~
@@ -108,6 +109,68 @@ defmodule SymphonyElixir.JobManagerTest do
              )
   end
 
+  test "source fingerprint covers every staged, unstaged, binary, renamed, deleted, and untracked byte", %{
+    workspace: workspace
+  } do
+    clean = JobManager.source_fingerprint(workspace, nil)
+
+    File.write!(Path.join(workspace, "tracked.txt"), "unstaged-one\n")
+    unstaged_one = JobManager.source_fingerprint(workspace, nil)
+    File.write!(Path.join(workspace, "tracked.txt"), "unstaged-two\n")
+    unstaged_two = JobManager.source_fingerprint(workspace, nil)
+
+    git!(workspace, ["add", "tracked.txt"])
+    staged_one = JobManager.source_fingerprint(workspace, nil)
+    File.write!(Path.join(workspace, "tracked.txt"), "staged-two\n")
+    git!(workspace, ["add", "tracked.txt"])
+    staged_two = JobManager.source_fingerprint(workspace, nil)
+
+    File.write!(Path.join(workspace, "tracked.txt"), <<0, 255, 1>>)
+    binary_one = JobManager.source_fingerprint(workspace, nil)
+    File.write!(Path.join(workspace, "tracked.txt"), <<0, 254, 1>>)
+    binary_two = JobManager.source_fingerprint(workspace, nil)
+
+    git!(workspace, ["restore", "--staged", "tracked.txt"])
+    git!(workspace, ["restore", "tracked.txt"])
+    tracked_path = Path.join(workspace, "tracked.txt")
+    moved_path = Path.join(System.tmp_dir!(), "fingerprint-deleted-#{System.unique_integer([:positive])}")
+    File.rename!(tracked_path, moved_path)
+
+    deleted =
+      try do
+        JobManager.source_fingerprint(workspace, nil)
+      after
+        File.rename!(moved_path, tracked_path)
+      end
+
+    git!(workspace, ["mv", "tracked.txt", "renamed.txt"])
+    renamed = JobManager.source_fingerprint(workspace, nil)
+
+    git!(workspace, ["reset", "--hard", "HEAD"])
+    untracked_path = Path.join(workspace, "untracked.bin")
+    File.write!(untracked_path, <<1, 0, 255>>)
+    untracked_one = JobManager.source_fingerprint(workspace, nil)
+    File.write!(untracked_path, <<2, 0, 255>>)
+    untracked_two = JobManager.source_fingerprint(workspace, nil)
+
+    fingerprints = [
+      clean,
+      unstaged_one,
+      unstaged_two,
+      staged_one,
+      staged_two,
+      binary_one,
+      binary_two,
+      deleted,
+      renamed,
+      untracked_one,
+      untracked_two
+    ]
+
+    assert Enum.all?(fingerprints, &is_binary/1)
+    assert Enum.uniq(fingerprints) == fingerprints
+  end
+
   test "runs on a configured worker and returns remote artifacts locally", %{workspace: workspace} do
     original_path = System.get_env("PATH")
     fake_bin = Path.join(workspace, "fake-ssh-bin")
@@ -136,6 +199,216 @@ defmodule SymphonyElixir.JobManagerTest do
     assert result["status"] == "completed"
     assert result["output"] == "remote:literal;value"
     assert File.read!(result["stderr_artifact"]) == "remote stderr"
+  end
+
+  test "remote execution resolves the project command with a project-only PATH", %{workspace: workspace} do
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(workspace, "path-fake-ssh")
+    project_bin = Path.join(workspace, "project-bin")
+    File.mkdir_p!(fake_bin)
+    File.mkdir_p!(project_bin)
+
+    write_script!(fake_bin, "ssh", """
+    #!/bin/sh
+    for argument in "$@"; do command=$argument; done
+    exec /bin/sh -c "$command"
+    """)
+
+    name = "remote-project-job"
+
+    write_script!(project_bin, name, """
+    #!/bin/sh
+    printf 'project PATH works'
+    """)
+
+    System.put_env("PATH", fake_bin <> ":" <> original_path)
+    on_exit(fn -> System.put_env("PATH", original_path) end)
+
+    request =
+      request(workspace,
+        executable: name,
+        passthrough_policy: :forbidden,
+        environment: %{"PATH" => project_bin}
+      )
+      |> Map.put(:worker_host, "fake-worker")
+
+    assert {:ok, result} = JobManager.run(request)
+    assert result["status"] == "completed"
+    assert result["output"] == "project PATH works"
+  end
+
+  @tag timeout: 15_000
+  test "cancel before a remote child control line still reaches terminal cancelled", %{workspace: workspace} do
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(workspace, "silent-fake-ssh")
+    ssh_pid = Path.join(workspace, "silent-ssh.pid")
+    File.mkdir_p!(fake_bin)
+
+    write_script!(fake_bin, "ssh", """
+    #!/bin/sh
+    printf '%s' "$$" > "$FAKE_SSH_PID_FILE"
+    exec /bin/sleep 300
+    """)
+
+    System.put_env("PATH", fake_bin <> ":" <> original_path)
+    System.put_env("FAKE_SSH_PID_FILE", ssh_pid)
+
+    on_exit(fn ->
+      System.put_env("PATH", original_path)
+      System.delete_env("FAKE_SSH_PID_FILE")
+      kill_pid_file(ssh_pid)
+    end)
+
+    run_id = "cancel-before-child-#{Ecto.UUID.generate()}"
+
+    request =
+      request(workspace, executable: "./never-runs", passthrough_policy: :forbidden)
+      |> Map.put(:run_id, run_id)
+      |> Map.put(:worker_host, "silent-worker")
+
+    job = Task.async(fn -> JobManager.run(request) end)
+    eventually(fn -> File.exists?(ssh_pid) end)
+    transport_pid = ssh_pid |> File.read!() |> String.trim()
+    assert process_alive?(transport_pid)
+    assert :ok = JobManager.cancel_run(run_id)
+    assert {:ok, {:ok, result}} = Task.yield(job, 8_000)
+    assert result["status"] == "cancelled"
+    eventually(fn -> not process_alive?(transport_pid) end)
+  end
+
+  @tag timeout: 30_000
+  test "a hanging remote TERM signal cannot block force escalation or descendant cleanup", %{workspace: workspace} do
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(workspace, "hanging-signal-ssh")
+    signal_pid = Path.join(workspace, "signal-ssh.pid")
+    child_pid_path = Path.join(workspace, "remote-child.pid")
+    File.mkdir_p!(fake_bin)
+
+    write_script!(fake_bin, "ssh", """
+    #!/bin/sh
+    for argument in "$@"; do command=$argument; done
+    case "$command" in
+      *"kill -TERM"*)
+        printf '%s' "$$" > "$FAKE_SIGNAL_PID_FILE"
+        exec /bin/sleep 300
+        ;;
+      *) exec /bin/sh -c "$command" ;;
+    esac
+    """)
+
+    write_script!(workspace, "remote-tree.sh", """
+    #!/bin/sh
+    sleep 300 &
+    child=$!
+    printf '%s' "$child" > "$1"
+    wait "$child"
+    """)
+
+    System.put_env("PATH", fake_bin <> ":" <> original_path)
+    System.put_env("FAKE_SIGNAL_PID_FILE", signal_pid)
+
+    on_exit(fn ->
+      System.put_env("PATH", original_path)
+      System.delete_env("FAKE_SIGNAL_PID_FILE")
+      kill_pid_file(signal_pid)
+      kill_pid_file(child_pid_path)
+    end)
+
+    run_id = "hanging-signal-#{Ecto.UUID.generate()}"
+
+    request =
+      request(workspace, executable: "./remote-tree.sh", passthrough: [child_pid_path])
+      |> Map.put(:run_id, run_id)
+      |> Map.put(:worker_host, "signal-worker")
+
+    job = Task.async(fn -> JobManager.run(request) end)
+    eventually(fn -> File.exists?(child_pid_path) end, 400)
+    child_pid = child_pid_path |> File.read!() |> String.trim()
+    assert process_alive?(child_pid)
+    assert :ok = JobManager.cancel_run(run_id)
+    eventually(fn -> File.exists?(signal_pid) end)
+
+    assert {:ok, {:ok, result}} = Task.yield(job, 8_000)
+    assert result["status"] == "cancelled"
+    eventually(fn -> not process_alive?(child_pid) end, 400)
+  end
+
+  @tag timeout: 30_000
+  test "a failed remote TERM signal cannot prevent force escalation or descendant cleanup", %{
+    workspace: workspace
+  } do
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(workspace, "failed-signal-ssh")
+    signal_marker = Path.join(workspace, "failed-signal-attempted")
+    child_pid_path = Path.join(workspace, "failed-signal-child.pid")
+    File.mkdir_p!(fake_bin)
+
+    write_script!(fake_bin, "ssh", """
+    #!/bin/sh
+    for argument in "$@"; do command=$argument; done
+    case "$command" in
+      *"kill -TERM"*)
+        printf attempted > "$FAKE_SIGNAL_MARKER"
+        exit 47
+        ;;
+      *) exec /bin/sh -c "$command" ;;
+    esac
+    """)
+
+    write_script!(workspace, "failed-signal-tree.sh", """
+    #!/bin/sh
+    sleep 300 &
+    child=$!
+    printf '%s' "$child" > "$1"
+    wait "$child"
+    """)
+
+    System.put_env("PATH", fake_bin <> ":" <> original_path)
+    System.put_env("FAKE_SIGNAL_MARKER", signal_marker)
+
+    on_exit(fn ->
+      System.put_env("PATH", original_path)
+      System.delete_env("FAKE_SIGNAL_MARKER")
+      kill_pid_file(child_pid_path)
+    end)
+
+    run_id = "failed-signal-#{Ecto.UUID.generate()}"
+
+    request =
+      request(workspace, executable: "./failed-signal-tree.sh", passthrough: [child_pid_path])
+      |> Map.put(:run_id, run_id)
+      |> Map.put(:worker_host, "failed-signal-worker")
+
+    job = Task.async(fn -> JobManager.run(request) end)
+    eventually(fn -> File.exists?(child_pid_path) end, 400)
+    child_pid = child_pid_path |> File.read!() |> String.trim()
+    assert process_alive?(child_pid)
+    assert :ok = JobManager.cancel_run(run_id)
+    eventually(fn -> File.exists?(signal_marker) end)
+
+    assert {:ok, {:ok, result}} = Task.yield(job, 8_000)
+    assert result["status"] == "cancelled"
+    eventually(fn -> not process_alive?(child_pid) end, 400)
+  end
+
+  test "encodes invalid UTF-8 stdout losslessly instead of truncating or raising", %{workspace: workspace} do
+    write_script!(workspace, "binary-output.sh", """
+    #!/bin/sh
+    printf '\\377\\000A'
+    """)
+
+    assert {:ok, result} =
+             JobManager.run(
+               request(workspace,
+                 executable: "./binary-output.sh",
+                 passthrough_policy: :forbidden
+               )
+             )
+
+    assert result["status"] == "completed"
+    assert result["output_encoding"] == "base64"
+    assert {:ok, <<255, 0, 65>>} = Base.decode64(result["output"])
+    assert is_binary(Jason.encode!(result))
   end
 
   test "same call is durable-idempotent and identical active calls single-flight", %{workspace: workspace} do
@@ -287,6 +560,15 @@ defmodule SymphonyElixir.JobManagerTest do
 
   defp process_alive?(pid) do
     match?({_, 0}, System.cmd("kill", ["-0", pid], stderr_to_stdout: true))
+  end
+
+  defp kill_pid_file(path) do
+    if File.exists?(path) do
+      pid = path |> File.read!() |> String.trim()
+      System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+    end
+
+    :ok
   end
 
   defp result_call_id(root, job_id) do

@@ -11,6 +11,23 @@ defmodule SymphonyElixir.JobManager do
 
   alias SymphonyElixir.{JobStore, JobSupervisor, Paths, SSH, Workflow}
 
+  @git_diff_args ["--binary", "--full-index", "--no-ext-diff", "--no-textconv"]
+  @remote_fingerprint_wrapper """
+  set -euo pipefail
+  export LC_ALL=C
+  cd -- "$1"
+
+  printf 'head %s\n' "$(git rev-parse --verify HEAD)"
+  printf 'staged %s\n' "$(git diff --cached --binary --full-index --no-ext-diff --no-textconv | git hash-object --stdin)"
+  printf 'unstaged %s\n' "$(git diff --binary --full-index --no-ext-diff --no-textconv | git hash-object --stdin)"
+
+  while IFS= read -r -d '' path; do
+    path_hash=$(printf '%s' "$path" | git hash-object --stdin)
+    content_hash=$(git hash-object --no-filters -- "$path")
+    printf 'untracked %s %s\n' "$path_hash" "$content_hash"
+  done < <(git ls-files --others --exclude-standard -z)
+  """
+
   defmodule State do
     @moduledoc false
     defstruct root: nil,
@@ -60,24 +77,34 @@ defmodule SymphonyElixir.JobManager do
   @spec source_fingerprint(Path.t(), String.t() | nil) :: String.t() | {:error, term()}
   def source_fingerprint(workspace, nil) when is_binary(workspace) do
     with git when is_binary(git) <- System.find_executable("git"),
-         {head, 0} <- System.cmd(git, ["-C", workspace, "rev-parse", "HEAD"], stderr_to_stdout: true),
-         {status, 0} <-
-           System.cmd(git, ["-C", workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all"], stderr_to_stdout: true) do
-      fingerprint(head, status)
+         {:ok, head} <- git_output(git, workspace, ["rev-parse", "--verify", "HEAD"]),
+         {:ok, staged} <- git_output(git, workspace, ["diff", "--cached" | @git_diff_args]),
+         {:ok, unstaged} <- git_output(git, workspace, ["diff" | @git_diff_args]),
+         {:ok, untracked_paths} <-
+           git_output(git, workspace, ["ls-files", "--others", "--exclude-standard", "-z"]),
+         {:ok, untracked} <- untracked_components(workspace, untracked_paths) do
+      fingerprint_components([
+        {"head", head},
+        {"staged_diff", staged},
+        {"unstaged_diff", unstaged}
+        | untracked
+      ])
     else
       nil -> {:error, :git_not_found}
-      {output, exit_code} -> {:error, {:source_fingerprint_failed, exit_code, output}}
+      {:error, reason} -> {:error, {:source_fingerprint_failed, reason}}
     end
+  rescue
+    error -> {:error, {:source_fingerprint_failed, Exception.message(error)}}
   end
 
   def source_fingerprint(workspace, worker_host)
       when is_binary(workspace) and is_binary(worker_host) do
     command =
-      "cd #{shell_escape(workspace)} && " <>
-        "git rev-parse HEAD && git status --porcelain=v1 --untracked-files=all"
+      "/bin/bash -c #{shell_escape(@remote_fingerprint_wrapper)} " <>
+        "symphony-source-fingerprint #{shell_escape(workspace)}"
 
     case SSH.run(worker_host, command) do
-      {:ok, {output, 0}} -> fingerprint(output, "remote")
+      {:ok, {output, 0}} -> fingerprint_components([{"remote_git_state", output}])
       {:ok, {output, exit_code}} -> {:error, {:source_fingerprint_failed, worker_host, exit_code, output}}
       {:error, reason} -> {:error, reason}
     end
@@ -550,8 +577,61 @@ defmodule SymphonyElixir.JobManager do
   defp substitute_job_id("$SYMPHONY_JOB_ID", job_id), do: job_id
   defp substitute_job_id(argument, _job_id), do: argument
 
-  defp fingerprint(head, status) do
-    :crypto.hash(:sha256, IO.iodata_to_binary([head, <<0>>, status]))
+  defp git_output(git, workspace, arguments) do
+    case System.cmd(git, ["-C", workspace | arguments], stderr_to_stdout: true) do
+      {output, 0} -> {:ok, output}
+      {output, exit_code} -> {:error, {:git_failed, exit_code, output}}
+    end
+  end
+
+  defp untracked_components(workspace, paths) do
+    paths
+    |> :binary.split(<<0>>, [:global])
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.sort()
+    |> Enum.reduce_while({:ok, []}, fn path, {:ok, components} ->
+      case untracked_identity(Path.join(workspace, path)) do
+        {:ok, type, content} ->
+          {:cont,
+           {:ok,
+            [
+              {"untracked_content", content},
+              {"untracked_type", type},
+              {"untracked_path", path}
+              | components
+            ]}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:untracked_file_unreadable, path, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp untracked_identity(path) do
+    with {:ok, stat} <- File.lstat(path) do
+      case stat.type do
+        :regular -> with {:ok, content} <- File.read(path), do: {:ok, "regular", content}
+        :symlink -> with {:ok, target} <- File.read_link(path), do: {:ok, "symlink", target}
+        type -> {:ok, Atom.to_string(type), <<>>}
+      end
+    end
+  end
+
+  defp fingerprint_components(components) do
+    components
+    |> Enum.reduce(:crypto.hash_init(:sha256), fn {tag, value}, context ->
+      :crypto.hash_update(context, [
+        <<byte_size(tag)::unsigned-big-integer-size(64)>>,
+        tag,
+        <<byte_size(value)::unsigned-big-integer-size(64)>>,
+        value
+      ])
+    end)
+    |> :crypto.hash_final()
     |> Base.encode16(case: :lower)
   end
 
