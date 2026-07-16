@@ -183,15 +183,45 @@ defmodule SymphonyElixir.BoardTest do
     assert get_in(drafted, ["github", "rework_draft", "completed"]) == true
     assert drafted["github"]["draft"] == true
 
+    assert {:ok, %{"task" => ready_again}} =
+             Board.execute(
+               %Commands.RecordGitHubOutcome{
+                 task_id: drafted["id"],
+                 kind: "ready",
+                 attrs: %{completed: true}
+               },
+               actor: %{type: :agent, identity: run["id"]},
+               expected_revision: drafted["revision"],
+               idempotency_key: BoardFactory.unique("github-ready-again")
+             )
+
+    assert ready_again["github"]["draft"] == false
+    refute Map.has_key?(ready_again["github"], "rework_draft")
+
+    assert {:ok, %{"task" => drafted_again}} =
+             Board.execute(
+               %Commands.RecordGitHubOutcome{
+                 task_id: ready_again["id"],
+                 kind: "rework_draft",
+                 attrs: %{completed: true}
+               },
+               actor: %{type: :agent, identity: run["id"]},
+               expected_revision: ready_again["revision"],
+               idempotency_key: BoardFactory.unique("github-draft-again")
+             )
+
+    assert drafted_again["github"]["draft"] == true
+    assert get_in(drafted_again, ["github", "rework_draft", "completed"]) == true
+
     assert {:ok, _result} =
              Board.execute(
                %Commands.RunFailed{
-                 task_id: drafted["id"],
+                 task_id: drafted_again["id"],
                  run_id: run["id"],
                  reason: "test cleanup"
                },
                actor: :system,
-               expected_revision: drafted["revision"],
+               expected_revision: drafted_again["revision"],
                idempotency_key: BoardFactory.unique("cleanup")
              )
   end

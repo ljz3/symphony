@@ -57,7 +57,9 @@ defmodule SymphonyElixir.Orchestrator do
               task_filter: nil,
               last_reconciled_at: nil,
               agent_runner: nil,
-              merge_runner: nil
+              merge_runner: nil,
+              rework_drafter: nil,
+              github_outcome_recorder: nil
 
     @type t :: %__MODULE__{}
   end
@@ -112,7 +114,9 @@ defmodule SymphonyElixir.Orchestrator do
        recover_orphans: Keyword.get(opts, :recover_orphans, true),
        task_filter: Keyword.get(opts, :task_filter),
        agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
-       merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3)
+       merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3),
+       rework_drafter: Keyword.get(opts, :rework_drafter),
+       github_outcome_recorder: Keyword.get(opts, :github_outcome_recorder)
      }}
   end
 
@@ -871,7 +875,8 @@ defmodule SymphonyElixir.Orchestrator do
     column = Bundle.column(bundle, task.column_id)
 
     not Task.archived?(task) and is_nil(task.runtime_state) and is_nil(task.active_run_id) and
-      match?(%{role: :dispatch}, column) and dependencies_done?(task, bundle)
+      match?(%{role: :dispatch}, column) and dependencies_done?(task, bundle) and
+      rework_draft_complete?(task)
   end
 
   @doc false
@@ -1306,8 +1311,10 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_rework_draft(State.t(), Task.t()) :: State.t()
   def reconcile_rework_draft(state, task) do
-    recorder = &record_github_outcome(&1, "rework_draft", %{completed: true})
-    reconcile_rework_draft(state, task, &convert_rework_to_draft/1, recorder)
+    drafter = state.rework_drafter || (&convert_rework_to_draft/1)
+    outcome_recorder = state.github_outcome_recorder || (&record_github_outcome/3)
+    recorder = &outcome_recorder.(&1, "rework_draft", %{completed: true})
+    reconcile_rework_draft(state, task, drafter, recorder)
   end
 
   @doc false
@@ -1319,13 +1326,13 @@ defmodule SymphonyElixir.Orchestrator do
         ) :: State.t()
   def reconcile_rework_draft(
         state,
-        %{column_id: "rework", active_run_id: nil, github: %{"number" => _number, "draft" => false}} = task,
+        %{column_id: "rework", active_run_id: nil, github: %{"number" => _number}} = task,
         drafter,
         recorder
       )
       when is_function(drafter, 1) and is_function(recorder, 1) do
-    unless get_in(task.github, ["rework_draft", "completed"]) == true do
-      with :ok <- drafter.(task),
+    unless rework_draft_complete?(task) do
+      with :ok <- maybe_convert_rework_to_draft(task, drafter),
            {:ok, _result} <- recorder.(task) do
         :ok
       else
@@ -1337,6 +1344,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def reconcile_rework_draft(state, _task, _drafter, _recorder), do: state
+
+  defp maybe_convert_rework_to_draft(%{github: %{"draft" => true}}, _drafter), do: :ok
+  defp maybe_convert_rework_to_draft(task, drafter), do: drafter.(task)
+
+  defp rework_draft_complete?(%{column_id: "rework", github: %{"number" => _number} = github}) do
+    github["draft"] == true and get_in(github, ["rework_draft", "completed"]) == true
+  end
+
+  defp rework_draft_complete?(_task), do: true
 
   defp convert_rework_to_draft(task) do
     {worktree, worker_host} = last_location(task)

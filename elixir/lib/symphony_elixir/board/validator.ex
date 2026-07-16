@@ -1003,7 +1003,7 @@ defmodule SymphonyElixir.Board.Validator do
   end
 
   defp project_github_outcome(github, "ready", %{"completed" => true}),
-    do: Map.put(github, "draft", false)
+    do: github |> Map.put("draft", false) |> Map.delete("rework_draft")
 
   defp project_github_outcome(github, "rework_draft", %{"completed" => true}),
     do: Map.put(github, "draft", true)
