@@ -8,6 +8,22 @@ defmodule SymphonyElixir.Workflow.Bundle do
 
   alias SymphonyElixir.AgentStage
 
+  defmodule Job do
+    @moduledoc "A validated project job definition."
+    @derive Jason.Encoder
+    @enforce_keys [:id, :executable, :arguments, :passthrough_arguments, :environment]
+    defstruct @enforce_keys
+
+    @type passthrough_arguments :: :required | :optional | :forbidden
+    @type t :: %__MODULE__{
+            id: String.t(),
+            executable: String.t(),
+            arguments: [String.t()],
+            passthrough_arguments: passthrough_arguments(),
+            environment: %{optional(String.t()) => String.t()}
+          }
+  end
+
   defmodule Column do
     @moduledoc "A workflow column."
     @derive Jason.Encoder
@@ -26,7 +42,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
       successful: false
     ]
 
-    @type role :: :dispatch | :pause | :blocked | :terminal
+    @type role :: :dispatch | :merge | :pause | :blocked | :terminal
     @type t :: %__MODULE__{
             id: String.t(),
             name: String.t(),
@@ -50,6 +66,9 @@ defmodule SymphonyElixir.Workflow.Bundle do
              :agent,
              :codex,
              :hooks,
+             :jobs,
+             :dispatch,
+             :merge,
              :columns,
              :human_transitions,
              :agent_transitions,
@@ -64,6 +83,9 @@ defmodule SymphonyElixir.Workflow.Bundle do
     :agent,
     :codex,
     :hooks,
+    :jobs,
+    :dispatch,
+    :merge,
     :base_prompt_path,
     :base_prompt,
     :context_prompt_path,
@@ -86,6 +108,9 @@ defmodule SymphonyElixir.Workflow.Bundle do
           agent: map(),
           codex: map(),
           hooks: map(),
+          jobs: %{optional(String.t()) => Job.t()},
+          dispatch: %{preflight: map() | nil},
+          merge: map() | nil,
           base_prompt_path: Path.t(),
           base_prompt: String.t(),
           context_prompt_path: Path.t(),
@@ -98,8 +123,14 @@ defmodule SymphonyElixir.Workflow.Bundle do
           loaded_at: String.t()
         }
 
-  @root_keys ~w(project source board agent codex prompts stages columns transitions hooks)
-  @roles %{"dispatch" => :dispatch, "pause" => :pause, "blocked" => :blocked, "terminal" => :terminal}
+  @root_keys ~w(project source board agent codex prompts stages columns transitions hooks jobs dispatch merge)
+  @roles %{
+    "dispatch" => :dispatch,
+    "merge" => :merge,
+    "pause" => :pause,
+    "blocked" => :blocked,
+    "terminal" => :terminal
+  }
 
   @spec load(map(), Path.t()) :: {:ok, t()} | {:error, term()}
   def load(config, path) when is_map(config) and is_binary(path) do
@@ -111,12 +142,15 @@ defmodule SymphonyElixir.Workflow.Bundle do
          {:ok, agent} <- parse_agent(config["agent"] || %{}),
          {:ok, codex} <- parse_codex(config["codex"] || %{}),
          {:ok, hooks} <- parse_hooks(config["hooks"] || %{}),
+         {:ok, jobs} <- parse_jobs(config["jobs"]),
+         {:ok, dispatch} <- parse_dispatch(config["dispatch"]),
          {:ok, prompts} <- parse_prompts(config["prompts"], path),
          {:ok, stages} <- parse_stages(config["stages"], path),
          {:ok, columns} <- parse_columns(config["columns"], stages),
+         {:ok, merge} <- parse_merge(config["merge"]),
          {:ok, human_transitions, agent_transitions} <-
            parse_transitions(config["transitions"], columns),
-         :ok <- validate_column_semantics(columns, stages) do
+         :ok <- validate_column_semantics(columns, stages, merge) do
       loaded_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
       hash = bundle_hash(config, prompts, stages)
 
@@ -129,6 +163,9 @@ defmodule SymphonyElixir.Workflow.Bundle do
          agent: agent,
          codex: codex,
          hooks: hooks,
+         jobs: jobs,
+         dispatch: dispatch,
+         merge: merge,
          base_prompt_path: prompts.base_path,
          base_prompt: prompts.base,
          context_prompt_path: prompts.context_path,
@@ -209,18 +246,16 @@ defmodule SymphonyElixir.Workflow.Bundle do
   end
 
   defp parse_agent(agent) do
-    keys = ~w(max_concurrent_agents max_turns_per_run ssh_hosts max_concurrent_agents_per_host)
+    keys = ~w(max_concurrent_agents ssh_hosts max_concurrent_agents_per_host)
 
-    with :ok <- validate_known_keys(agent, keys, "agent"),
+    with :ok <- reject_execution_limits(agent, ~w(max_turns_per_run), "agent"),
+         :ok <- validate_known_keys(agent, keys, "agent"),
          {:ok, concurrency} <- positive_integer(agent, "max_concurrent_agents", 4),
-         {:ok, max_turns} <- positive_integer(agent, "max_turns_per_run", 20),
          {:ok, hosts} <- string_list(agent, "ssh_hosts", []),
          {:ok, host_capacity} <- nullable_positive_integer(agent, "max_concurrent_agents_per_host") do
       {:ok,
        %{
          max_concurrent_agents: concurrency,
-         max_turns_per_run: max_turns,
-         max_turns: max_turns,
          ssh_hosts: hosts,
          max_concurrent_agents_per_host: host_capacity
        }}
@@ -228,43 +263,136 @@ defmodule SymphonyElixir.Workflow.Bundle do
   end
 
   defp parse_codex(codex) do
-    keys = ~w(command approval_policy sandbox network_access turn_timeout_ms read_timeout_ms stall_timeout_ms)
+    keys = ~w(command approval_policy sandbox network_access)
 
-    with :ok <- validate_known_keys(codex, keys, "codex"),
+    with :ok <-
+           reject_execution_limits(codex, ~w(turn_timeout_ms read_timeout_ms stall_timeout_ms), "codex"),
+         :ok <- validate_known_keys(codex, keys, "codex"),
          {:ok, command} <- optional_string(codex, "command", "codex app-server"),
          {:ok, sandbox} <- optional_string(codex, "sandbox", "workspace-write"),
-         {:ok, network_access} <- boolean(codex, "network_access", false),
-         {:ok, turn_timeout_ms} <- positive_integer(codex, "turn_timeout_ms", 3_600_000),
-         {:ok, read_timeout_ms} <- positive_integer(codex, "read_timeout_ms", 5_000),
-         {:ok, stall_timeout_ms} <- non_negative_integer(codex, "stall_timeout_ms", 300_000) do
+         {:ok, network_access} <- boolean(codex, "network_access", false) do
       {:ok,
        %{
          command: command,
          approval_policy: codex["approval_policy"] || "never",
          thread_sandbox: sandbox,
-         network_access: network_access,
-         turn_timeout_ms: turn_timeout_ms,
-         read_timeout_ms: read_timeout_ms,
-         stall_timeout_ms: stall_timeout_ms
+         network_access: network_access
        }}
     end
   end
 
   defp parse_hooks(hooks) do
-    keys = ~w(after_create before_run after_run before_remove timeout_ms)
+    keys = ~w(after_create before_run after_run before_remove)
 
-    with :ok <- validate_known_keys(hooks, keys, "hooks"),
-         {:ok, timeout_ms} <- positive_integer(hooks, "timeout_ms", 60_000) do
+    with :ok <- reject_execution_limits(hooks, ~w(timeout_ms), "hooks"),
+         :ok <- validate_known_keys(hooks, keys, "hooks") do
       {:ok,
        %{
          after_create: blank_to_nil(hooks["after_create"]),
          before_run: blank_to_nil(hooks["before_run"]),
          after_run: blank_to_nil(hooks["after_run"]),
-         before_remove: blank_to_nil(hooks["before_remove"]),
-         timeout_ms: timeout_ms
+         before_remove: blank_to_nil(hooks["before_remove"])
        }}
     end
   end
+
+  defp parse_jobs(nil), do: {:ok, %{}}
+
+  defp parse_jobs(%{} = jobs) do
+    jobs
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce_while({:ok, %{}}, fn {id, config}, {:ok, acc} ->
+      case parse_job(id, config) do
+        {:ok, job} -> {:cont, {:ok, Map.put(acc, id, job)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp parse_jobs(_jobs), do: {:error, :invalid_jobs}
+
+  defp parse_job(id, %{} = config) do
+    context = "jobs.#{id}"
+    keys = ~w(executable arguments passthrough_arguments environment)
+
+    with :ok <- valid_id(id, "job"),
+         :ok <- reject_execution_limits(config, ~w(timeout_ms max_output_bytes), context),
+         :ok <- validate_known_keys(config, keys, context),
+         {:ok, executable} <- required_string(config, "executable", "#{context}.executable"),
+         {:ok, arguments} <- job_arguments(config, id),
+         {:ok, passthrough_arguments} <- passthrough_arguments(config, id),
+         {:ok, environment} <- job_environment(config, id) do
+      {:ok,
+       %Job{
+         id: id,
+         executable: executable,
+         arguments: arguments,
+         passthrough_arguments: passthrough_arguments,
+         environment: environment
+       }}
+    end
+  end
+
+  defp parse_job(id, _config), do: {:error, {:invalid_job, id}}
+
+  defp parse_dispatch(nil), do: {:ok, %{preflight: nil}}
+
+  defp parse_dispatch(%{} = dispatch) do
+    with :ok <- validate_known_keys(dispatch, ~w(preflight), "dispatch"),
+         {:ok, preflight} <- parse_preflight(Map.get(dispatch, "preflight")) do
+      {:ok, %{preflight: preflight}}
+    end
+  end
+
+  defp parse_dispatch(_dispatch), do: {:error, :invalid_dispatch}
+
+  defp parse_preflight(nil), do: {:ok, nil}
+
+  defp parse_preflight(%{} = preflight) do
+    context = "dispatch.preflight"
+
+    with :ok <- reject_execution_limits(preflight, ~w(timeout_ms max_output_bytes), context),
+         :ok <- validate_known_keys(preflight, ~w(command retry_after_failure_ms), context),
+         {:ok, command} <- required_string(preflight, "command", "#{context}.command"),
+         {:ok, retry_after_failure_ms} <-
+           required_positive_integer(preflight, "retry_after_failure_ms", "#{context}.retry_after_failure_ms") do
+      {:ok, %{command: command, retry_after_failure_ms: retry_after_failure_ms}}
+    end
+  end
+
+  defp parse_preflight(_preflight), do: {:error, :invalid_dispatch_preflight}
+
+  defp parse_merge(nil), do: {:ok, nil}
+
+  defp parse_merge(%{} = merge) do
+    context = "merge"
+
+    with :ok <- reject_execution_limits(merge, ~w(timeout_ms readiness_timeout_ms max_output_bytes), context),
+         :ok <-
+           validate_known_keys(
+             merge,
+             ~w(method readiness_command review_column conflict_column),
+             context
+           ),
+         {:ok, "squash"} <- required_string(merge, "method", "#{context}.method"),
+         {:ok, readiness_command} <-
+           required_string(merge, "readiness_command", "#{context}.readiness_command"),
+         {:ok, review_column} <- required_string(merge, "review_column", "#{context}.review_column"),
+         {:ok, conflict_column} <- required_string(merge, "conflict_column", "#{context}.conflict_column") do
+      {:ok,
+       %{
+         method: :squash,
+         readiness_command: readiness_command,
+         review_column: review_column,
+         conflict_column: conflict_column
+       }}
+    else
+      {:ok, method} -> {:error, {:unsupported_merge_method, method}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_merge(_merge), do: {:error, :invalid_merge}
 
   defp parse_prompts(%{} = prompts, workflow_path) do
     with :ok <- validate_known_keys(prompts, ~w(base context), "prompts"),
@@ -418,7 +546,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
     end)
   end
 
-  defp validate_column_semantics(columns, stages) do
+  defp validate_column_semantics(columns, stages, merge) do
     initial = Enum.filter(columns, & &1.initial)
     blocked = Enum.filter(columns, &(&1.role == :blocked))
     done = Enum.filter(columns, & &1.satisfies_dependencies)
@@ -429,8 +557,38 @@ defmodule SymphonyElixir.Workflow.Bundle do
          :ok <- exactly_one(done, :dependency_satisfying_column),
          :ok <- at_most_one(ready, :mark_pr_ready_column),
          :ok <- validate_initial_column(List.first(initial)),
-         :ok <- validate_done_column(List.first(done)) do
+         :ok <- validate_done_column(List.first(done)),
+         :ok <- validate_merge_columns(columns, merge) do
       validate_on_claim(columns, stages)
+    end
+  end
+
+  defp validate_merge_columns(columns, nil) do
+    case Enum.filter(columns, &(&1.role == :merge)) do
+      [] -> :ok
+      merge_columns -> {:error, {:merge_columns_require_configuration, Enum.map(merge_columns, & &1.id)}}
+    end
+  end
+
+  defp validate_merge_columns(columns, merge) do
+    merge_columns = Enum.filter(columns, &(&1.role == :merge))
+
+    with :ok <- exactly_one(merge_columns, :merge_column),
+         true <- merge.review_column != merge.conflict_column,
+         :ok <- validate_merge_target(columns, merge.review_column, :review),
+         :ok <- validate_merge_target(columns, merge.conflict_column, :conflict) do
+      :ok
+    else
+      false -> {:error, :merge_review_and_conflict_columns_must_differ}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_merge_target(columns, id, kind) do
+    case Enum.find(columns, &(&1.id == id)) do
+      %Column{role: :dispatch} -> :ok
+      nil -> {:error, {:unknown_merge_target, kind, id}}
+      %Column{role: role} -> {:error, {:merge_target_not_dispatchable, kind, id, role}}
     end
   end
 
@@ -686,10 +844,75 @@ defmodule SymphonyElixir.Workflow.Bundle do
     end
   end
 
+  defp job_arguments(map, id) do
+    case Map.fetch(map, "arguments") do
+      {:ok, arguments} when is_list(arguments) ->
+        if Enum.all?(arguments, &is_binary/1) do
+          validate_job_argument_tokens(arguments, id)
+        else
+          {:error, {:invalid_job_arguments, id}}
+        end
+
+      _ ->
+        {:error, {:invalid_job_arguments, id}}
+    end
+  end
+
+  defp validate_job_argument_tokens(arguments, id) do
+    invalid =
+      Enum.find(arguments, fn argument ->
+        tokens = Regex.scan(~r/\$SYMPHONY_[A-Z0-9_]+/, argument) |> List.flatten()
+        tokens != [] and not (argument == "$SYMPHONY_JOB_ID" and tokens == ["$SYMPHONY_JOB_ID"])
+      end)
+
+    if invalid,
+      do: {:error, {:invalid_job_argument_token, id, invalid}},
+      else: {:ok, arguments}
+  end
+
+  defp passthrough_arguments(map, id) do
+    case map["passthrough_arguments"] do
+      "required" -> {:ok, :required}
+      "optional" -> {:ok, :optional}
+      "forbidden" -> {:ok, :forbidden}
+      _ -> {:error, {:invalid_job_passthrough_arguments, id}}
+    end
+  end
+
+  defp job_environment(map, id) do
+    case Map.fetch(map, "environment") do
+      {:ok, %{} = environment} ->
+        validate_job_environment(environment, id)
+
+      _ ->
+        {:error, {:invalid_job_environment, id}}
+    end
+  end
+
+  defp validate_job_environment(environment, id) do
+    if Enum.all?(environment, fn {key, value} -> valid_environment_key?(key) and is_binary(value) end) do
+      {:ok, environment}
+    else
+      {:error, {:invalid_job_environment, id}}
+    end
+  end
+
+  defp valid_environment_key?(key) when is_binary(key),
+    do: Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, key)
+
+  defp valid_environment_key?(_key), do: false
+
   defp positive_integer(map, key, default) do
     case Map.get(map, key, default) do
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, {:invalid_positive_integer, key}}
+    end
+  end
+
+  defp required_positive_integer(map, key, context) do
+    case Map.get(map, key) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _ -> {:error, {:invalid_positive_integer, context}}
     end
   end
 
@@ -698,13 +921,6 @@ defmodule SymphonyElixir.Workflow.Bundle do
       nil -> {:ok, nil}
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, {:invalid_positive_integer, key}}
-    end
-  end
-
-  defp non_negative_integer(map, key, default) do
-    case Map.get(map, key, default) do
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _ -> {:error, {:invalid_non_negative_integer, key}}
     end
   end
 
@@ -746,6 +962,14 @@ defmodule SymphonyElixir.Workflow.Bundle do
 
   defp blank_to_nil(value) when is_binary(value), do: if(String.trim(value) == "", do: nil, else: value)
   defp blank_to_nil(_value), do: nil
+
+  defp reject_execution_limits(map, forbidden, context) do
+    present = Map.keys(map) |> Enum.filter(&(&1 in forbidden)) |> Enum.sort()
+
+    if present == [],
+      do: :ok,
+      else: {:error, {:execution_limits_forbidden, context, present}}
+  end
 
   defp nonblank?(value), do: is_binary(value) and value != "" and String.trim(value) == value
 end

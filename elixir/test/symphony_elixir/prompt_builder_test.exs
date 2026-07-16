@@ -31,7 +31,10 @@ defmodule SymphonyElixir.PromptBuilderTest do
     workpad = PromptBuilder.render_workpad(task, run)
     assert workpad =~ "Implementation workpad"
     assert workpad =~ task.identifier
-    assert PromptBuilder.continuation_prompt(2, 3) =~ "turn 2 of 3"
+    continuation = PromptBuilder.continuation_prompt(2)
+    assert continuation =~ "same run and Codex session"
+    refute continuation =~ "turn 2 of"
+    refute continuation =~ "maximum"
     assert PromptBuilder.runner_contract() =~ "task worktree"
 
     Board.execute(%Commands.RunFailed{task_id: task.id, run_id: run["id"], reason: :test_complete},

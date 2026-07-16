@@ -188,16 +188,53 @@ The document defines:
 
 - immutable `project.id` and uppercase `project.key`
 - source Git remote and optional board-history remote
-- agent concurrency, turns per run, and optional SSH worker hosts/capacity
-- Codex command, approval/sandbox/network policy, and timeouts
+- agent concurrency and optional SSH worker hosts/capacity
+- Codex command and approval/sandbox/network policy
+- optional named blocking jobs with executable, fixed arguments, passthrough policy, and environment
+- optional pre-claim dispatch preflight with a retry delay after explicit failure
+- optional deterministic squash-merge policy and its review/conflict columns
 - shared base/context prompts
 - named stages with their prompt, workpad template, and allowed model/effort map
-- ordered `dispatch`, `pause`, `blocked`, or `terminal` columns
+- ordered `dispatch`, `merge`, `pause`, `blocked`, or `terminal` columns
 - human and agent transition edges
 - worktree lifecycle hooks
 
-The checked-in [`WORKFLOW.yml`](WORKFLOW.yml) is the complete reference. Template paths are resolved
-relative to that file, while the source repository is derived from its containing Git worktree.
+The checked-in [`WORKFLOW.yml`](WORKFLOW.yml) is the baseline workflow. Optional jobs, preflight, and
+deterministic merge configuration use these strict shapes:
+
+```yaml
+jobs:
+  targeted_validation:
+    executable: ./scripts/validate.sh
+    arguments: [targeted, --run-id, $SYMPHONY_JOB_ID]
+    passthrough_arguments: required # required | optional | forbidden
+    environment:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+dispatch:
+  preflight:
+    command: ./scripts/symphony-preflight.sh
+    retry_after_failure_ms: 30000
+
+merge:
+  method: squash
+  readiness_command: ./scripts/symphony-merge-readiness.sh
+  review_column: automated_review
+  conflict_column: merge_conflict
+```
+
+Job arguments are a literal argument vector. The exact `$SYMPHONY_JOB_ID` item is the only reserved
+Symphony substitution. Job definitions require an environment map, which may be empty. A configured
+merge policy requires exactly one `role: merge` column without a stage; its review and conflict
+targets must be different dispatch columns. Template and executable paths are resolved relative to
+the workflow/source worktree as specified by their consumers.
+
+Managed Codex turns, app-server responses, worktree hooks, jobs, preflight, and merge readiness do
+not have elapsed-time, inactivity, or output-size limits. The workflow loader rejects former
+`max_turns_per_run`, Codex timeout, hook timeout, job timeout/output-cap, preflight timeout, and merge
+timeout/output-cap keys with an explicit migration error. Retry/reconciliation intervals and forced
+termination after a human cancellation request remain scheduling and cancellation policy, not work
+deadlines.
 
 Invalid initial configuration leaves the board available in read-only diagnostic mode. An invalid
 reload keeps the last valid bundle. Valid reloads wait until no agent is starting, running, or

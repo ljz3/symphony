@@ -174,7 +174,7 @@ defmodule SymphonyElixir.LiveE2ETest do
              )
 
     assert claimed["runtime_state"] == "starting"
-    assert :ok = AgentRunner.run(claimed["id"], run["id"], nil, max_turns: 1)
+    assert :ok = AgentRunner.run(claimed["id"], run["id"])
     assert {:ok, updated} = Board.task(claimed["id"])
     assert updated.column_id == expected_column
     assert updated.active_run_id == nil

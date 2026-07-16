@@ -4,7 +4,20 @@ defmodule SymphonyElixir.Config.Schema do
   alias SymphonyElixir.{Paths, PathSafety}
   alias SymphonyElixir.Workflow.Bundle
 
-  @enforce_keys [:project, :source, :board, :agent, :codex, :hooks, :workspace, :worker, :server]
+  @enforce_keys [
+    :project,
+    :source,
+    :board,
+    :agent,
+    :codex,
+    :hooks,
+    :jobs,
+    :dispatch,
+    :merge,
+    :workspace,
+    :worker,
+    :server
+  ]
   defstruct @enforce_keys
 
   @type t :: %__MODULE__{
@@ -14,6 +27,9 @@ defmodule SymphonyElixir.Config.Schema do
           agent: map(),
           codex: map(),
           hooks: map(),
+          jobs: map(),
+          dispatch: map(),
+          merge: map() | nil,
           workspace: map(),
           worker: map(),
           server: map()
@@ -31,6 +47,9 @@ defmodule SymphonyElixir.Config.Schema do
       agent: bundle.agent,
       codex: Map.put(bundle.codex, :turn_sandbox_policy, nil),
       hooks: bundle.hooks,
+      jobs: bundle.jobs,
+      dispatch: bundle.dispatch,
+      merge: bundle.merge,
       workspace: %{root: workspace_root},
       worker: %{
         ssh_hosts: bundle.agent.ssh_hosts,

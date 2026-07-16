@@ -44,12 +44,11 @@ defmodule SymphonyElixir.PromptBuilder do
     |> Kernel.<>("\n")
   end
 
-  @spec continuation_prompt(pos_integer(), pos_integer()) :: String.t()
-  def continuation_prompt(turn_number, max_turns)
-      when is_integer(turn_number) and turn_number > 1 and is_integer(max_turns) and max_turns >= turn_number do
+  @spec continuation_prompt(pos_integer()) :: String.t()
+  def continuation_prompt(turn_number) when is_integer(turn_number) and turn_number > 1 do
     """
     Continue the current stage from the existing worktree and shared workpad.
-    This is turn #{turn_number} of #{max_turns} in the same run and Codex session.
+    This is continuation turn #{turn_number} in the same run and Codex session.
     Do not restart completed investigation. Finish the remaining work and make a
     required task transition before this invocation ends.
     """

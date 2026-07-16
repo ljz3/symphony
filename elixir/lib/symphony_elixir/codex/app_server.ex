@@ -491,7 +491,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       thread_id: thread_id,
       turn_id: turn_id,
       on_message: on_message,
-      timeout_ms: Config.settings!().codex.turn_timeout_ms,
       tool_executor: tool_executor,
       auto_approve_requests: auto_approve_requests,
       last_error_notification: nil
@@ -500,7 +499,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     receive_loop(port, "", context)
   end
 
-  defp receive_loop(port, pending_line, %{timeout_ms: timeout_ms} = context) do
+  defp receive_loop(port, pending_line, context) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
@@ -511,9 +510,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
-    after
-      timeout_ms ->
-        {:error, :turn_timeout}
+
+      {^port, :closed} ->
+        {:error, :port_closed}
     end
   end
 
@@ -1221,27 +1220,27 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
+    await_matching_response(port, request_id, "")
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp await_matching_response(port, request_id, pending_line) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(port, request_id, complete_line)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        await_matching_response(port, request_id, pending_line <> to_string(chunk))
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
-    after
-      timeout_ms ->
-        {:error, :response_timeout}
+
+      {^port, :closed} ->
+        {:error, :port_closed}
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, data) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -1256,11 +1255,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        await_matching_response(port, request_id, "")
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        await_matching_response(port, request_id, "")
     end
   end
 

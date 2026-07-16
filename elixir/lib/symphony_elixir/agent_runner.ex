@@ -74,15 +74,12 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_turns(session, task_id, run_id, worktree, recipient, opts) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns_per_run)
-
     context = %{
       task_id: task_id,
       run_id: run_id,
       worktree: worktree,
       recipient: recipient,
       invocation: Keyword.get(opts, :invocation, 1),
-      max_turns: max_turns,
       opts: opts
     }
 
@@ -94,7 +91,7 @@ defmodule SymphonyElixir.AgentRunner do
          {:ok, task} <- Board.task(context.task_id),
          {:ok, run} <- Board.run(context.run_id),
          :ok <- validate_scope(task, run),
-         prompt <- turn_prompt(task, run, turn, context.max_turns, context.opts),
+         prompt <- turn_prompt(task, run, turn, context.opts),
          {:ok, _turn_result} <-
            AppServer.run_turn(session, prompt, task,
              on_message:
@@ -121,11 +118,8 @@ defmodule SymphonyElixir.AgentRunner do
         refreshed.column_id != run["start_column_id"] ->
           finish_run(refreshed, context.run_id, %{turns: turn, transitioned_to: refreshed.column_id})
 
-        turn < context.max_turns ->
-          do_run_turns(session, context, turn + 1)
-
         true ->
-          {:error, :max_turns_exhausted_without_transition}
+          do_run_turns(session, context, turn + 1)
       end
     else
       {:error, :graceful_stop_requested} ->
@@ -138,8 +132,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp turn_prompt(task, run, 1, _max_turns, opts), do: PromptBuilder.build_prompt(task, run, opts)
-  defp turn_prompt(_task, _run, turn, max_turns, _opts), do: PromptBuilder.continuation_prompt(turn, max_turns)
+  defp turn_prompt(task, run, 1, opts), do: PromptBuilder.build_prompt(task, run, opts)
+  defp turn_prompt(_task, _run, turn, _opts), do: PromptBuilder.continuation_prompt(turn)
 
   defp ensure_workpad(task, run, opts) do
     invocation = Keyword.get(opts, :invocation, 1)
