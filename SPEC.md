@@ -207,7 +207,10 @@ broad source-checkout write access.
 Outcomes:
 
 - An active preflight consumes global and worker-host capacity. Elapsed time and silence never end
-  it. Task movement, workflow activation, shutdown, or explicit cancellation may terminate it.
+  it. A task notification re-reads current state and terminates the probe only when its revision,
+  eligibility/runtime, workflow hash, or worker reservation changed; non-revision events preserve
+  the probe. Workflow activation, shutdown, or explicit semantic cancellation may terminate it.
+  Results from a cancelled probe are discarded and never become a project preflight failure.
 - Explicit preflight failure releases its reservation, keeps the task queued, and retains only the
   current diagnostic fingerprint, reason, completion time, and next retry time for that task.
   Identical failures replace current state instead of appending history, and unrelated tasks remain
@@ -228,7 +231,12 @@ Preserve SSH workers through a worktree backend:
 
 - Local execution uses the source repository’s object store.
 - Each SSH worker maintains a per-project bare source mirror and task worktrees, synchronized through the configured source remote.
-- Retain host capacity scheduling; an unhealthy worker is excluded, and dispatch is globally gated only when no eligible worker remains.
+- Probe SSH worker health asynchronously under supervision, without an elapsed-time or inactivity
+  deadline. Unknown and probing workers are not selectable. Explicit success records current healthy
+  state; exit or failure records current unhealthy state and schedules a later probe only after the
+  failed probe terminates. Workflow host removal and shutdown cancel the supervised process tree.
+- Retain host capacity scheduling; an unhealthy worker is excluded, direct dispatch resumes after
+  explicit health, and dispatch is globally gated only when no eligible worker remains.
 
 ### Run-scoped Codex tools
 
@@ -364,9 +372,10 @@ Add targeted coverage for:
   safe task/run/event projections, Host/Origin rejection, canonical task creation, and per-request
   idempotency.
 - Orchestrator pre-claim reservation, no-run-before-success, stale-success rejection, current-only
-  failure projection, delayed retry, cancellation/restart cleanup, claim/on-claim behavior, stage
-  handoffs, no-retry blocking, orphan recovery, human stop, GitHub-wait exception, capacity, and
-  dependency gating.
+  failure projection, unchanged-event preservation, delayed retry, semantic cancellation/restart
+  cleanup, asynchronous deadline-free SSH health probing, direct dispatch after explicit health,
+  claim/on-claim behavior, stage handoffs, no-retry blocking, orphan recovery, human stop,
+  GitHub-wait exception, capacity, and dependency gating.
 - Cumulative-only token extraction, camel/snake-case token fields, cached tokens, high-water behavior, unique turns, telemetry migration/recovery/cleanup, terminal stats for completion/stop/failure, and `null` unavailable usage.
 - Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, meaningful-diff draft PR creation including documentation-only and zero-diff cases, publication markers, readiness prerequisites, rework-to-draft, cancellation, and merge validation.
 - Creator-run PR-body routing, existing workpad-comment routing before or after finalization, unpublished failed-run locality, retry-after-GitHub-failure, and crash-after-publication idempotency.

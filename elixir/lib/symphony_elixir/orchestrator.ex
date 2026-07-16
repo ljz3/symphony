@@ -22,6 +22,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @reconcile_interval_ms 1_000
   @github_health_ttl_ms 5_000
+  @worker_health_retry_ms 5_000
+  @worker_health_refresh_ms 30_000
   @graceful_stop_ms 10_000
   @forced_stop_ms 5_000
   @telemetry_broadcast_delay_ms 250
@@ -34,6 +36,8 @@ defmodule SymphonyElixir.Orchestrator do
               preflights: %{},
               preflight_refs: %{},
               preflight_failures: %{},
+              worker_health: %{},
+              worker_health_refs: %{},
               cleanup_errors: %{},
               cleanup_running: MapSet.new(),
               cleanup_completed: MapSet.new(),
@@ -68,6 +72,7 @@ defmodule SymphonyElixir.Orchestrator do
           started_at: nil,
           running: [],
           preflights: [],
+          worker_health: [],
           rate_limits: [],
           dispatch_gate: :not_started,
           cleanup_errors: %{},
@@ -124,6 +129,7 @@ defmodule SymphonyElixir.Orchestrator do
        started_at: state.started_at,
        running: running,
        preflights: preflight_status(state),
+       worker_health: worker_health_status(state),
        rate_limits: state.rate_limits |> Map.values() |> Enum.sort_by(& &1["worker"]),
        dispatch_gate: state.dispatch_gate,
        github: state.github_health,
@@ -153,7 +159,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
-      |> cancel_preflight(task_id)
+      |> reconcile_task_preflight(task_id)
       |> maybe_request_stop(task_id)
       |> maybe_terminal_cleanup(task_id)
       |> broadcast_preflight_change(previous)
@@ -164,12 +170,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:workflow_activated, _hash}, state) do
     previous = state
+    bundle = Config.bundle!()
 
     state =
       state
       |> cancel_all_preflights()
       |> Map.put(:preflight_failures, %{})
       |> broadcast_preflight_change(previous)
+      |> reconcile_worker_health_if_dispatching(bundle)
 
     send(self(), :reconcile)
     {:noreply, state}
@@ -244,19 +252,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({ref, result}, state) when is_reference(ref) do
-    case Map.pop(state.preflight_refs, ref) do
-      {nil, _preflight_refs} ->
-        handle_runner_result(ref, result, state)
+    case Map.pop(state.worker_health_refs, ref) do
+      {nil, _worker_health_refs} ->
+        handle_preflight_or_runner_result(ref, result, state)
 
-      {task_id, preflight_refs} ->
+      {{host, probe_id}, worker_health_refs} ->
         previous = state
         Process.demonitor(ref, [:flush])
-        {preflight, preflights} = Map.pop(state.preflights, task_id)
 
         state =
-          %{state | preflight_refs: preflight_refs, preflights: preflights}
-          |> finish_preflight(preflight, result)
-          |> broadcast_preflight_change(previous)
+          %{state | worker_health_refs: worker_health_refs}
+          |> finish_worker_health_probe(host, probe_id, result)
+          |> broadcast_worker_health_change(previous)
 
         send(self(), :reconcile)
         {:noreply, state}
@@ -264,18 +271,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    case Map.pop(state.preflight_refs, ref) do
-      {nil, _preflight_refs} ->
-        handle_runner_down(ref, reason, state)
+    case Map.pop(state.worker_health_refs, ref) do
+      {nil, _worker_health_refs} ->
+        handle_preflight_or_runner_down(ref, reason, state)
 
-      {task_id, preflight_refs} ->
+      {{host, probe_id}, worker_health_refs} ->
         previous = state
-        {preflight, preflights} = Map.pop(state.preflights, task_id)
 
         state =
-          %{state | preflight_refs: preflight_refs, preflights: preflights}
-          |> finish_preflight(preflight, {:error, nil, {:preflight_process_exit, reason}})
-          |> broadcast_preflight_change(previous)
+          %{state | worker_health_refs: worker_health_refs}
+          |> finish_worker_health_probe(host, probe_id, {:error, {:worker_health_process_exit, reason}})
+          |> broadcast_worker_health_change(previous)
 
         send(self(), :reconcile)
         {:noreply, state}
@@ -347,6 +353,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_preflight_or_runner_result(ref, result, state) do
+    case Map.pop(state.preflight_refs, ref) do
+      {nil, _preflight_refs} ->
+        handle_runner_result(ref, result, state)
+
+      {task_id, preflight_refs} ->
+        previous = state
+        Process.demonitor(ref, [:flush])
+        {preflight, preflights} = Map.pop(state.preflights, task_id)
+
+        state =
+          %{state | preflight_refs: preflight_refs, preflights: preflights}
+          |> finish_preflight(preflight, result)
+          |> broadcast_preflight_change(previous)
+
+        send(self(), :reconcile)
+        {:noreply, state}
+    end
+  end
+
   defp handle_runner_down(ref, reason, state) do
     case Map.pop(state.refs, ref) do
       {nil, _refs} ->
@@ -362,7 +388,36 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_preflight_or_runner_down(ref, reason, state) do
+    case Map.pop(state.preflight_refs, ref) do
+      {nil, _preflight_refs} ->
+        handle_runner_down(ref, reason, state)
+
+      {task_id, preflight_refs} ->
+        previous = state
+        {preflight, preflights} = Map.pop(state.preflights, task_id)
+
+        state =
+          %{state | preflight_refs: preflight_refs, preflights: preflights}
+          |> finish_preflight(preflight, {:error, nil, {:preflight_process_exit, reason}})
+          |> broadcast_preflight_change(previous)
+
+        send(self(), :reconcile)
+        {:noreply, state}
+    end
+  end
+
   defp finish_preflight(state, nil, _result), do: state
+
+  defp finish_preflight(state, %{discard_result: true} = preflight, _result) do
+    Logger.info(
+      "preflight result discarded reason=#{preflight.cancellation_reason} task_id=#{preflight.task_id} " <>
+        "task_identifier=#{preflight.identifier} task_revision=#{preflight.task_revision} " <>
+        "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
+    )
+
+    state
+  end
 
   defp finish_preflight(state, preflight, {:ok, _workspace_path, _output}) do
     claim_after_preflight(state, preflight)
@@ -444,7 +499,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp current_preflight_snapshot?(task, bundle, preflight, state) do
     task.revision == preflight.task_revision and bundle.hash == preflight.workflow_hash and
-      dispatch_eligible?(task, bundle, state)
+      preflight_dispatch_eligible?(task, bundle, state)
+  end
+
+  defp preflight_dispatch_eligible?(task, bundle, state) do
+    eligible?(task, bundle) and not Map.has_key?(state.publication_errors, task.id)
   end
 
   defp worker_reservation_current?(nil, %{agent: %{ssh_hosts: []}}, _state), do: true
@@ -524,6 +583,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
+      |> reconcile_worker_health(bundle)
       |> prune_preflight_failures(bundle)
       |> broadcast_preflight_change(previous)
 
@@ -590,6 +650,8 @@ defmodule SymphonyElixir.Orchestrator do
       started_at: now,
       last_activity_at: now,
       retry_after_failure_ms: config.retry_after_failure_ms,
+      discard_result: false,
+      cancellation_reason: nil,
       pid: async.pid,
       ref: async.ref
     }
@@ -611,9 +673,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp run_preflight(task, worker_host, bundle, config, recipient, probe_id) do
-    preparation_guard = start_preflight_preparation_guard(recipient, self())
+    preparation_guard = start_owned_task_guard(recipient, self(), :preflight_owner_down)
     worktree_result = Worktree.ensure(task, worker_host)
-    :ok = stop_preflight_preparation_guard(preparation_guard)
+    :ok = stop_owned_task_guard(preparation_guard)
 
     with {:ok, workspace_path} <- worktree_result do
       send(recipient, {:preflight_phase, task.id, probe_id, :running, workspace_path})
@@ -635,34 +697,34 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp start_preflight_preparation_guard(owner, preflight) do
+  defp start_owned_task_guard(owner, task, owner_down_reason) do
     spawn(fn ->
       owner_ref = Process.monitor(owner)
-      preflight_ref = Process.monitor(preflight)
+      task_ref = Process.monitor(task)
 
       receive do
         {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-          Worktree.terminate_owned_processes(preflight)
-          Process.exit(preflight, :preflight_owner_down)
+          Worktree.terminate_owned_processes(task)
+          Process.exit(task, owner_down_reason)
 
-        {:DOWN, ^preflight_ref, :process, ^preflight, _reason} ->
+        {:DOWN, ^task_ref, :process, ^task, _reason} ->
           :ok
 
-        {:stop_preflight_preparation_guard, caller, stop_ref} ->
+        {:stop_owned_task_guard, caller, stop_ref} ->
           Process.demonitor(owner_ref, [:flush])
-          Process.demonitor(preflight_ref, [:flush])
-          send(caller, {:preflight_preparation_guard_stopped, stop_ref})
+          Process.demonitor(task_ref, [:flush])
+          send(caller, {:owned_task_guard_stopped, stop_ref})
       end
     end)
   end
 
-  defp stop_preflight_preparation_guard(guard) do
+  defp stop_owned_task_guard(guard) do
     guard_ref = Process.monitor(guard)
     stop_ref = make_ref()
-    send(guard, {:stop_preflight_preparation_guard, self(), stop_ref})
+    send(guard, {:stop_owned_task_guard, self(), stop_ref})
 
     receive do
-      {:preflight_preparation_guard_stopped, ^stop_ref} ->
+      {:owned_task_guard_stopped, ^stop_ref} ->
         Process.demonitor(guard_ref, [:flush])
         :ok
 
@@ -721,7 +783,7 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec dispatch_eligible?(Task.t(), Bundle.t(), State.t()) :: boolean()
   def dispatch_eligible?(task, bundle, state) do
-    eligible?(task, bundle) and not Map.has_key?(state.publication_errors, task.id) and
+    preflight_dispatch_eligible?(task, bundle, state) and
       not Map.has_key?(state.preflights, task.id)
   end
 
@@ -854,7 +916,7 @@ defmodule SymphonyElixir.Orchestrator do
     capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
 
     bundle.agent.ssh_hosts
-    |> Enum.filter(fn host -> worker_healthy?(host) and worker_load(state, host) < capacity end)
+    |> Enum.filter(fn host -> worker_healthy?(state, host) and worker_load(state, host) < capacity end)
     |> choose_worker(state)
   end
 
@@ -862,6 +924,167 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp choose_worker(hosts, state) do
     {:ok, Enum.min_by(hosts, &worker_load(state, &1))}
+  end
+
+  defp reconcile_worker_health(state, bundle) do
+    previous = state
+    configured_hosts = MapSet.new(bundle.agent.ssh_hosts)
+
+    state =
+      state.worker_health
+      |> Map.keys()
+      |> Enum.reject(&MapSet.member?(configured_hosts, &1))
+      |> Enum.reduce(state, &cancel_worker_health_probe(&2, &1, :worker_removed))
+
+    now = System.monotonic_time(:millisecond)
+
+    state =
+      Enum.reduce(bundle.agent.ssh_hosts, state, fn host, acc ->
+        if worker_health_probe_due?(acc.worker_health[host], now),
+          do: start_worker_health_probe(acc, host),
+          else: acc
+      end)
+
+    broadcast_worker_health_change(state, previous)
+  end
+
+  defp reconcile_worker_health_if_dispatching(state, bundle) do
+    if dispatch_enabled(state) == :ok do
+      reconcile_worker_health(state, bundle)
+    else
+      previous = state
+      state |> cancel_all_worker_health() |> broadcast_worker_health_change(previous)
+    end
+  end
+
+  defp worker_health_probe_due?(nil, _now), do: true
+  defp worker_health_probe_due?(%{status: :unhealthy, retry_at_ms: retry_at_ms}, now), do: now >= retry_at_ms
+  defp worker_health_probe_due?(%{status: :healthy, refresh_at_ms: refresh_at_ms}, now), do: now >= refresh_at_ms
+  defp worker_health_probe_due?(_health, _now), do: false
+
+  defp start_worker_health_probe(state, host) do
+    recipient = self()
+    probe_id = make_ref()
+
+    async =
+      Elixir.Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
+        run_worker_health_probe(host, recipient)
+      end)
+
+    entry = %{
+      host: host,
+      status: :probing,
+      probe_id: probe_id,
+      pid: async.pid,
+      ref: async.ref,
+      started_at: timestamp(),
+      completed_at: nil,
+      reason: nil,
+      next_retry_at: nil,
+      next_probe_at: nil,
+      retry_at_ms: nil,
+      refresh_at_ms: nil
+    }
+
+    Logger.info("worker health probe started worker_host=#{host}")
+
+    %{
+      state
+      | worker_health: Map.put(state.worker_health, host, entry),
+        worker_health_refs: Map.put(state.worker_health_refs, async.ref, {host, probe_id})
+    }
+  end
+
+  defp run_worker_health_probe(host, owner) do
+    guard = start_owned_task_guard(owner, self(), :worker_health_owner_down)
+    result = SSH.run(host, "true", stderr_to_stdout: true)
+    :ok = stop_owned_task_guard(guard)
+    result
+  end
+
+  defp finish_worker_health_probe(state, host, probe_id, result) do
+    case state.worker_health[host] do
+      %{probe_id: ^probe_id, status: :probing} = entry ->
+        put_worker_health_result(state, host, entry, result)
+
+      _stale_or_cancelled ->
+        state
+    end
+  end
+
+  defp put_worker_health_result(state, host, entry, {:ok, {_output, 0}}) do
+    completed_at = DateTime.utc_now()
+
+    health = %{
+      entry
+      | status: :healthy,
+        pid: nil,
+        ref: nil,
+        completed_at: format_datetime(completed_at),
+        reason: nil,
+        next_retry_at: nil,
+        next_probe_at: format_datetime(DateTime.add(completed_at, @worker_health_refresh_ms, :millisecond)),
+        retry_at_ms: nil,
+        refresh_at_ms: System.monotonic_time(:millisecond) + @worker_health_refresh_ms
+    }
+
+    Logger.info("worker health probe completed outcome=healthy worker_host=#{host}")
+    %{state | worker_health: Map.put(state.worker_health, host, health)}
+  end
+
+  defp put_worker_health_result(state, host, entry, result) do
+    completed_at = DateTime.utc_now()
+    reason = worker_health_failure_reason(result)
+
+    health = %{
+      entry
+      | status: :unhealthy,
+        pid: nil,
+        ref: nil,
+        completed_at: format_datetime(completed_at),
+        reason: reason,
+        next_retry_at: format_datetime(DateTime.add(completed_at, @worker_health_retry_ms, :millisecond)),
+        next_probe_at: nil,
+        retry_at_ms: System.monotonic_time(:millisecond) + @worker_health_retry_ms,
+        refresh_at_ms: nil
+    }
+
+    Logger.warning(
+      "worker health probe completed outcome=unhealthy worker_host=#{host} reason=#{inspect(reason)} " <>
+        "next_retry_at=#{health.next_retry_at}"
+    )
+
+    %{state | worker_health: Map.put(state.worker_health, host, health)}
+  end
+
+  defp worker_health_failure_reason({:ok, {_output, status}}), do: "exit_status_#{status}"
+  defp worker_health_failure_reason({:error, reason}), do: inspect(reason)
+  defp worker_health_failure_reason(other), do: inspect({:unexpected_worker_health_result, other})
+
+  defp cancel_worker_health_probe(state, host, reason) do
+    case Map.pop(state.worker_health, host) do
+      {nil, worker_health} ->
+        %{state | worker_health: worker_health}
+
+      {health, worker_health} ->
+        if health.status == :probing do
+          Worktree.terminate_owned_processes(health.pid)
+          Process.exit(health.pid, :worker_health_cancelled)
+          Process.demonitor(health.ref, [:flush])
+        end
+
+        Logger.info("worker health probe cancelled worker_host=#{host} reason=#{reason}")
+
+        %{
+          state
+          | worker_health: worker_health,
+            worker_health_refs: Map.delete(state.worker_health_refs, health.ref)
+        }
+    end
+  end
+
+  defp cancel_all_worker_health(state) do
+    Enum.reduce(Map.keys(state.worker_health), state, &cancel_worker_health_probe(&2, &1, :shutdown))
   end
 
   @doc false
@@ -878,9 +1101,7 @@ defmodule SymphonyElixir.Orchestrator do
     running + preflights
   end
 
-  defp worker_healthy?(host) do
-    match?({:ok, {_output, 0}}, SSH.run(host, "true", stderr_to_stdout: true))
-  end
+  defp worker_healthy?(state, host), do: match?(%{status: :healthy}, state.worker_health[host])
 
   defp recover_orphan_runs(state) do
     if state.recover_orphans and dispatch_enabled(state) == :ok do
@@ -1176,14 +1397,73 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cancel_preflight(state, task_id) do
+  defp reconcile_task_preflight(state, task_id) do
+    bundle = Config.bundle!()
+
+    case Board.task(task_id) do
+      {:ok, task} -> reconcile_task_preflight(state, task, bundle)
+      {:error, :not_found} -> state |> cancel_preflight(task_id, :task_missing) |> clear_preflight_failure(task_id)
+    end
+  end
+
+  defp reconcile_task_preflight(state, task, bundle) do
+    state =
+      case state.preflights[task.id] do
+        nil ->
+          state
+
+        %{discard_result: true} ->
+          state
+
+        preflight ->
+          if active_preflight_current?(task, bundle, preflight, state),
+            do: state,
+            else: cancel_preflight(state, task.id, :task_semantics_changed)
+      end
+
+    case state.preflight_failures[task.id] do
+      nil ->
+        state
+
+      failure ->
+        if failed_preflight_current?(task, bundle, failure, state),
+          do: state,
+          else: clear_preflight_failure(state, task.id)
+    end
+  end
+
+  defp active_preflight_current?(task, bundle, preflight, state) do
+    current_preflight_snapshot?(task, bundle, preflight, state) and
+      active_worker_reservation_current?(preflight.worker_host, bundle, state) and
+      capacity_load(state) <= bundle.agent.max_concurrent_agents
+  end
+
+  defp failed_preflight_current?(task, bundle, failure, state) do
+    current_preflight_snapshot?(task, bundle, failure, state) and
+      configured_worker?(failure.worker_host, bundle)
+  end
+
+  defp active_worker_reservation_current?(nil, %{agent: %{ssh_hosts: []}}, _state), do: true
+
+  defp active_worker_reservation_current?(host, bundle, state) when is_binary(host) do
+    capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
+    host in bundle.agent.ssh_hosts and worker_load(state, host) <= capacity
+  end
+
+  defp active_worker_reservation_current?(_host, _bundle, _state), do: false
+
+  defp configured_worker?(nil, %{agent: %{ssh_hosts: []}}), do: true
+  defp configured_worker?(host, bundle) when is_binary(host), do: host in bundle.agent.ssh_hosts
+  defp configured_worker?(_host, _bundle), do: false
+
+  defp clear_preflight_failure(state, task_id) do
+    %{state | preflight_failures: Map.delete(state.preflight_failures, task_id)}
+  end
+
+  defp cancel_preflight(state, task_id, reason) do
     case Map.pop(state.preflights, task_id) do
       {nil, preflights} ->
-        %{
-          state
-          | preflights: preflights,
-            preflight_failures: Map.delete(state.preflight_failures, task_id)
-        }
+        %{state | preflights: preflights}
 
       {preflight, preflights} ->
         if preflight.phase == :preparing_worktree do
@@ -1194,12 +1474,18 @@ defmodule SymphonyElixir.Orchestrator do
         end
 
         Logger.info(
-          "preflight cancellation requested task_id=#{preflight.task_id} " <>
+          "preflight cancellation requested reason=#{reason} task_id=#{preflight.task_id} " <>
             "task_identifier=#{preflight.identifier} task_revision=#{preflight.task_revision} " <>
             "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
         )
 
-        cancelling = %{preflight | phase: :cancelling, last_activity_at: timestamp()}
+        cancelling = %{
+          preflight
+          | phase: :cancelling,
+            discard_result: true,
+            cancellation_reason: reason,
+            last_activity_at: timestamp()
+        }
 
         %{
           state
@@ -1210,7 +1496,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cancel_all_preflights(state) do
-    Enum.reduce(Map.keys(state.preflights), state, &cancel_preflight(&2, &1))
+    Enum.reduce(Map.keys(state.preflights), state, &cancel_preflight(&2, &1, :workflow_changed))
   end
 
   defp preflight_status(state) do
@@ -1250,8 +1536,33 @@ defmodule SymphonyElixir.Orchestrator do
     ])
   end
 
+  defp worker_health_status(state) do
+    state.worker_health
+    |> Map.values()
+    |> Enum.map(
+      &Map.take(&1, [
+        :host,
+        :status,
+        :started_at,
+        :completed_at,
+        :reason,
+        :next_retry_at,
+        :next_probe_at
+      ])
+    )
+    |> Enum.sort_by(& &1.host)
+  end
+
   defp broadcast_preflight_change(state, previous) do
     if state.preflights != previous.preflights or state.preflight_failures != previous.preflight_failures do
+      Phoenix.PubSub.broadcast(SymphonyElixir.PubSub, "board:health", :board_health_changed)
+    end
+
+    state
+  end
+
+  defp broadcast_worker_health_change(state, previous) do
+    if state.worker_health != previous.worker_health do
       Phoenix.PubSub.broadcast(SymphonyElixir.PubSub, "board:health", :board_health_changed)
     end
 
@@ -1313,12 +1624,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp timestamp do
-    DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
+    DateTime.utc_now() |> format_datetime()
   end
+
+  defp format_datetime(datetime), do: datetime |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
 
   @impl true
   def terminate(_reason, state) do
-    _state = cancel_all_preflights(state)
+    _state = state |> cancel_all_preflights() |> cancel_all_worker_health()
     :ok
   end
 end

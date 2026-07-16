@@ -28,7 +28,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
       Workflow.Store.force_reload()
     end)
 
-    %{source: source}
+    %{source: source, fake_bin: fake_bin}
   end
 
   @tag timeout: 20_000
@@ -65,6 +65,77 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     eventually(fn -> Enum.all?(status(orchestrator).preflights, &(&1.task_id != todo_id)) end)
     eventually(fn -> not os_process_alive?(pid) end)
     assert Board.runs(todo_id) == []
+  end
+
+  @tag timeout: 15_000
+  test "an unchanged task notification preserves the active probe and claims once", %{source: source} do
+    state_dir = fixture_dir(source, "unchanged-active")
+    attempts = Path.join(state_dir, "attempts")
+    release = Path.join(state_dir, "release")
+
+    command = """
+    mkdir -p #{shell_escape(state_dir)}
+    printf x >> #{shell_escape(attempts)}
+    while [ ! -f #{shell_escape(release)} ]; do sleep 0.05; done
+    """
+
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Unchanged notification")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    assert {:ok, %{"task" => claimed, "run" => prior_run}} =
+             Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+               actor: :system,
+               expected_revision: todo["revision"],
+               idempotency_key: BoardFactory.unique("unchanged-prior-claim")
+             )
+
+    {review, _result} = BoardFactory.move(claimed, "automated_review", :agent)
+
+    assert {:ok, %{"task" => current, "run" => completed_run}} =
+             Board.execute(
+               %Commands.RunFinished{
+                 task_id: review["id"],
+                 run_id: prior_run["id"],
+                 outcome: %{},
+                 stats: %{"turn_count" => 1, "token_usage" => nil}
+               },
+               actor: :system,
+               expected_revision: review["revision"],
+               idempotency_key: BoardFactory.unique("unchanged-prior-finish")
+             )
+
+    todo_id = current["id"]
+    configure_preflight(source, command, retry_after_failure_ms: 250, concurrency: 1)
+    orchestrator = start_gate([todo_id])
+    on_exit(fn -> File.touch(release) end)
+
+    eventually(fn -> attempt_count(attempts) == 1 end)
+    eventually(fn -> match?([%{task_id: ^todo_id, status: :running}], status(orchestrator).preflights) end)
+
+    assert {:ok, %{"run" => published_run}} =
+             Board.execute(
+               %Commands.RecordRunStatsPublication{
+                 task_id: todo_id,
+                 run_id: completed_run["id"],
+                 destination: "pr_body",
+                 publication_id: BoardFactory.unique("stats-publication")
+               },
+               actor: :system,
+               expected_revision: current["revision"],
+               idempotency_key: BoardFactory.unique("unchanged-stats-event")
+             )
+
+    assert published_run["stats_publication"]["destination"] == "pr_body"
+    Process.sleep(350)
+
+    assert attempt_count(attempts) == 1
+    assert match?([%{task_id: ^todo_id, status: :running}], status(orchestrator).preflights)
+
+    File.touch!(release)
+    eventually(fn -> length(Board.runs(todo_id)) == 2 end)
+    Process.sleep(250)
+    assert attempt_count(attempts) == 1
+    assert length(Board.runs(todo_id)) == 2
   end
 
   @tag timeout: 15_000
@@ -146,6 +217,12 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
 
     assert attempt_count(attempts) == 1
     first_failure = Enum.find(status(orchestrator).preflights, &(&1.task_id == failing_id))
+
+    send(orchestrator, {:task_changed, failing_id})
+    Process.sleep(350)
+
+    assert attempt_count(attempts) == 1
+    assert Enum.find(status(orchestrator).preflights, &(&1.task_id == failing_id)) == first_failure
     assert Board.runs(failing_id) == []
     assert {:ok, failing_task} = Board.task(failing_id)
     assert failing_task.column_id == "todo"
@@ -166,6 +243,92 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     Process.sleep(1_100)
     assert length(Board.runs(passing_id)) == 1
     eventually(fn -> match?({:ok, %{runtime_state: nil}}, Board.task(passing_id)) end)
+  end
+
+  @tag timeout: 20_000
+  test "silent SSH health probing is asynchronous and direct dispatch waits for explicit health", %{
+    source: source,
+    fake_bin: fake_bin
+  } do
+    state_dir = fixture_dir(source, "worker-health")
+    started = Path.join(state_dir, "started")
+    process_id = Path.join(state_dir, "pid")
+    release = Path.join(state_dir, "release")
+    completed = Path.join(state_dir, "completed")
+
+    File.write!(
+      Path.join(fake_bin, "ssh"),
+      fake_ssh(started: started, process_id: process_id, release: release, completed: completed)
+    )
+
+    File.chmod!(Path.join(fake_bin, "ssh"), 0o755)
+    configure_workers_without_preflight(source, "silent-worker")
+    {todo, _backlog} = queued_task("Asynchronous worker health")
+    todo_id = todo["id"]
+    orchestrator = start_gate([todo_id])
+    on_exit(fn -> File.touch(release) end)
+
+    eventually(fn -> File.exists?(started) and File.exists?(process_id) end)
+    probe_pid = process_id |> File.read!() |> String.trim() |> String.to_integer()
+    parent = self()
+    spawn(fn -> send(parent, {:responsive_status, status(orchestrator)}) end)
+
+    assert_receive {:responsive_status, %{worker_health: [%{host: "silent-worker", status: :probing}]}}, 500
+    assert Board.runs(todo_id) == []
+
+    Process.sleep(5_200)
+    assert os_process_alive?(probe_pid)
+    assert match?([%{host: "silent-worker", status: :probing}], status(orchestrator).worker_health)
+
+    {backlog, _result} = BoardFactory.move(todo, "backlog")
+    eventually(fn -> match?({:ok, %{column_id: "backlog"}}, Board.task(todo_id)) end)
+    assert status(orchestrator).online
+    assert Board.runs(todo_id) == []
+
+    configure_workers_without_preflight(source, nil)
+    eventually(fn -> not os_process_alive?(probe_pid) end)
+    eventually(fn -> status(orchestrator).worker_health == [] end)
+
+    File.touch!(release)
+    configure_workers_without_preflight(source, "silent-worker")
+    {_todo, _result} = BoardFactory.move(backlog, "todo")
+    eventually(fn -> File.exists?(completed) end)
+    eventually(fn -> length(Board.runs(todo_id)) == 1 end)
+    Process.sleep(250)
+    assert length(Board.runs(todo_id)) == 1
+  end
+
+  @tag timeout: 10_000
+  test "worker health failure is current and retries only after terminal failure", %{
+    source: source,
+    fake_bin: fake_bin
+  } do
+    state_dir = fixture_dir(source, "worker-unhealthy")
+    attempts = Path.join(state_dir, "attempts")
+
+    File.write!(
+      Path.join(fake_bin, "ssh"),
+      "#!/bin/sh\nmkdir -p #{shell_escape(state_dir)}\nprintf x >> #{shell_escape(attempts)}\nexit 9\n"
+    )
+
+    File.chmod!(Path.join(fake_bin, "ssh"), 0o755)
+    configure_workers_without_preflight(source, "failing-worker")
+    {todo, _backlog} = queued_task("Failed worker health")
+    orchestrator = start_gate([todo["id"]])
+
+    eventually(fn ->
+      match?(
+        [%{host: "failing-worker", status: :unhealthy, reason: "exit_status_9", next_retry_at: retry}]
+        when is_binary(retry),
+        status(orchestrator).worker_health
+      )
+    end)
+
+    assert attempt_count(attempts) == 1
+    assert Board.runs(todo["id"]) == []
+    assert status(orchestrator).online
+    Process.sleep(500)
+    assert attempt_count(attempts) == 1
   end
 
   @tag timeout: 20_000
@@ -308,6 +471,16 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     String.replace(workflow, "hooks:\n", "hooks:\n  after_create: |-\n#{command_yaml}\n")
   end
 
+  defp configure_workers_without_preflight(source, host) do
+    workflow = File.read!(source.workflow)
+    hosts = if is_binary(host), do: "[#{host}]", else: "[]"
+    workflow = Regex.replace(~r/^  ssh_hosts:.*$/m, workflow, "  ssh_hosts: #{hosts}")
+    workflow = Regex.replace(~r/^  command:.*$/m, workflow, "  command: \"false\"")
+    workflow = Regex.replace(~r/\ndispatch:\n.*\z/s, workflow, "")
+    File.write!(source.workflow, workflow)
+    assert :ok = Workflow.Store.force_reload()
+  end
+
   defp start_gate(task_ids) do
     selected = MapSet.new(task_ids)
     name = Module.concat(__MODULE__, "Gate#{System.unique_integer([:positive, :monotonic])}")
@@ -358,6 +531,26 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
       api) printf '%s' '{}' ;;
       *) exit 2 ;;
     esac
+    """
+  end
+
+  defp fake_ssh(opts) do
+    started = Keyword.fetch!(opts, :started)
+    process_id = Keyword.fetch!(opts, :process_id)
+    release = Keyword.fetch!(opts, :release)
+    completed = Keyword.fetch!(opts, :completed)
+
+    """
+    #!/bin/sh
+    set -eu
+    if [ ! -f #{shell_escape(completed)} ]; then
+      mkdir -p #{shell_escape(Path.dirname(started))}
+      touch #{shell_escape(started)}
+      printf %s $$ > #{shell_escape(process_id)}
+      while [ ! -f #{shell_escape(release)} ]; do sleep 0.05; done
+      touch #{shell_escape(completed)}
+    fi
+    exit 0
     """
   end
 

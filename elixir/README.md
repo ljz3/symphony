@@ -258,10 +258,19 @@ stage prompt/workpad, and starts app-server in that worktree. The prompt order i
 
 Preflight has no elapsed-time or inactivity deadline. A running probe consumes capacity. Explicit
 failure releases that capacity, gates only the affected queued task until its retry time, and exposes
-one replaceable current diagnostic rather than a history. Task changes and workflow activation
-cancel stale probes. Owner monitoring terminates an orphaned local or SSH command when the
-orchestrator exits, so restart reruns the probe instead of accepting a pre-restart result. Board
-health projects only current running or failed preflight state.
+one replaceable current diagnostic rather than a history. Task notifications re-read current state:
+non-revision events preserve an active probe or current failure, while revision, eligibility,
+workflow-hash, or worker-reservation changes cancel stale work. A cancelled result is discarded and
+never recorded as a project failure. Owner monitoring terminates an orphaned local or SSH command
+when the orchestrator exits, so restart reruns the probe instead of accepting a pre-restart result.
+Board health projects only current running or failed preflight state.
+
+SSH worker health is also probed asynchronously under supervision. A silent probe can remain active
+indefinitely without blocking Orchestrator messages; unknown and probing workers are not selected.
+Explicit success records healthy state, while process exit or explicit failure records one current
+unhealthy reason and schedules a later probe after completion. Workflow host removal and service
+shutdown cancel the owned process tree. Direct dispatch without project preflight proceeds normally
+once the selected worker has an explicit healthy result.
 
 Symphony applies the configured Codex sandbox mode to each turn. In `workspace-write` mode, a local
 run can write the managed task worktree and the source repository's shared Git metadata while the

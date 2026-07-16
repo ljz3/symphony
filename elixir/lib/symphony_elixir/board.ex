@@ -102,6 +102,7 @@ defmodule SymphonyElixir.Board do
         dispatch_gate: :orchestrator_unavailable,
         github: %{available: false, error: :orchestrator_unavailable},
         preflights: [],
+        worker_health: [],
         publication_errors: %{}
       })
 
