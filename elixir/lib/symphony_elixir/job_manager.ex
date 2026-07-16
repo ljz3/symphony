@@ -17,14 +17,56 @@ defmodule SymphonyElixir.JobManager do
   export LC_ALL=C
   cd -- "$1"
 
-  printf 'head %s\n' "$(git rev-parse --verify HEAD)"
-  printf 'staged %s\n' "$(git diff --cached --binary --full-index --no-ext-diff --no-textconv | git hash-object --stdin)"
-  printf 'unstaged %s\n' "$(git diff --binary --full-index --no-ext-diff --no-textconv | git hash-object --stdin)"
+  emit_component() {
+    printf '%s\\000%s\\000' "$1" "$2"
+  }
+
+  emit_component head "$(git rev-parse --verify HEAD)"
+  emit_component staged "$(git diff --cached --binary --full-index --no-ext-diff --no-textconv | git hash-object --stdin)"
+  emit_component unstaged "$(git diff --binary --full-index --no-ext-diff --no-textconv | git hash-object --stdin)"
 
   while IFS= read -r -d '' path; do
-    path_hash=$(printf '%s' "$path" | git hash-object --stdin)
-    content_hash=$(git hash-object --no-filters -- "$path")
-    printf 'untracked %s %s\n' "$path_hash" "$content_hash"
+    if [ -L "$path" ]; then
+      type=symlink
+      content_kind=target
+      content_hash=$(readlink "./$path" | git hash-object --stdin)
+    elif [ -f "$path" ]; then
+      type=regular
+      content_kind=bytes
+      content_hash=$(git hash-object --no-filters -- "$path")
+    elif [ -d "$path" ]; then
+      type=directory
+      content_kind=metadata
+      content_hash=$(printf '%s' directory | git hash-object --stdin)
+    elif [ -p "$path" ]; then
+      type=fifo
+      content_kind=metadata
+      content_hash=$(printf '%s' fifo | git hash-object --stdin)
+    elif [ -S "$path" ]; then
+      type=socket
+      content_kind=metadata
+      content_hash=$(printf '%s' socket | git hash-object --stdin)
+    elif [ -b "$path" ]; then
+      type=device
+      content_kind=block
+      content_hash=$(printf '%s' block-device | git hash-object --stdin)
+    elif [ -c "$path" ]; then
+      type=device
+      content_kind=character
+      content_hash=$(printf '%s' character-device | git hash-object --stdin)
+    elif [ -e "$path" ]; then
+      type=other
+      content_kind=metadata
+      content_hash=$(printf '%s' other | git hash-object --stdin)
+    else
+      printf 'untracked path disappeared: %s\n' "$path" >&2
+      exit 66
+    fi
+
+    emit_component untracked_path "$path"
+    emit_component untracked_type "$type"
+    emit_component untracked_content_kind "$content_kind"
+    emit_component untracked_content "$content_hash"
   done < <(git ls-files --others --exclude-standard -z)
   """
 

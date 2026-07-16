@@ -171,6 +171,69 @@ defmodule SymphonyElixir.JobManagerTest do
     assert Enum.uniq(fingerprints) == fingerprints
   end
 
+  test "remote source fingerprint frames untracked file type without reading special files", %{
+    workspace: workspace
+  } do
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(workspace, "fingerprint-fake-ssh")
+    File.mkdir_p!(fake_bin)
+
+    write_script!(fake_bin, "ssh", """
+    #!/bin/sh
+    for argument in "$@"; do command=$argument; done
+    exec /bin/sh -c "$command"
+    """)
+
+    System.put_env("PATH", fake_bin <> ":" <> original_path)
+    on_exit(fn -> System.put_env("PATH", original_path) end)
+
+    path = Path.join(workspace, "kind-collision")
+    File.write!(path, "same-bytes")
+    regular = JobManager.source_fingerprint(workspace, "fake-worker")
+
+    first_target =
+      Path.join(System.tmp_dir!(), "fingerprint-regular-#{System.unique_integer([:positive])}")
+
+    File.rename!(path, first_target)
+    File.ln_s!(first_target, path)
+    first_symlink = JobManager.source_fingerprint(workspace, "fake-worker")
+
+    moved_symlink =
+      Path.join(System.tmp_dir!(), "fingerprint-symlink-#{System.unique_integer([:positive])}")
+
+    second_target =
+      Path.join(System.tmp_dir!(), "fingerprint-target-#{System.unique_integer([:positive])}")
+
+    File.rename!(path, moved_symlink)
+    File.write!(second_target, "same-bytes")
+    File.ln_s!(second_target, path)
+    second_symlink = JobManager.source_fingerprint(workspace, "fake-worker")
+
+    assert is_binary(regular)
+    assert is_binary(first_symlink)
+    assert is_binary(second_symlink)
+    refute regular == first_symlink
+    refute first_symlink == second_symlink
+
+    case System.find_executable("mkfifo") do
+      nil ->
+        :ok
+
+      mkfifo ->
+        fifo = Path.join(workspace, "untracked-fifo")
+        {_, 0} = System.cmd(mkfifo, [fifo], stderr_to_stdout: true)
+        fifo_fingerprint = JobManager.source_fingerprint(workspace, "fake-worker")
+        assert is_binary(fifo_fingerprint)
+
+        {listed, 0} =
+          System.cmd("git", ["-C", workspace, "ls-files", "--others", "--exclude-standard", "-z"])
+
+        if "untracked-fifo" in :binary.split(listed, <<0>>, [:global]) do
+          refute fifo_fingerprint == second_symlink
+        end
+    end
+  end
+
   test "runs on a configured worker and returns remote artifacts locally", %{workspace: workspace} do
     original_path = System.get_env("PATH")
     fake_bin = Path.join(workspace, "fake-ssh-bin")
