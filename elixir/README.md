@@ -243,14 +243,25 @@ and a column referenced by a live task cannot be removed.
 
 ## Agent execution and GitHub
 
-For each claimed dispatch task, Symphony atomically records the run, creates or reuses its managed
-worktree, runs configured hooks, validates the exact model against Codex's complete catalog, renders
-the stage prompt/workpad, and starts app-server in that worktree. The prompt order is fixed:
+For each eligible dispatch task, Symphony first reserves global and selected-worker capacity. When
+dispatch preflight is configured, it creates or reuses the managed worktree and runs the preflight
+there while the task remains queued and no run exists. A successful command is usable only if a
+fresh read confirms the same task revision, eligibility, workflow hash, and worker reservation;
+otherwise Symphony discards it and probes current state again. Symphony then atomically records the
+run, runs configured hooks, validates the exact model against Codex's complete catalog, renders the
+stage prompt/workpad, and starts app-server in that worktree. The prompt order is fixed:
 
 1. Symphony's runner safety contract
 2. workflow base prompt
 3. workflow context prompt
 4. selected stage prompt
+
+Preflight has no elapsed-time or inactivity deadline. A running probe consumes capacity. Explicit
+failure releases that capacity, gates only the affected queued task until its retry time, and exposes
+one replaceable current diagnostic rather than a history. Task changes and workflow activation
+cancel stale probes. Owner monitoring terminates an orphaned local or SSH command when the
+orchestrator exits, so restart reruns the probe instead of accepting a pre-restart result. Board
+health projects only current running or failed preflight state.
 
 Symphony applies the configured Codex sandbox mode to each turn. In `workspace-write` mode, a local
 run can write the managed task worktree and the source repository's shared Git metadata while the

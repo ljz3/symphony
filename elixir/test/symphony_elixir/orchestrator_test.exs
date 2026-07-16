@@ -38,6 +38,78 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert status.publication_errors == %{"failing" => :github_unavailable}
   end
 
+  test "preflight reservations consume global and worker capacity and expose only current state" do
+    active = %{
+      probe_id: make_ref(),
+      task_id: "preparing",
+      identifier: "SYM-PREFLIGHT",
+      task_revision: 7,
+      workflow_hash: "workflow-hash",
+      worker_host: "builder-a",
+      workspace_path: nil,
+      phase: :preparing_worktree,
+      started_at: "2026-07-16T00:00:00Z",
+      last_activity_at: "2026-07-16T00:00:00Z",
+      pid: self(),
+      ref: make_ref()
+    }
+
+    failed = %{
+      task_id: "failed",
+      identifier: "SYM-FAILED",
+      task_revision: 3,
+      workflow_hash: "workflow-hash",
+      worker_host: "builder-b",
+      status: :failed,
+      fingerprint: "failure-fingerprint",
+      reason: "exit_status_2: configuration unavailable",
+      reason_kind: "exit_status_2",
+      completed_at: "2026-07-16T00:00:01Z",
+      next_retry_at: "2026-07-16T00:00:31Z",
+      retry_at_ms: System.monotonic_time(:millisecond) + 30_000
+    }
+
+    state =
+      struct(State,
+        preflights: %{active.task_id => active},
+        preflight_refs: %{active.ref => active.task_id},
+        preflight_failures: %{failed.task_id => failed}
+      )
+
+    assert Orchestrator.capacity_load(state) == 1
+    assert Orchestrator.worker_load(state, "builder-a") == 1
+    assert Orchestrator.worker_load(state, "builder-b") == 0
+
+    assert {:reply, status, _state} = Orchestrator.handle_call(:status, self(), state)
+
+    assert status.preflights == [
+             %{
+               identifier: "SYM-FAILED",
+               task_id: "failed",
+               task_revision: 3,
+               workflow_hash: "workflow-hash",
+               worker_host: "builder-b",
+               status: :failed,
+               fingerprint: "failure-fingerprint",
+               reason: "exit_status_2: configuration unavailable",
+               completed_at: "2026-07-16T00:00:01Z",
+               next_retry_at: "2026-07-16T00:00:31Z"
+             },
+             %{
+               identifier: "SYM-PREFLIGHT",
+               task_id: "preparing",
+               task_revision: 7,
+               workflow_hash: "workflow-hash",
+               worker_host: "builder-a",
+               workspace_path: nil,
+               status: :running,
+               phase: :preparing_worktree,
+               started_at: "2026-07-16T00:00:00Z",
+               last_activity_at: "2026-07-16T00:00:00Z"
+             }
+           ]
+  end
+
   defp publish_merging_bundle do
     bundle = Config.bundle!()
 

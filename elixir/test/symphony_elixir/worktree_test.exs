@@ -70,6 +70,70 @@ defmodule SymphonyElixir.WorktreeTest do
     assert File.read!(sentinel) == "safe"
   end
 
+  test "runs preflight in the managed worktree with frozen task and workflow identity" do
+    task = task_fixture(BoardFactory.unique("SYM-PREFLIGHT-ENV"))
+    assert {:ok, path} = Worktree.ensure(task)
+
+    command =
+      ~S(printf '%s\n' "$SYMPHONY_TASK_ID|$SYMPHONY_TASK_IDENTIFIER|$SYMPHONY_TASK_BRANCH|$SYMPHONY_WORKFLOW_HASH|$PWD")
+
+    assert {:ok, output} = Worktree.run_preflight(task, path, command, "workflow-hash")
+
+    [task_id, identifier, branch, workflow_hash, command_path] =
+      output |> String.trim() |> String.split("|", parts: 5)
+
+    assert [task_id, identifier, branch, workflow_hash] ==
+             [task.id, task.identifier, task.branch, "workflow-hash"]
+
+    assert {:ok, canonical_command_path} = SymphonyElixir.PathSafety.canonicalize(command_path)
+    assert {:ok, canonical_path} = SymphonyElixir.PathSafety.canonicalize(path)
+    assert canonical_command_path == canonical_path
+  end
+
+  @tag timeout: 15_000
+  test "waits for a quiet preflight beyond the former hook deadline and preserves all output" do
+    task = task_fixture(BoardFactory.unique("SYM-PREFLIGHT-LONG"))
+    assert {:ok, path} = Worktree.ensure(task)
+    payload = String.duplicate("preflight-output-", 8_192)
+    encoded = Base.encode64(payload)
+
+    started_at = System.monotonic_time(:millisecond)
+
+    assert {:ok, ^payload} =
+             Worktree.run_preflight(
+               task,
+               path,
+               "sleep 5.2; printf %s #{encoded} | base64 --decode",
+               "workflow-hash"
+             )
+
+    assert System.monotonic_time(:millisecond) - started_at >= 5_100
+  end
+
+  test "stops an active preflight when its orchestrator owner exits" do
+    task = task_fixture(BoardFactory.unique("SYM-PREFLIGHT-OWNER"))
+    assert {:ok, path} = Worktree.ensure(task)
+    marker = Path.join(path, "preflight-started")
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+
+    preflight =
+      Elixir.Task.async(fn ->
+        Worktree.run_preflight(
+          task,
+          path,
+          "touch #{shell_escape(marker)}; sleep 600",
+          "workflow-hash",
+          nil,
+          owner: owner
+        )
+      end)
+
+    eventually(fn -> File.exists?(marker) end)
+    Process.exit(owner, :kill)
+
+    assert {:error, :preflight_owner_down} = Elixir.Task.await(preflight, 5_000)
+  end
+
   @tag timeout: 20_000
   test "waits for a worktree hook beyond the former hook deadline", %{source: source} do
     workflow =
@@ -115,5 +179,21 @@ defmodule SymphonyElixir.WorktreeTest do
       {_output, 0},
       System.cmd("git", ["-C", root, "show-ref", "--verify", "--quiet", "refs/heads/#{branch}"], stderr_to_stdout: true)
     )
+  end
+
+  defp eventually(predicate, attempts \\ 100)
+  defp eventually(predicate, 0), do: assert(predicate.())
+
+  defp eventually(predicate, attempts) do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(25)
+      eventually(predicate, attempts - 1)
+    end
+  end
+
+  defp shell_escape(value) do
+    "'" <> String.replace(to_string(value), "'", "'\"'\"'") <> "'"
   end
 end

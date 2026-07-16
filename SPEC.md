@@ -185,14 +185,19 @@ Other invariants:
 
 Replace tracker polling with event-driven candidate dispatch plus periodic runtime reconciliation.
 
-1. Query SQLite for eligible dispatch tasks with satisfied dependencies and available slots.
-2. Atomically commit a run claim and any `on_claim` transition.
-3. Create/reuse the persistent task worktree and branch.
-4. Run hooks.
-5. Resolve and validate the frozen stage model/effort.
-6. Render prompt/workpad and start Codex app-server in the worktree.
-7. Run continuation turns without a count or elapsed-time limit, reusing the same session and workpad.
-8. Require an agent transition before the invocation ends.
+1. Query SQLite for eligible queued dispatch tasks with satisfied dependencies and available slots.
+2. Reserve global and selected-worker capacity for the candidate.
+3. When dispatch preflight is configured, create/reuse the persistent task worktree and run the
+   command there while the task remains queued and no run exists.
+4. After preflight succeeds, re-read the task and active workflow and discard the result unless the
+   task revision, eligibility, workflow hash, and worker reservation still match.
+5. Atomically commit a run claim and any `on_claim` transition.
+6. Create/reuse the persistent task worktree and branch when preflight did not already do so.
+7. Run hooks.
+8. Resolve and validate the frozen stage model/effort.
+9. Render prompt/workpad and start Codex app-server in the worktree.
+10. Run continuation turns without a count or elapsed-time limit, reusing the same session and workpad.
+11. Require an agent transition before the invocation ends.
 
 Apply the configured Codex sandbox mode to every turn. For local `workspace-write` runs, grant write
 access to both the managed task worktree and its shared Git common directory while keeping the
@@ -201,6 +206,15 @@ broad source-checkout write access.
 
 Outcomes:
 
+- An active preflight consumes global and worker-host capacity. Elapsed time and silence never end
+  it. Task movement, workflow activation, shutdown, or explicit cancellation may terminate it.
+- Explicit preflight failure releases its reservation, keeps the task queued, and retains only the
+  current diagnostic fingerprint, reason, completion time, and next retry time for that task.
+  Identical failures replace current state instead of appending history, and unrelated tasks remain
+  dispatchable. The retry delay schedules a new probe only after the prior probe exits.
+- Orchestrator restart terminates an orphaned local or SSH probe through owner monitoring; the new
+  orchestrator reruns the current probe and never trusts a pre-restart success.
+- Board health exposes only current running and failed preflight projections.
 - Transition to a different dispatch stage ends the current stage successfully and schedules a fresh run with the new stage prompt/workpad.
 - Transition to pause/terminal finishes the run.
 - Ending in the unchanged dispatch stage after an explicit invocation failure, requesting input, hook/process/protocol failure, or abnormal exit moves immediately to Blocked. Elapsed time, silence, and continuation count are not failures.
@@ -349,7 +363,10 @@ Add targeted coverage for:
   annotations, dynamic state enum discovery, exact-path dispatch, project-ID fail-closed behavior,
   safe task/run/event projections, Host/Origin rejection, canonical task creation, and per-request
   idempotency.
-- Orchestrator claim/on-claim behavior, stage handoffs, no-retry blocking, orphan recovery, human stop, GitHub-wait exception, capacity, and dependency gating.
+- Orchestrator pre-claim reservation, no-run-before-success, stale-success rejection, current-only
+  failure projection, delayed retry, cancellation/restart cleanup, claim/on-claim behavior, stage
+  handoffs, no-retry blocking, orphan recovery, human stop, GitHub-wait exception, capacity, and
+  dependency gating.
 - Cumulative-only token extraction, camel/snake-case token fields, cached tokens, high-water behavior, unique turns, telemetry migration/recovery/cleanup, terminal stats for completion/stop/failure, and `null` unavailable usage.
 - Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, meaningful-diff draft PR creation including documentation-only and zero-diff cases, publication markers, readiness prerequisites, rework-to-draft, cancellation, and merge validation.
 - Creator-run PR-body routing, existing workpad-comment routing before or after finalization, unpublished failed-run locality, retry-after-GitHub-failure, and crash-after-publication idempotency.

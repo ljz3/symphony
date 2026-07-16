@@ -47,7 +47,8 @@ For external effects, include the durable saga/effect identifier and PR number w
 
 - `Board.Writer` and `Board.History`: command acceptance, event commit/projection, CAS failure,
   replay, checkpoint, divergence, and reconciliation with event and revision context.
-- `Orchestrator`: dispatch gates, claim, dependency/capacity decisions, stop requests, orphan
+- `Orchestrator`: dispatch gates, preflight start/pass/failure/cancellation with task revision,
+  workflow hash and worker context, claim, dependency/capacity decisions, stop requests, orphan
   recovery, external-effect progress, worker exit, and terminal cleanup with task/run context.
 - `AgentRunner`: invocation start/completion/blocking with task/run/stage/worker context and
   `session_id` once known.

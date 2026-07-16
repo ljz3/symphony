@@ -134,6 +134,46 @@ defmodule SymphonyElixir.Worktree do
     end
   end
 
+  @doc """
+  Runs the configured pre-claim command in an already managed task worktree.
+
+  The command has no elapsed-time or inactivity deadline. When an owner is
+  supplied, loss of that process terminates the supervised local process tree or
+  SSH command and closes its port so an orphaned probe cannot overlap the probe
+  started by a restarted orchestrator.
+  """
+  @spec run_preflight(Task.t(), Path.t(), String.t(), String.t(), worker_host(), keyword()) ::
+          {:ok, String.t()} | {:error, term()}
+  def run_preflight(
+        %Task{} = task,
+        worktree,
+        command,
+        workflow_hash,
+        worker_host \\ nil,
+        opts \\ []
+      )
+      when is_binary(worktree) and is_binary(command) and is_binary(workflow_hash) and is_list(opts) do
+    owner = Keyword.get(opts, :owner)
+    cancellation_ref = Keyword.get(opts, :cancellation_ref, make_ref())
+
+    with {:ok, port} <- start_preflight_port(task, worktree, command, workflow_hash, worker_host),
+         {:ok, {output, status}} <- collect_preflight_port(port, owner, cancellation_ref) do
+      if status == 0,
+        do: {:ok, output},
+        else: {:error, {:preflight_failed, status, output}}
+    end
+  end
+
+  @doc false
+  @spec terminate_owned_processes(pid()) :: :ok
+  def terminate_owned_processes(owner) when is_pid(owner) do
+    owner
+    |> owned_ports()
+    |> Enum.each(&terminate_preflight_port/1)
+
+    :ok
+  end
+
   @spec remove(Task.t(), worker_host()) :: :ok | {:error, term()}
   def remove(%Task{} = task, worker_host \\ nil) do
     if worker_host do
@@ -539,6 +579,133 @@ defmodule SymphonyElixir.Worktree do
       {:ok, {output, status}} -> {:error, {:worktree_hook_failed, kind, host, status, output}}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp start_preflight_port(task, worktree, command, workflow_hash, nil) do
+    case System.find_executable("bash") do
+      nil ->
+        {:error, :bash_not_found}
+
+      executable ->
+        port_opts = [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: [~c"-lc", String.to_charlist(command)],
+          cd: String.to_charlist(worktree),
+          env: preflight_env(task, workflow_hash) |> Enum.map(&port_env/1)
+        ]
+
+        {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
+    end
+  rescue
+    error -> {:error, {:preflight_start_failed, Exception.message(error)}}
+  end
+
+  defp start_preflight_port(task, worktree, command, workflow_hash, host) do
+    exports =
+      task
+      |> preflight_env(workflow_hash)
+      |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
+
+    script = "cd #{shell_escape(worktree)} && env #{exports} bash -lc #{shell_escape(command)}"
+    SSH.start_port(host, script)
+  end
+
+  defp collect_preflight_port(port, owner, cancellation_ref) when is_pid(owner) do
+    owner_ref = Process.monitor(owner)
+
+    try do
+      collect_preflight_port(port, owner_ref, cancellation_ref, [])
+    after
+      Process.demonitor(owner_ref, [:flush])
+    end
+  end
+
+  defp collect_preflight_port(port, _owner, cancellation_ref) do
+    collect_preflight_port(port, make_ref(), cancellation_ref, [])
+  end
+
+  defp collect_preflight_port(port, owner_ref, cancellation_ref, chunks) do
+    receive do
+      {^port, {:data, data}} ->
+        collect_preflight_port(port, owner_ref, cancellation_ref, [data | chunks])
+
+      {^port, {:exit_status, status}} ->
+        {:ok, {chunks |> Enum.reverse() |> IO.iodata_to_binary(), status}}
+
+      {^port, :closed} ->
+        {:error, :preflight_port_closed}
+
+      {:DOWN, ^owner_ref, :process, _owner, _reason} ->
+        terminate_preflight_port(port)
+        {:error, :preflight_owner_down}
+
+      {:cancel_preflight, ^cancellation_ref} ->
+        terminate_preflight_port(port)
+        {:error, :preflight_cancelled}
+    end
+  end
+
+  defp terminate_preflight_port(port) do
+    with {:os_pid, os_pid} when is_integer(os_pid) <- Port.info(port, :os_pid) do
+      os_pid
+      |> descendant_processes()
+      |> Enum.reverse()
+      |> Enum.each(&signal_process(&1, "TERM"))
+
+      signal_process(os_pid, "TERM")
+    end
+
+    if Port.info(port), do: Port.close(port)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp owned_ports(owner) do
+    case Process.info(owner, :links) do
+      {:links, links} -> Enum.filter(links, &is_port/1)
+      nil -> []
+    end
+  end
+
+  defp descendant_processes(pid) do
+    pid
+    |> child_processes()
+    |> Enum.flat_map(fn child -> [child | descendant_processes(child)] end)
+  end
+
+  defp child_processes(pid) do
+    case System.cmd("pgrep", ["-P", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split(~r/\s+/, trim: true)
+        |> Enum.flat_map(fn value ->
+          case Integer.parse(value) do
+            {child, ""} -> [child]
+            _ -> []
+          end
+        end)
+
+      {_output, _status} ->
+        []
+    end
+  rescue
+    _error -> []
+  end
+
+  defp signal_process(pid, signal) do
+    _result = System.cmd("kill", ["-#{signal}", Integer.to_string(pid)], stderr_to_stdout: true)
+    :ok
+  rescue
+    _error -> :ok
+  end
+
+  defp port_env({key, value}), do: {String.to_charlist(key), String.to_charlist(value)}
+
+  defp preflight_env(task, workflow_hash) do
+    hook_env(task) ++ [{"SYMPHONY_WORKFLOW_HASH", workflow_hash}]
   end
 
   defp hook_env(task) do
