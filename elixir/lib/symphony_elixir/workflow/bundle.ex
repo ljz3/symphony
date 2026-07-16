@@ -150,7 +150,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
          {:ok, merge} <- parse_merge(config["merge"]),
          {:ok, human_transitions, agent_transitions} <-
            parse_transitions(config["transitions"], columns),
-         :ok <- validate_column_semantics(columns, stages, merge) do
+         :ok <- validate_column_semantics(columns, stages, merge, human_transitions, agent_transitions) do
       loaded_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
       hash = bundle_hash(config, prompts, stages)
 
@@ -546,7 +546,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
     end)
   end
 
-  defp validate_column_semantics(columns, stages, merge) do
+  defp validate_column_semantics(columns, stages, merge, human_transitions, agent_transitions) do
     initial = Enum.filter(columns, & &1.initial)
     blocked = Enum.filter(columns, &(&1.role == :blocked))
     done = Enum.filter(columns, & &1.satisfies_dependencies)
@@ -558,7 +558,8 @@ defmodule SymphonyElixir.Workflow.Bundle do
          :ok <- at_most_one(ready, :mark_pr_ready_column),
          :ok <- validate_initial_column(List.first(initial)),
          :ok <- validate_done_column(List.first(done)),
-         :ok <- validate_merge_columns(columns, merge) do
+         :ok <- validate_merge_columns(columns, merge),
+         :ok <- validate_merge_transitions(columns, merge, human_transitions, agent_transitions) do
       validate_on_claim(columns, stages)
     end
   end
@@ -589,6 +590,28 @@ defmodule SymphonyElixir.Workflow.Bundle do
       %Column{role: :dispatch} -> :ok
       nil -> {:error, {:unknown_merge_target, kind, id}}
       %Column{role: role} -> {:error, {:merge_target_not_dispatchable, kind, id, role}}
+    end
+  end
+
+  defp validate_merge_transitions(_columns, nil, _human, _agent), do: :ok
+
+  defp validate_merge_transitions(columns, merge, human, agent) do
+    merge_column = Enum.find(columns, &(&1.role == :merge))
+    review = Enum.find(columns, &(&1.id == merge.review_column))
+    conflict = Enum.find(columns, &(&1.id == merge.conflict_column))
+    blocked = Enum.find(columns, &(&1.role == :blocked))
+    all_targets = Map.values(human) ++ Map.values(agent)
+    conflict_targets = Map.get(agent, conflict.id, [])
+
+    with true <- review.stage_id != conflict.stage_id,
+         false <- Enum.any?(all_targets, &(merge_column.id in &1)),
+         true <- Map.get(human, merge_column.id, []) == [],
+         true <- Map.get(agent, merge_column.id, []) == [],
+         true <- review.id in conflict_targets,
+         true <- Enum.all?(conflict_targets, &(&1 in [review.id, blocked.id])) do
+      :ok
+    else
+      _ -> {:error, :invalid_deterministic_merge_transitions}
     end
   end
 

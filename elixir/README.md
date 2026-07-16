@@ -17,12 +17,17 @@ worktree and branch. A service-owned `gh` process manages pull-request effects a
 The checked-in workflow provides:
 
 ```text
-Backlog -> Todo -> In Progress -> Automated Review -> Human Review -> Merging -> Done
-                                \-> Rework ---------/
+Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merging -> Done
+                                |       ^                                |
+                                v       |                                v
+                              Rework ---+                         Merge Conflict
+                                |
+                                +--------------------------------> Automated Review
 ```
 
-Blocked records the previous column so a human can resume it; Cancelled is an unsuccessful terminal
-state. Only Done satisfies dependencies. Agent failures block immediately, and no retry queue exists.
+Human Review remains the publish-and-ready pause path. Blocked records the previous column so a
+human can resume it; Cancelled is an unsuccessful terminal state. Only Done satisfies dependencies.
+Agent failures block immediately, and no retry queue exists.
 
 ## Prerequisites
 
@@ -321,6 +326,43 @@ current run's highest meaningful invocation, otherwise the newest completed, fai
 same-task run's highest meaningful invocation. Generated templates are stored as record-v2 hashes
 and skipped until edited; legacy v1 records remain readable and meaningful. Publication manifests
 remain v1, and cross-task or non-current active work is never selected.
+
+### Structured review and deterministic merge
+
+The configured review run receives `symphony_review_complete`. Its strict nested payload records a
+`pass` or `rework` verdict, the exact reviewed head, plan-policy result, concrete validation
+evidence, structured findings, route, and expected task revision. Symphony independently observes
+the clean source worktree, current source and PR heads, PR state, aggregate GitHub review decision,
+every paginated review thread and comment, and every required check. It stores system-derived
+reviewer/run/time/PR fields and deterministic feedback/check fingerprints in the canonical task
+event; raw provider payloads are not copied into prompt state.
+
+A pass requires matching source/task/PR heads, completed criteria with evidence, a followed or
+not-required plan, no blocker/high findings, aggregate `APPROVED`, no unresolved threads, and green
+required checks. Only that command may route to the system-owned `role: merge` column. Rework
+requires findings and a configured non-review dispatch or Blocked route. Any later canonical source
+or PR-head change clears the pass and sends merge-pending work back to review.
+
+The orchestrator runs at most one deterministic merge worker separately from normal AgentRunner
+capacity; no model or run is claimed for Merging. The worker revalidates the exact reviewed state,
+runs the configured readiness command to natural exit without a deadline, fetches the remote default
+branch, and then either:
+
+- performs a guarded `gh pr merge --squash --match-head-commit <reviewed-head>` when the task branch
+  contains the current target;
+- commits and pushes a normal target-branch merge, invalidates the attestation, and requires review
+  of the new exact head; or
+- verifies a real Git conflict, collects the complete sorted unmerged-path set, aborts the probe,
+  and records the conflict before dispatching the Merge Conflict agent.
+
+External effects have canonical checkpoints before the clean-update push and guarded squash, so a
+restart inspects current Git/PR state and resumes instead of blindly repeating them. A first conflict
+for one task-head/target-head pair enters Merge Conflict; recurrence of the same pair blocks. That
+agent may resolve only the recorded paths by merging the recorded target without rebase/history
+rewrite, validate through `symphony_job_run`, push, and return to Automated Review. It never lands the
+PR. After squash, the system fetches the target until the merge SHA is reachable, then atomically
+records completion and moves to Done. Stale state returns to review, transient provider/process
+failure remains merge-pending, and broken invariants or a missing/closed PR block.
 
 After the first meaningful committed diff from the remote default branch, Symphony pushes the task
 branch and creates a deterministic draft PR. Documentation, product-specification, configuration,

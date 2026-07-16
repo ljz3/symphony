@@ -20,9 +20,10 @@ Symphony separates durable task authority from rebuildable runtime state:
 - The same loopback listener exposes exactly three guarded MCP task tools for Codex: creation,
   exact task lookup, and current-task listing by workflow state.
 - One persistent Git worktree and immutable branch belong to each task.
-- A service-owned `gh` client creates draft pull requests, publishes workpads, checks review
-  readiness, and verifies merges. Publish-only transitions are accepted only after their workpad
-  marker and local publication manifest are durable.
+- A service-owned `gh` client creates draft pull requests, publishes workpads, captures exact-head
+  structured review attestations, and performs checkpointed guarded squash merges without a model.
+  Publish-only transitions are accepted only after their workpad marker and local publication
+  manifest are durable.
 - Completed, stopped, and failed Codex runs retain canonical runtime/turn/token statistics; the PR
   body or the run's published workpad comment exposes the same compact summary without extra comments.
 - The board and statistics view combine those durable summaries with active SQLite telemetry to show
@@ -34,12 +35,15 @@ Symphony separates durable task authority from rebuildable runtime state:
 The standard flow is:
 
 ```text
-Backlog -> Todo -> In Progress -> Automated Review -> Human Review -> Merging -> Done
-                                \-> Rework ---------/
+Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merging -> Done
+                                |       ^                                |
+                                v       |                                v
+                              Rework ---+                         Merge Conflict
 ```
 
-Blocked and Cancelled are explicit side paths. A failed agent invocation moves the task to Blocked;
-there is no agent retry queue.
+Human Review, Blocked, and Cancelled are explicit side paths. A verified merge conflict receives a
+constrained repair run and then returns to Automated Review; recurrence of the same head pair blocks.
+A failed agent invocation moves the task to Blocked; there is no agent retry queue.
 
 See [SPEC.md](SPEC.md) for the behavioral contract and [elixir/README.md](elixir/README.md) for setup,
 operation, storage, and recovery instructions.

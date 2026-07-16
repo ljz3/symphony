@@ -401,7 +401,7 @@ defmodule SymphonyElixir.BoardTest do
     assert recovered_creator["pull_request_created"] == true
     assert {:ok, %{"pull_request_created" => false}} = Board.run(second_run["id"])
 
-    assert {:ok, _result} =
+    assert {:ok, %{"task" => cleaned}} =
              Board.execute(
                %Commands.RunFailed{
                  task_id: linked_task["id"],
@@ -412,5 +412,21 @@ defmodule SymphonyElixir.BoardTest do
                expected_revision: linked_task["revision"],
                idempotency_key: BoardFactory.unique("creator-cleanup")
              )
+
+    assert {:ok, %{"run" => published_creator}} =
+             Board.execute(
+               %Commands.RecordRunStatsPublication{
+                 task_id: cleaned["id"],
+                 run_id: first_run["id"],
+                 destination: "pr_body",
+                 publication_id: "creator-recovery-test-cleanup"
+               },
+               actor: :system,
+               expected_revision: cleaned["revision"],
+               idempotency_key: BoardFactory.unique("creator-stats-cleanup")
+             )
+
+    assert published_creator["stats_publication"]["publication_id"] ==
+             "creator-recovery-test-cleanup"
   end
 end

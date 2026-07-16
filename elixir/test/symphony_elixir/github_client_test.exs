@@ -16,6 +16,7 @@ defmodule SymphonyElixir.GitHubClientTest do
     File.write!(Path.join(root, "pr_edit_count"), "0\n")
     File.write!(Path.join(root, "comment_patch_count"), "0\n")
     File.write!(Path.join(root, "comment_count"), "0\n")
+    File.write!(Path.join(root, "review_comment_page_count"), "0\n")
     executable = Path.join(root, "gh")
 
     File.write!(executable, """
@@ -45,7 +46,22 @@ defmodule SymphonyElixir.GitHubClientTest do
       api)
         case "$*" in
           *rate_limit*) printf '%s' '{"resources":{}}' ;;
-          *graphql*) printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
+          *graphql*)
+            if [ "${FAKE_GH_REVIEW_PAGINATION:-}" = "comments-101" ]; then
+              case "$*" in
+                *id=thread-1*)
+                  increment "$state/review_comment_page_count"
+                  case "$*" in
+                    *after=comments-page-2*) cat "$state/review_comments_page_2.json" ;;
+                    *) cat "$state/review_comments_page_1.json" ;;
+                  esac
+                  ;;
+                *) cat "$state/review_threads_page.json" ;;
+              esac
+            else
+              printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+            fi
+            ;;
           *issues/comments/*)
             previous=""
             for argument in "$@"; do
@@ -142,7 +158,8 @@ defmodule SymphonyElixir.GitHubClientTest do
                 ;;
               *)
                 head="$(git rev-parse HEAD)"
-                printf '{"number":42,"url":"https://github.example/example/repository/pull/42","isDraft":true,"headRefOid":"%s","reviewDecision":"","state":"OPEN","statusCheckRollup":[]}' "$head"
+                review_decision="${FAKE_GH_REVIEW_DECISION:-}"
+                printf '{"number":42,"url":"https://github.example/example/repository/pull/42","isDraft":true,"headRefOid":"%s","reviewDecision":"%s","state":"OPEN","statusCheckRollup":[]}' "$head" "$review_decision"
                 ;;
             esac
             ;;
@@ -167,6 +184,8 @@ defmodule SymphonyElixir.GitHubClientTest do
     on_exit(fn ->
       System.put_env("PATH", old_path)
       System.delete_env("FAKE_GH_CHECKS")
+      System.delete_env("FAKE_GH_REVIEW_PAGINATION")
+      System.delete_env("FAKE_GH_REVIEW_DECISION")
       System.delete_env("FAKE_GH_STATE")
       System.delete_env("FAKE_PUBLICATION_ID")
       System.delete_env("FAKE_RUN_ID")
@@ -214,6 +233,54 @@ defmodule SymphonyElixir.GitHubClientTest do
   test "preserves genuine required-check CLI failures" do
     assert {:error, {:gh_failed, ["pr", "checks", "42" | _rest], 7, "transport failure"}} =
              readiness("cli_failure")
+  end
+
+  test "review snapshot fingerprints comments beyond the first hundred", %{fake_gh_root: root} do
+    source = BoardFactory.workflow_source()
+    System.put_env("FAKE_GH_REVIEW_PAGINATION", "comments-101")
+
+    File.write!(
+      Path.join(root, "review_threads_page.json"),
+      Jason.encode!(%{
+        "data" => %{
+          "repository" => %{
+            "pullRequest" => %{
+              "reviewThreads" => %{
+                "nodes" => [%{"id" => "thread-1", "isResolved" => false}],
+                "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+              }
+            }
+          }
+        }
+      })
+    )
+
+    first_hundred =
+      Enum.map(1..100, fn index ->
+        %{"id" => "comment-#{index}", "updatedAt" => "2026-07-16T00:00:00Z"}
+      end)
+
+    write_review_comment_pages(root, first_hundred, "2026-07-16T00:00:00Z")
+    task = task_fixture("TEST", github: %{"number" => 42})
+
+    assert {:ok, first} = GitHub.review_snapshot(task, source.root)
+    assert first.unresolved_review_threads == 1
+    assert file_count(root, "review_comment_page_count") == 2
+
+    write_review_comment_pages(root, first_hundred, "2026-07-16T00:00:01Z")
+    assert {:ok, second} = GitHub.review_snapshot(task, source.root)
+    assert file_count(root, "review_comment_page_count") == 4
+    refute second.feedback_fingerprint == first.feedback_fingerprint
+  end
+
+  test "review snapshot accepts only GitHub's aggregate approved decision" do
+    source = BoardFactory.workflow_source()
+    task = task_fixture("TEST", github: %{"number" => 42})
+
+    for {decision, expected} <- [{"", false}, {"CHANGES_REQUESTED", false}, {"APPROVED", true}] do
+      System.put_env("FAKE_GH_REVIEW_DECISION", decision)
+      assert {:ok, %{approved: ^expected}} = GitHub.review_snapshot(task, source.root)
+    end
   end
 
   test "creates a draft pull request for committed documentation configuration and tooling changes", %{
@@ -415,6 +482,36 @@ defmodule SymphonyElixir.GitHubClientTest do
     |> File.read!()
     |> String.trim()
     |> String.to_integer()
+  end
+
+  defp write_review_comment_pages(root, first_hundred, final_updated_at) do
+    File.write!(
+      Path.join(root, "review_comments_page_1.json"),
+      Jason.encode!(%{
+        "data" => %{
+          "node" => %{
+            "comments" => %{
+              "nodes" => first_hundred,
+              "pageInfo" => %{"hasNextPage" => true, "endCursor" => "comments-page-2"}
+            }
+          }
+        }
+      })
+    )
+
+    File.write!(
+      Path.join(root, "review_comments_page_2.json"),
+      Jason.encode!(%{
+        "data" => %{
+          "node" => %{
+            "comments" => %{
+              "nodes" => [%{"id" => "comment-101", "updatedAt" => final_updated_at}],
+              "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+            }
+          }
+        }
+      })
+    )
   end
 
   defp task_fixture(identifier, opts \\ []) do

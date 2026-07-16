@@ -1,16 +1,25 @@
 defmodule SymphonyElixir.OrchestratorTest do
   use ExUnit.Case, async: false
 
+  alias SymphonyElixir.Board
+  alias SymphonyElixir.Board.Commands
+  alias SymphonyElixir.BoardFactory
+  alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.Config
+  alias SymphonyElixir.DeterministicMerge
+  alias SymphonyElixir.DeterministicMerge.Worker, as: MergeWorker
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Orchestrator.State
   alias SymphonyElixir.Task
 
+  @head String.duplicate("a", 40)
+  @target String.duplicate("b", 40)
+
   test "publication reconciliation skips active workpads and gates only the affected task" do
     bundle = publish_merging_bundle()
-    active = task("active", "merging", "active-run")
-    failing = task("failing", "merging", nil)
-    ready = task("ready", "merging", nil)
+    active = task("active", "rework", "active-run")
+    failing = task("failing", "rework", nil)
+    ready = task("ready", "rework", nil)
     parent = self()
 
     publisher = fn task ->
@@ -110,12 +119,233 @@ defmodule SymphonyElixir.OrchestratorTest do
            ]
   end
 
+  test "rework draft conversion waits for the active run and executes after completion" do
+    parent = self()
+    active = %{task("rework", "rework", "active-run") | github: %{"number" => 42, "draft" => false}}
+    state = struct(State)
+
+    drafter = fn task ->
+      send(parent, {:drafted, task.id})
+      :ok
+    end
+
+    recorder = fn task ->
+      send(parent, {:recorded, task.id})
+      {:ok, %{}}
+    end
+
+    assert ^state = Orchestrator.reconcile_rework_draft(state, active, drafter, recorder)
+    refute_receive {:drafted, "rework"}
+    refute_receive {:recorded, "rework"}
+
+    completed = %{active | active_run_id: nil, runtime_state: nil}
+    assert ^state = Orchestrator.reconcile_rework_draft(state, completed, drafter, recorder)
+    assert_receive {:drafted, "rework"}
+    assert_receive {:recorded, "rework"}
+  end
+
+  test "merge-role work uses only the system runner and verified conflict dispatches one agent" do
+    task = canonical_merge_task()
+    selected_task_id = task.id
+    parent = self()
+
+    merge_runner = fn merge_task, _bundle, _opts ->
+      send(parent, {:merge_runner_called, merge_task.id, self()})
+
+      receive do
+        :release_merge_runner -> {:ok, :pending}
+      end
+    end
+
+    agent_runner = fn task_id, run_id, _recipient ->
+      send(parent, {:agent_runner_called, task_id, run_id})
+      :ok
+    end
+
+    disabled_state =
+      struct(State,
+        dispatch_enabled: false,
+        recover_orphans: false,
+        task_filter: &(&1.id == selected_task_id),
+        merge_runner: merge_runner,
+        agent_runner: agent_runner,
+        github_health: %{available: true, authenticated: true, error: nil},
+        github_health_checked_at: System.monotonic_time(:millisecond)
+      )
+
+    assert {:noreply, disabled_state} = Orchestrator.handle_info(:reconcile, disabled_state)
+    refute_receive {:merge_runner_called, ^selected_task_id, _pid}, 100
+
+    state = %{disabled_state | dispatch_enabled: true}
+    assert {:noreply, merging_state} = Orchestrator.handle_info(:reconcile, state)
+    assert_receive {:merge_runner_called, ^selected_task_id, merge_pid}
+    refute_receive {:agent_runner_called, ^selected_task_id, _run_id}, 100
+
+    paths = ["Sources/Conflict.swift"]
+    conflict_id = DeterministicMerge.conflict_id(selected_task_id, @head, @target, paths)
+
+    assert {:ok, %{"task" => conflicted}} =
+             Board.execute(
+               %Commands.RecordMergeConflict{
+                 task_id: selected_task_id,
+                 task_head: @head,
+                 target_head: @target,
+                 conflicted_paths: paths,
+                 conflict_id: conflict_id
+               },
+               actor: :system,
+               expected_revision: task.revision,
+               idempotency_key: BoardFactory.unique("orchestrator-conflict")
+             )
+
+    assert conflicted["column_id"] == "merge_conflict"
+    %{ref: merge_ref} = Map.fetch!(merging_state.merging, selected_task_id)
+    send(merge_pid, :release_merge_runner)
+    assert_receive {:DOWN, ^merge_ref, :process, ^merge_pid, :normal}
+
+    assert {:noreply, post_merge_state} =
+             Orchestrator.handle_info({:DOWN, merge_ref, :process, merge_pid, :normal}, merging_state)
+
+    assert {:noreply, conflict_state} = Orchestrator.handle_info(:reconcile, post_merge_state)
+    assert_receive {:agent_runner_called, ^selected_task_id, conflict_run_id}
+    refute_receive {:agent_runner_called, ^selected_task_id, _run_id}, 100
+    assert map_size(conflict_state.merging) == 0
+    assert Map.fetch!(conflict_state.running, selected_task_id).run_id == conflict_run_id
+
+    on_exit(fn -> cleanup_active_run(selected_task_id, conflict_run_id) end)
+  end
+
+  test "merge worker identity survives an Orchestrator-only restart and prevents duplicate effects" do
+    assert :none = MergeWorker.active()
+
+    task = canonical_merge_task()
+    selected_task_id = task.id
+    parent = self()
+    invocations = :atomics.new(1, [])
+    name = SymphonyElixir.OrchestratorRestartTest
+
+    merge_runner = fn merge_task, _bundle, _opts ->
+      invocation = :atomics.add_get(invocations, 1, 1)
+      send(parent, {:merge_effect_invoked, invocation, merge_task.id, self()})
+
+      receive do
+        {:release_merge_effect, ^invocation} -> :ok
+      end
+
+      if invocation == 1 do
+        {:ok, current} = Board.task(merge_task.id)
+
+        result =
+          Board.execute(
+            %Commands.RecordMergeCheckpoint{
+              task_id: merge_task.id,
+              checkpoint: "clean_update_started",
+              attrs: %{"task_head" => @head, "target_head" => @target}
+            },
+            actor: :system,
+            expected_revision: current.revision,
+            idempotency_key: BoardFactory.unique("orchestrator-restart-checkpoint")
+          )
+
+        send(parent, {:merge_checkpoint_result, result})
+      end
+
+      {:ok, :pending}
+    end
+
+    opts = [
+      name: name,
+      dispatch_enabled: false,
+      recover_orphans: false,
+      task_filter: &(&1.id == selected_task_id),
+      merge_runner: merge_runner
+    ]
+
+    on_exit(fn ->
+      case Process.whereis(name) do
+        pid when is_pid(pid) -> safe_stop(pid)
+        nil -> :ok
+      end
+
+      case MergeWorker.active() do
+        {:ok, _task_id, pid} ->
+          ref = Process.monitor(pid)
+          send(pid, {:release_merge_effect, 1})
+          send(pid, {:release_merge_effect, 2})
+          await_merge_worker_exit(pid, ref)
+
+        :none ->
+          :ok
+      end
+    end)
+
+    {:ok, first_orchestrator} = Orchestrator.start_link(opts)
+    enable_dispatch(first_orchestrator)
+
+    worker =
+      receive do
+        {:merge_effect_invoked, 1, ^selected_task_id, pid} ->
+          pid
+      after
+        2_000 ->
+          state = :sys.get_state(first_orchestrator)
+
+          flunk(
+            "merge worker did not start: gate=#{inspect(state.dispatch_gate)} " <>
+              "active=#{inspect(MergeWorker.active())} task=#{inspect(Board.task(selected_task_id))}"
+          )
+      end
+
+    assert {:ok, ^selected_task_id, ^worker} = MergeWorker.active()
+
+    send(first_orchestrator, :reconcile)
+    send(first_orchestrator, :reconcile)
+    refute_receive {:merge_effect_invoked, 2, ^selected_task_id, _pid}, 200
+    assert :atomics.get(invocations, 1) == 1
+
+    GenServer.stop(first_orchestrator, :normal)
+    assert Process.alive?(worker)
+    assert {:ok, ^selected_task_id, ^worker} = MergeWorker.active()
+
+    {:ok, restarted_orchestrator} = Orchestrator.start_link(opts)
+    enable_dispatch(restarted_orchestrator)
+    send(restarted_orchestrator, :reconcile)
+    send(restarted_orchestrator, :reconcile)
+
+    eventually(fn ->
+      match?(%{pid: ^worker}, :sys.get_state(restarted_orchestrator).merging[selected_task_id])
+    end)
+
+    refute_receive {:merge_effect_invoked, 2, ^selected_task_id, _pid}, 200
+    assert :atomics.get(invocations, 1) == 1
+
+    disable_dispatch(restarted_orchestrator)
+    send(worker, {:release_merge_effect, 1})
+
+    assert_receive {:merge_checkpoint_result, {:ok, %{"task" => checkpointed}}}, 2_000
+    assert checkpointed["merge_saga"]["checkpoint"] == "clean_update_started"
+
+    eventually(fn -> MergeWorker.active() == :none end)
+    eventually(fn -> :sys.get_state(restarted_orchestrator).merging == %{} end)
+
+    enable_dispatch(restarted_orchestrator)
+    assert_receive {:merge_effect_invoked, 2, ^selected_task_id, retry_worker}, 2_000
+    assert {:ok, ^selected_task_id, ^retry_worker} = MergeWorker.active()
+    assert retry_worker != worker
+
+    disable_dispatch(restarted_orchestrator)
+    send(retry_worker, {:release_merge_effect, 2})
+    eventually(fn -> MergeWorker.active() == :none end)
+    assert :atomics.get(invocations, 1) == 2
+    safe_stop(restarted_orchestrator)
+  end
+
   defp publish_merging_bundle do
     bundle = Config.bundle!()
 
     columns =
       Enum.map(bundle.columns, fn
-        %{id: "merging"} = column -> %{column | publish_workpad: true}
+        %{id: "rework"} = column -> %{column | publish_workpad: true}
         column -> column
       end)
 
@@ -143,4 +373,179 @@ defmodule SymphonyElixir.OrchestratorTest do
       updated_at: "now"
     }
   end
+
+  defp canonical_merge_task do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("System merge dispatch")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    assert {:ok, %{"task" => implementation, "run" => implementation_run}} =
+             Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+               actor: :system,
+               expected_revision: todo["revision"],
+               idempotency_key: BoardFactory.unique("orchestrator-implementation-claim")
+             )
+
+    criterion_id = implementation["acceptance_criteria"] |> hd() |> Map.fetch!("id")
+
+    assert {:ok, %{"task" => evidenced}} =
+             Board.execute(
+               %Commands.CompleteAcceptance{
+                 task_id: implementation["id"],
+                 criterion_id: criterion_id,
+                 evidence: [%{"command" => "mix test", "result" => "passed"}]
+               },
+               actor: %{type: :agent, identity: implementation_run["id"]},
+               expected_revision: implementation["revision"],
+               idempotency_key: BoardFactory.unique("orchestrator-acceptance")
+             )
+
+    assert {:ok, %{"task" => sourced}} =
+             Board.execute(%Commands.RecordSourceHead{task_id: evidenced["id"], head_sha: @head, clean: true},
+               actor: %{type: :agent, identity: implementation_run["id"]},
+               expected_revision: evidenced["revision"],
+               idempotency_key: BoardFactory.unique("orchestrator-source")
+             )
+
+    assert {:ok, %{"task" => linked}} =
+             Board.execute(
+               %Commands.LinkPullRequest{
+                 task_id: sourced["id"],
+                 run_id: implementation_run["id"],
+                 number: 1,
+                 url: "https://github.test/pull/1",
+                 head_sha: @head,
+                 state: "open",
+                 draft: false
+               },
+               actor: :system,
+               expected_revision: sourced["revision"],
+               idempotency_key: BoardFactory.unique("orchestrator-pull-request")
+             )
+
+    assert {:ok, %{"task" => review_ready}} =
+             Board.execute(%Commands.MoveTask{task_id: linked["id"], column_id: "automated_review"},
+               actor: %{type: :agent, identity: implementation_run["id"]},
+               expected_revision: linked["revision"],
+               idempotency_key: BoardFactory.unique("orchestrator-to-review")
+             )
+
+    implementation_finished = finish_run(review_ready, implementation_run)
+
+    assert {:ok, %{"task" => review_task, "run" => review_run}} =
+             Board.execute(%Commands.ClaimRun{task_id: implementation_finished["id"]},
+               actor: :system,
+               expected_revision: implementation_finished["revision"],
+               idempotency_key: BoardFactory.unique("orchestrator-review-claim")
+             )
+
+    arguments = %{
+      "expected_revision" => review_task["revision"],
+      "verdict" => "pass",
+      "reviewed_head_sha" => @head,
+      "route" => "merging",
+      "plan_policy" => %{"status" => "followed", "summary" => "Repository plan policy followed."},
+      "validation_evidence" => [%{"command" => "mix test", "result" => "passed", "exit_status" => 0}],
+      "findings" => []
+    }
+
+    snapshotter = fn _task, _worktree, _opts ->
+      {:ok,
+       %{
+         number: 1,
+         state: "OPEN",
+         head_sha: @head,
+         source_head_sha: @head,
+         approved: true,
+         required_checks_green: true,
+         unresolved_review_threads: 0,
+         feedback_fingerprint: "feedback-v1",
+         checks_fingerprint: "checks-v1"
+       }}
+    end
+
+    assert %{"success" => true} =
+             DynamicTool.execute("symphony_review_complete", arguments,
+               task_id: review_task["id"],
+               run_id: review_run["id"],
+               call_id: BoardFactory.unique("orchestrator-review-complete"),
+               review_snapshotter: snapshotter
+             )
+
+    {:ok, attested} = Board.task(review_task["id"])
+    finish_run(attested, review_run)
+    {:ok, task} = Board.task(review_task["id"])
+    task
+  end
+
+  defp finish_run(task, run) do
+    task_id = if is_struct(task, Task), do: task.id, else: task["id"]
+    revision = if is_struct(task, Task), do: task.revision, else: task["revision"]
+
+    assert {:ok, %{"task" => finished}} =
+             Board.execute(%Commands.RunFinished{task_id: task_id, run_id: run["id"], outcome: %{}},
+               actor: :system,
+               expected_revision: revision,
+               idempotency_key: BoardFactory.unique("orchestrator-finish")
+             )
+
+    finished
+  end
+
+  defp cleanup_active_run(task_id, run_id) do
+    case Board.task(task_id) do
+      {:ok, %{active_run_id: ^run_id} = task} ->
+        Board.execute(%Commands.RunFailed{task_id: task_id, run_id: run_id, reason: :test_cleanup},
+          actor: :system,
+          expected_revision: task.revision,
+          idempotency_key: BoardFactory.unique("orchestrator-cleanup")
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp enable_dispatch(orchestrator) do
+    :sys.replace_state(orchestrator, fn state ->
+      %{
+        state
+        | dispatch_enabled: true,
+          github_health: %{available: true, authenticated: true, error: nil},
+          github_health_checked_at: System.monotonic_time(:millisecond)
+      }
+    end)
+
+    send(orchestrator, :reconcile)
+  end
+
+  defp disable_dispatch(orchestrator) do
+    :sys.replace_state(orchestrator, &%{&1 | dispatch_enabled: false})
+  end
+
+  defp safe_stop(orchestrator) do
+    GenServer.stop(orchestrator, :normal)
+  catch
+    :exit, {:noproc, {GenServer, :stop, _arguments}} -> :ok
+  end
+
+  defp await_merge_worker_exit(pid, ref) do
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      2_000 -> flunk("merge worker did not stop during test cleanup")
+    end
+  end
+
+  defp eventually(assertion, attempts \\ 300)
+
+  defp eventually(assertion, attempts) when attempts > 0 do
+    if assertion.() do
+      :ok
+    else
+      Process.sleep(10)
+      eventually(assertion, attempts - 1)
+    end
+  end
+
+  defp eventually(assertion, 0), do: assert(assertion.())
 end

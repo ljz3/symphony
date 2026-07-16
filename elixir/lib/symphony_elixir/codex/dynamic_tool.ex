@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @workpad_read_tool "symphony_workpad_read"
   @workpad_write_tool "symphony_workpad_write"
   @acceptance_tool "symphony_acceptance_complete"
+  @review_tool "symphony_review_complete"
   @transition_tool "symphony_task_transition"
   @create_tool "symphony_task_create"
   @job_tool "symphony_job_run"
@@ -79,6 +80,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       tool_spec(@create_tool, TaskCreateTool.dynamic_description(), TaskCreateTool.input_schema(false))
     ]
 
+    task_tools = if review_tool_available?(run), do: List.insert_at(task_tools, 4, review_tool_spec()), else: task_tools
+
     case frozen_jobs(run) |> Map.keys() |> Enum.sort() do
       [] -> task_tools
       names -> task_tools ++ [job_tool_spec(names)]
@@ -116,6 +119,38 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           task_id: scope.task.id,
           criterion_id: criterion_id,
           evidence: evidence
+        },
+        revision,
+        scope,
+        opts
+      )
+    end
+  end
+
+  defp execute_scoped(@review_tool, arguments, scope, opts) do
+    worktree = scope.run["workspace_path"] || Worktree.path(scope.task)
+    snapshotter = Keyword.get(opts, :review_snapshotter, &GitHub.review_snapshot/3)
+
+    with {:ok, verdict} <- required_enum(arguments, "verdict", ["pass", "rework"]),
+         {:ok, reviewed_head_sha} <- required_sha(arguments, "reviewed_head_sha"),
+         {:ok, route} <- required_string(arguments, "route"),
+         {:ok, plan_policy} <- required_plan_policy(arguments),
+         {:ok, validation_evidence} <- required_validation_evidence(arguments),
+         {:ok, findings} <- required_findings(arguments),
+         {:ok, revision} <- required_revision(arguments),
+         {:ok, provider_snapshot} <-
+           snapshotter.(scope.task, worktree, worker_host: scope.run["worker_host"]) do
+      board_execute(
+        %Commands.RecordReviewAttestation{
+          task_id: scope.task.id,
+          run_id: scope.run["id"],
+          verdict: verdict,
+          reviewed_head_sha: reviewed_head_sha,
+          route: route,
+          plan_policy: plan_policy,
+          validation_evidence: validation_evidence,
+          findings: findings,
+          provider_snapshot: provider_snapshot
         },
         revision,
         scope,
@@ -307,6 +342,72 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
+  defp required_sha(arguments, key) do
+    with {:ok, sha} <- required_string(arguments, key),
+         true <- Regex.match?(~r/\A[0-9a-f]{40,64}\z/i, sha) do
+      {:ok, sha}
+    else
+      false -> {:error, {:invalid_git_sha, key}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp required_enum(arguments, key, allowed) do
+    case Map.get(arguments, key) do
+      value -> if value in allowed, do: {:ok, value}, else: {:error, {:invalid_enum, key, allowed}}
+    end
+  end
+
+  defp required_plan_policy(%{"plan_policy" => %{} = policy}) do
+    status = policy["status"]
+    summary = policy["summary"]
+
+    if Map.keys(policy) |> Enum.sort() == ["status", "summary"] and
+         status in ["not_required", "followed", "deviation"] and nonblank_string?(summary),
+       do: {:ok, policy},
+       else: {:error, :invalid_review_plan_policy}
+  end
+
+  defp required_plan_policy(_arguments), do: {:error, :invalid_review_plan_policy}
+
+  defp required_validation_evidence(%{"validation_evidence" => evidence})
+       when is_list(evidence) and evidence != [] do
+    if Enum.all?(evidence, &valid_validation_evidence?/1),
+      do: {:ok, evidence},
+      else: {:error, :invalid_review_validation_evidence}
+  end
+
+  defp required_validation_evidence(_arguments), do: {:error, :invalid_review_validation_evidence}
+
+  defp valid_validation_evidence?(evidence) when is_map(evidence) do
+    allowed = ~w(artifact command exit_status result)
+
+    Enum.all?(Map.keys(evidence), &(&1 in allowed)) and nonblank_string?(evidence["command"]) and
+      nonblank_string?(evidence["result"]) and optional_string?(evidence["artifact"]) and
+      (is_nil(evidence["exit_status"]) or is_integer(evidence["exit_status"]))
+  end
+
+  defp valid_validation_evidence?(_evidence), do: false
+
+  defp required_findings(%{"findings" => findings}) when is_list(findings) do
+    if Enum.all?(findings, &valid_finding?/1),
+      do: {:ok, findings},
+      else: {:error, :invalid_review_findings}
+  end
+
+  defp required_findings(_arguments), do: {:error, :invalid_review_findings}
+
+  defp valid_finding?(finding) when is_map(finding) do
+    allowed = ~w(line path severity summary)
+
+    Enum.all?(Map.keys(finding), &(&1 in allowed)) and
+      finding["severity"] in ["blocker", "high", "medium", "low", "note"] and
+      nonblank_string?(finding["summary"]) and optional_string?(finding["path"]) and
+      (is_nil(finding["line"]) or (is_integer(finding["line"]) and finding["line"] > 0))
+  end
+
+  defp valid_finding?(_finding), do: false
+
   defp empty_arguments(arguments, _tool) when map_size(arguments) == 0, do: :ok
   defp empty_arguments(_arguments, tool), do: {:error, {:tool_takes_no_arguments, tool}}
 
@@ -318,6 +419,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp nonempty(_value, key), do: {:error, {:nonempty_string_required, key}}
+
+  defp nonblank_string?(value), do: is_binary(value) and String.trim(value) != ""
+  defp optional_string?(nil), do: true
+  defp optional_string?(value), do: is_binary(value)
 
   defp tool_spec(name, description, schema) do
     %{"name" => name, "description" => description, "inputSchema" => schema}
@@ -338,6 +443,91 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     )
   end
+
+  defp review_tool_spec do
+    tool_spec(
+      @review_tool,
+      "Record an exact-head automated-review verdict, evidence, findings, and permitted route.",
+      %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "required" => ~w(expected_revision verdict reviewed_head_sha route plan_policy validation_evidence findings),
+        "properties" => %{
+          "expected_revision" => %{"type" => "integer", "minimum" => 0},
+          "verdict" => %{"type" => "string", "enum" => ["pass", "rework"]},
+          "reviewed_head_sha" => %{"type" => "string", "pattern" => "^[0-9a-fA-F]{40,64}$"},
+          "route" => %{"type" => "string", "minLength" => 1},
+          "plan_policy" => review_plan_policy_schema(),
+          "validation_evidence" => review_validation_schema(),
+          "findings" => review_findings_schema()
+        }
+      }
+    )
+  end
+
+  defp review_plan_policy_schema do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ["status", "summary"],
+      "properties" => %{
+        "status" => %{"type" => "string", "enum" => ["not_required", "followed", "deviation"]},
+        "summary" => %{"type" => "string", "minLength" => 1}
+      }
+    }
+  end
+
+  defp review_validation_schema do
+    %{
+      "type" => "array",
+      "minItems" => 1,
+      "items" => %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "required" => ["command", "result"],
+        "properties" => %{
+          "command" => %{"type" => "string", "minLength" => 1},
+          "result" => %{"type" => "string", "minLength" => 1},
+          "artifact" => %{"type" => ["string", "null"]},
+          "exit_status" => %{"type" => ["integer", "null"]}
+        }
+      }
+    }
+  end
+
+  defp review_findings_schema do
+    %{
+      "type" => "array",
+      "items" => %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "required" => ["severity", "summary"],
+        "properties" => %{
+          "severity" => %{"type" => "string", "enum" => ["blocker", "high", "medium", "low", "note"]},
+          "summary" => %{"type" => "string", "minLength" => 1},
+          "path" => %{"type" => ["string", "null"]},
+          "line" => %{"type" => ["integer", "null"], "minimum" => 1}
+        }
+      }
+    }
+  end
+
+  defp review_tool_available?(nil), do: true
+
+  defp review_tool_available?(%{"stage_id" => stage_id}) do
+    case Workflow.current() do
+      {:ok, %{merge: %{} = merge} = bundle} ->
+        case Bundle.column(bundle, merge.review_column) do
+          %{stage_id: ^stage_id} -> true
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp review_tool_available?(_run), do: false
 
   defp frozen_jobs(%{"frozen_bundle" => %{"jobs" => jobs}}) when is_map(jobs), do: jobs
   defp frozen_jobs(_run), do: %{}

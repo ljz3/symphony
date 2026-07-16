@@ -180,4 +180,49 @@ defmodule SymphonyElixir.CurrentStateTest do
     refute encoded =~ "do-not-copy"
     refute encoded =~ "reviewed_head_sha"
   end
+
+  test "projects canonical review conflict state and tolerates unavailable related state" do
+    {dependency, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Missing workflow column")})
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Review conflict state")})
+    {:ok, %Task{} = task} = Board.task(created["id"])
+
+    conflict = %{
+      "id" => "conflict-id",
+      "task_head" => String.duplicate("a", 40),
+      "target_head" => String.duplicate("b", 40),
+      "conflicted_paths" => ["Sources/Conflict.swift"],
+      "recorded_at" => "2026-01-01T00:00:00Z",
+      "raw" => "must-not-leak"
+    }
+
+    task = %Task{
+      task
+      | dependencies: [dependency["id"]],
+        review_attestation: %{
+          "verdict" => "pass",
+          "reviewed_head_sha" => String.duplicate("a", 40),
+          "route" => "merging",
+          "raw" => "must-not-leak"
+        },
+        merge_saga: %{"checkpoint" => "conflict_recorded", "last_conflict" => conflict}
+    }
+
+    run = %{"id" => "review-conflict-run", "stage_id" => "automated_review", "status" => "running"}
+    projection = CurrentState.project(task, run, %{}, preflights: [], job_manager: :missing_current_state_jobs)
+
+    assert projection["review_attestation"] == %{
+             "verdict" => "pass",
+             "reviewed_head_sha" => String.duplicate("a", 40),
+             "route" => "merging"
+           }
+
+    assert projection["merge_conflict"] == Map.delete(conflict, "raw")
+    assert [%{"id" => dependency_id, "satisfied" => false}] = projection["dependencies"]
+    assert dependency_id == dependency["id"]
+    assert projection["allowed_transitions"] == []
+    refute Map.has_key?(projection, "job")
+
+    unavailable = %{task | dependencies: ["missing-dependency"], review_attestation: nil, merge_saga: nil}
+    assert CurrentState.project(unavailable, run, %{}, preflights: [], job_manager: 123)["dependencies"] == []
+  end
 end

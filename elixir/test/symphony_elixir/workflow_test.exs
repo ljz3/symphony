@@ -151,10 +151,6 @@ defmodule SymphonyElixir.WorkflowTest do
 
     source.workflow
     |> File.read!()
-    |> String.replace(
-      "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-      "  - id: merging\n    name: Merging\n    role: merge"
-    )
     |> Kernel.<>("""
 
     jobs:
@@ -168,11 +164,6 @@ defmodule SymphonyElixir.WorkflowTest do
       preflight:
         command: ./scripts/symphony-preflight.sh
         retry_after_failure_ms: 30000
-    merge:
-      method: squash
-      readiness_command: ./scripts/symphony-merge-readiness.sh
-      review_column: automated_review
-      conflict_column: rework
     """)
     |> then(&File.write!(source.workflow, &1))
 
@@ -199,9 +190,9 @@ defmodule SymphonyElixir.WorkflowTest do
 
     assert bundle.merge == %{
              method: :squash,
-             readiness_command: "./scripts/symphony-merge-readiness.sh",
+             readiness_command: "./elixir/scripts/symphony-merge-readiness.sh",
              review_column: "automated_review",
-             conflict_column: "rework"
+             conflict_column: "merge_conflict"
            }
 
     assert Workflow.Bundle.column(bundle, "merging").role == :merge
@@ -213,20 +204,7 @@ defmodule SymphonyElixir.WorkflowTest do
     original = File.read!(source.workflow)
 
     merge_workflow = fn key ->
-      original
-      |> String.replace(
-        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-        "  - id: merging\n    name: Merging\n    role: merge"
-      )
-      |> Kernel.<>("""
-
-      merge:
-        method: squash
-        readiness_command: ./merge-readiness.sh
-        review_column: automated_review
-        conflict_column: rework
-        #{key}: 1
-      """)
+      insert_under(original, "merge:", "  #{key}: 1")
     end
 
     cases = [
@@ -322,10 +300,7 @@ defmodule SymphonyElixir.WorkflowTest do
     merge_role_workflow =
       source.workflow
       |> File.read!()
-      |> String.replace(
-        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-        "  - id: merging\n    name: Merging\n    role: merge"
-      )
+      |> strip_merge()
 
     File.write!(source.workflow, merge_role_workflow)
     assert {:error, {:merge_columns_require_configuration, ["merging"]}} = Workflow.load(source.workflow)
@@ -350,4 +325,6 @@ defmodule SymphonyElixir.WorkflowTest do
   defp insert_under(yaml, heading, line) do
     String.replace(yaml, heading <> "\n", heading <> "\n" <> line <> "\n", global: false)
   end
+
+  defp strip_merge(yaml), do: Regex.replace(~r/\nmerge:\n(?:  .+\n)+(?=\nhooks:\n)/, yaml, "")
 end
