@@ -25,7 +25,11 @@ Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merg
                                 +--------------------------------> Automated Review
 ```
 
-Human Review remains the publish-and-ready pause path. Blocked records the previous column so a
+Draft or otherwise non-ready pull requests leave Automated Review without a verdict and enter Human
+Review, the publish-and-ready pause path. A human returns the ready PR to Automated Review for a
+fresh structured review; only that explicit non-draft snapshot may pass to Merging. Human Review →
+Rework converts the PR to draft, so the same Human-ready/fresh-review cycle repeats after rework.
+Blocked records the previous column so a
 human can resume it; Cancelled is an unsuccessful terminal state. Only Done satisfies dependencies.
 Agent failures block immediately, and no retry queue exists.
 
@@ -284,6 +288,11 @@ unhealthy reason and schedules a later probe after completion. Workflow host rem
 shutdown cancel the owned process tree. Direct dispatch without project preflight proceeds normally
 once the selected worker has an explicit healthy result.
 
+Synchronous SSH commands capture stderr with stdout. OpenSSH status `255` becomes a structured
+transport error that retains the diagnostic; every other exit status remains a normal command
+result. Deterministic merge treats that transport error as pending at readiness, target comparison,
+reachability, and existing-worktree reconciliation boundaries. These commands have no added timeout.
+
 Symphony applies the configured Codex sandbox mode to each turn. In `workspace-write` mode, a local
 run can write the managed task worktree and the source repository's shared Git metadata while the
 source checkout's working tree remains read-only. This lets task worktrees stage and commit without
@@ -337,14 +346,16 @@ The configured review run receives `symphony_review_complete`. Its strict nested
 `pass` or `rework` verdict, the exact reviewed head, plan-policy result, concrete validation
 evidence, structured findings, route, and expected task revision. Symphony independently observes
 the clean source worktree, current source and PR heads, PR state, aggregate GitHub review decision,
-every paginated review thread and comment, and every required check. It stores system-derived
+the strictly boolean draft state, every paginated review thread and comment, and every required
+check. Draft state participates in the feedback fingerprint. Symphony stores system-derived
 reviewer/run/time/PR fields, deterministic feedback/check fingerprints, and a canonical fingerprint
 of the exact acceptance-criterion set and current evidence in the canonical task event; raw provider
 payloads are not copied into prompt state.
 
 A pass requires matching source/task/PR heads, completed criteria with evidence, a followed or
 not-required plan, no blocker/high findings, aggregate `APPROVED`, no unresolved threads, and green
-required checks. Only that command may route to the system-owned `role: merge` column. Rework
+required checks, plus an explicitly non-draft provider snapshot. A missing or malformed draft field
+invalidates the snapshot. Only that command may route to the system-owned `role: merge` column. Rework
 requires findings and a configured non-review dispatch or Blocked route. Any later canonical source
 or PR-head change, linked PR identity change, or acceptance-criterion/evidence change clears the pass
 and sends merge-pending work back to review.
@@ -362,7 +373,11 @@ branch, and then either:
   and records the conflict before dispatching the Merge Conflict agent.
 
 After readiness exits, and again immediately before a clean-update push or guarded squash, the
-worker reloads canonical task state and re-observes the clean local source and provider PR state.
+worker reloads canonical task state and re-observes the clean local source and provider PR state,
+including `draft: false`. The initial, post-readiness, clean-update, and guarded-squash gates all
+require the PR to remain non-draft; a draft flip returns the task to Automated Review without a
+push or squash.
+
 External effects have canonical checkpoints before the clean-update push and guarded squash, so a
 restart inspects local Git plus the actual remote PR head and resumes instead of repeating them; an
 already-updated remote head invalidates review without another push. A first conflict
@@ -386,10 +401,12 @@ and tooling-only commits qualify; a zero-diff branch does not. Any agent transit
 marker is written to an atomic local manifest before SQLite is marked published; stable task/content
 hash IDs make retries idempotent, while changed content becomes unpublished. Entering Human Review
 continues to publish, enforce acceptance evidence, review-thread and required-check readiness, and
-then mark the PR ready. GitHub CLI's exact no-required-checks diagnostic is normalized to an empty
+then mark the PR ready and project canonical `draft: false`. A human must return that card to
+Automated Review for a fresh review; the readiness action itself does not record or reuse a pass.
+GitHub CLI's exact no-required-checks diagnostic is normalized to an empty
 green set, while listed failed or pending checks and other CLI failures remain blocking. Rework
-returns the PR to draft. Cancelled closes an open PR. Done is accepted only after the merge commit is
-reachable from the remote default branch.
+returns the PR to draft and projects canonical `draft: true`. Cancelled closes an open PR. Done is
+accepted only after the merge commit is reachable from the remote default branch.
 
 Periodic reconciliation never publishes an active run's workpad. A publication failure appears in
 health/status under the affected task ID and gates only that task's dispatch while marker-idempotent
@@ -497,9 +514,12 @@ make e2e
 ```
 
 That target creates disposable source and board remotes, a fake app-server process, and a fake `gh`
-executable. It exercises local task creation, the implementation/review/rework/merge stages, two
-marker-idempotent workpad publications, terminal cleanup, verified handoff, projection loss, writer restart, and
-identical event replay without using a production repository.
+executable. It exercises local task creation, draft Automated Review → Human readiness, Human Review
+→ Rework draft conversion, a second ready cycle, a human return to fresh Automated Review, structured
+pass, and system-owned deterministic Merging with no agent run. It also proves the guarded reviewed
+head is exactly the landed tree, two marker-idempotent workpad publications, reachability, terminal
+cleanup, verified handoff, projection loss, writer restart, and identical event replay without using
+a production repository.
 
 ## Migration note
 

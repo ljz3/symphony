@@ -108,7 +108,7 @@ transitions:
     todo: [backlog, cancelled]
     in_progress: [blocked, cancelled]
     automated_review: [blocked, cancelled]
-    human_review: [rework, cancelled]
+    human_review: [automated_review, rework, cancelled]
     rework: [blocked, cancelled]
     merge_conflict: [blocked, cancelled]
     merging: []

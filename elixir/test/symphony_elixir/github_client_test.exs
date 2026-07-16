@@ -159,7 +159,9 @@ defmodule SymphonyElixir.GitHubClientTest do
               *)
                 head="$(git rev-parse HEAD)"
                 review_decision="${FAKE_GH_REVIEW_DECISION:-}"
-                printf '{"number":42,"url":"https://github.example/example/repository/pull/42","isDraft":true,"headRefOid":"%s","reviewDecision":"%s","state":"OPEN","statusCheckRollup":[]}' "$head" "$review_decision"
+                draft_value="${FAKE_GH_DRAFT_VALUE:-true}"
+                printf '%s' "$*" > "$state/last_pr_view_args"
+                printf '{"number":42,"url":"https://github.example/example/repository/pull/42","isDraft":%s,"headRefOid":"%s","reviewDecision":"%s","state":"OPEN","statusCheckRollup":[]}' "$draft_value" "$head" "$review_decision"
                 ;;
             esac
             ;;
@@ -186,6 +188,7 @@ defmodule SymphonyElixir.GitHubClientTest do
       System.delete_env("FAKE_GH_CHECKS")
       System.delete_env("FAKE_GH_REVIEW_PAGINATION")
       System.delete_env("FAKE_GH_REVIEW_DECISION")
+      System.delete_env("FAKE_GH_DRAFT_VALUE")
       System.delete_env("FAKE_GH_STATE")
       System.delete_env("FAKE_PUBLICATION_ID")
       System.delete_env("FAKE_RUN_ID")
@@ -281,6 +284,27 @@ defmodule SymphonyElixir.GitHubClientTest do
       System.put_env("FAKE_GH_REVIEW_DECISION", decision)
       assert {:ok, %{approved: ^expected}} = GitHub.review_snapshot(task, source.root)
     end
+  end
+
+  test "review snapshot requests and fingerprints one bounded draft boolean", %{fake_gh_root: root} do
+    source = BoardFactory.workflow_source()
+    task = task_fixture("TEST", github: %{"number" => 42})
+
+    System.put_env("FAKE_GH_DRAFT_VALUE", "true")
+    assert {:ok, first} = GitHub.review_snapshot(task, source.root)
+    assert first.draft == true
+    assert File.read!(Path.join(root, "last_pr_view_args")) =~ "isDraft"
+
+    assert Map.keys(first) |> Enum.sort() ==
+             ~w(approved checks_fingerprint draft feedback_fingerprint head_sha merge_sha mergeable number observed_at required_checks_green source_head_sha state unresolved_review_threads url)a
+
+    System.put_env("FAKE_GH_DRAFT_VALUE", "false")
+    assert {:ok, second} = GitHub.review_snapshot(task, source.root)
+    assert second.draft == false
+    refute second.feedback_fingerprint == first.feedback_fingerprint
+
+    System.put_env("FAKE_GH_DRAFT_VALUE", Jason.encode!("not-a-boolean"))
+    assert {:error, _reason} = GitHub.review_snapshot(task, source.root)
   end
 
   test "returns the live pull-request identity and source head for conflict verification" do

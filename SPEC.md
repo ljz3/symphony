@@ -129,8 +129,10 @@ With Human Review, Rework, Merge Conflict, Blocked, and Cancelled branches.
 - `Backlog`: initial pause column.
 - `Todo`: implementation dispatch; `on_claim` atomically moves to In Progress.
 - `In Progress`: implementation stage.
-- `Automated Review`: separately prompted review stage.
-- `Human Review`: pause; entering publishes workpads and marks the draft PR ready.
+- `Automated Review`: separately prompted review stage. A draft or otherwise non-ready PR routes to
+  Human Review without recording a structured verdict.
+- `Human Review`: pause; entering publishes workpads and marks the draft PR ready. A human may return
+  the ready PR to Automated Review for the fresh review required before a pass.
 - `Rework`: separately prompted rework stage, returning to Automated Review.
 - `Merge Conflict`: separately prompted repair stage entered only after the system verifies and records
   a real Git conflict; it returns only to Automated Review or Blocked.
@@ -238,6 +240,11 @@ Preserve SSH workers through a worktree backend:
   failed probe terminates. Workflow host removal and shutdown cancel the supervised process tree.
 - Retain host capacity scheduling; an unhealthy worker is excluded, direct dispatch resumes after
   explicit health, and dispatch is globally gated only when no eligible worker remains.
+- Capture SSH stderr with stdout. OpenSSH exit status `255` is the only command status normalized to
+  a structured transport failure and preserves its diagnostic; all other statuses remain ordinary
+  command results. Deterministic-merge readiness, target comparison, reachability, and existing
+  worktree reconciliation classify that transport failure as merge-pending rather than invariant
+  failure. Do not add a timeout.
 
 ### Run-scoped Codex tools
 
@@ -258,14 +265,16 @@ Pass app-server call metadata to the executor and combine the active run ID with
 reviewed head, `pass` or `rework` verdict, route, plan-policy status and summary, nonempty validation
 evidence, and structured findings. The service, not the model, reads the current clean worktree,
 source head, PR head/state, aggregate review decision, every paginated review thread and comment,
-and every required check context. It stores the reviewer/run identity, observation time, PR number,
+the bounded boolean PR draft state, and every required check context. The draft state participates
+in the feedback fingerprint. It stores the reviewer/run identity, observation time, PR number,
 and deterministic feedback/check fingerprints plus a canonical fingerprint of the exact acceptance-
 criterion multiset and its current evidence in a canonical review-attestation event. Current-state
 projection exposes only the explicit nested attestation allowlist, never raw provider payloads.
 
 A passing attestation requires the exact source/task/PR head, completed criteria with evidence, a
 non-deviating plan policy, no blocker/high findings, aggregate GitHub `APPROVED`, no unresolved
-threads, and green required checks, and routes only to the unique system merge column. A rework
+threads, green required checks, and an explicitly non-draft PR, and routes only to the unique system
+merge column. A missing or non-boolean provider draft field invalidates the snapshot. A rework
 attestation requires findings and routes only along a configured agent edge to a non-review dispatch
 column or Blocked. Direct agent movement into the merge column is rejected. A later canonical source
 or PR-head change, linked PR identity change, or acceptance-criterion/evidence change clears a
@@ -341,14 +350,19 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 - Each publication posts one PR comment containing every unpublished run workpad since the last publication. Include the stable hidden publication ID marker so retries across comment/manifest/SQLite crash windows are idempotent; changed content has a new hash and becomes unpublished.
 - After termination, append the creator run's compact status/model/effort/runtime/turn/token block to the PR body. Append every other run's block to the existing comment identified by its workpad publication marker, reconciling comments posted before final stats exist. Never create a stats-only comment, never copy a creator run into a workpad comment, and never expose Codex thread IDs or pricing estimates.
 - Include a hidden per-run stats marker and record successful publication as an idempotent canonical run event with destination, publication ID, and timestamp. GitHub failures stay in external-effect reconciliation and never retry or alter the agent run.
-- Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, then complete the board transition through a resumable saga.
-- Human Review → Rework converts the PR back to draft.
+- Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, project canonical `draft: false`, then complete the board transition through a resumable saga.
+- Human Review → Rework converts the PR back to draft and projects canonical `draft: true`. After
+  rework returns to Automated Review, a still-draft PR routes through Human Review again. The
+  configured human edge from Human Review to Automated Review starts a fresh review of the ready PR;
+  readiness alone cannot reuse or create a passing attestation.
 - Cancelled closes any open PR with a reason.
 - Reconcile at most one system merge worker at a time, separately from agent capacity and
   `AgentRunner`. Revalidate the exact reviewed source/PR head, feedback fingerprint, aggregate
-  approval, all review threads/comments, all required checks, and acceptance evidence before any
-  merge effect. A valid failed or pending check payload returns to review; provider transport,
-  authentication, or process failure leaves the task merge-pending for reconciliation.
+  approval, boolean non-draft state, all review threads/comments, all required checks, and acceptance
+  evidence before any merge effect. Initial, post-readiness, clean-update, and guarded-squash gates
+  all require `draft: false`. A draft PR or valid failed/pending check payload returns to review;
+  provider transport, authentication, or process failure leaves the task merge-pending for
+  reconciliation.
 - Run the configured merge-readiness command to natural process exit without an elapsed-time,
   inactivity, or output deadline. Fetch the current remote default branch and compare it with the
   reviewed task head. If the task branch is behind, commit and push a normal merge of the target into
@@ -473,10 +487,14 @@ Replace the Linear live E2E with:
 2. Local task creation through the board.
 3. Fake or real Codex implementation run in a task worktree.
 4. First-commit draft PR creation.
-5. Automated Review → Human Review workpad publication.
-6. Rework cycle with a second workpad comment.
-7. Merge → Done validation and cleanup.
-8. Service restart followed by event replay and identical board state.
+5. Automated Review observes the draft PR, records no verdict, and routes to Human Review for
+   workpad publication and readiness.
+6. Human Review → Rework converts the PR to draft; rework returns through Automated Review and a
+   second Human Review publication/readiness cycle.
+7. A human returns the ready PR to Automated Review, whose fresh passing attestation enters Merging.
+   Assert that no Merging agent run exists and that the deterministic system worker guards the exact
+   reviewed head, lands the squash, proves reachability, and moves to Done.
+8. Validate cleanup, then restart projection/writer state and prove identical event replay.
 
 Run targeted tests during implementation, then `mix specs.check` and the full `make all` gate.
 
@@ -489,4 +507,5 @@ Run targeted tests during implementation, then `mix specs.check` and the full `m
 - Workpads are intentionally less durable than task/event history.
 - There is no historical token backfill; only runs finalized after this behavior is deployed have complete stats. Cached-input tokens are shown separately and remain a subset of input tokens.
 - User-facing workflow configuration has no schema-version field; internal SQLite migrations and event-format compatibility remain implementation details.
-- The checked-in standard workflow includes Automated Review followed by optional Human Review.
+- The checked-in standard workflow includes Automated Review and the Human Review ready/re-review
+  cycle required before a draft PR can pass.

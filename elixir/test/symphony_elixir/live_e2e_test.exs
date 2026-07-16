@@ -5,7 +5,8 @@ defmodule SymphonyElixir.LiveE2ETest do
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.{Commands, History, Projection, Sync, Writer}
   alias SymphonyElixir.BoardFactory
-  alias SymphonyElixir.GitHub
+  alias SymphonyElixir.DeterministicMerge.Worker, as: MergeWorker
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow
   alias SymphonyElixir.Workflow.Store
@@ -56,23 +57,83 @@ defmodule SymphonyElixir.LiveE2ETest do
     assert implementation.github["draft"] == true
     assert implementation.github["url"] == "https://github.test/owner/repo/pull/1"
 
-    first_review = run_stage(implementation, "human_review")
-    assert get_in(first_review.github, ["ready", "completed"]) == true
+    first_human_review = run_stage(implementation, "human_review")
+    assert get_in(first_human_review.github, ["ready", "completed"]) == true
+    assert first_human_review.github["draft"] == false
     assert comment_count(fixture.gh_state) == 1
     refute File.exists?(Path.join(fixture.gh_state, "draft"))
 
-    assert :ok = GitHub.convert_to_draft(first_review, worktree)
-    assert File.regular?(Path.join(fixture.gh_state, "draft"))
-    {rework, _result} = BoardFactory.move(Task.to_map(first_review), "rework")
+    {rework_pending, _result} = BoardFactory.move(Task.to_map(first_human_review), "rework")
 
-    reviewed_again = rework |> run_stage("automated_review") |> run_stage("human_review")
+    eventually(fn ->
+      File.regular?(Path.join(fixture.gh_state, "draft")) and
+        match?(
+          {:ok, %{github: %{"draft" => true, "rework_draft" => %{"completed" => true}}}},
+          Board.task(rework_pending["id"])
+        )
+    end)
+
+    assert {:ok, rework} = Board.task(rework_pending["id"])
+    draft_review = run_stage(rework, "automated_review")
+    second_human_review = run_stage(draft_review, "human_review")
+
     assert comment_count(fixture.gh_state) == 2
     refute File.exists?(Path.join(fixture.gh_state, "draft"))
+    assert second_human_review.github["draft"] == false
 
-    {merging, _result} = BoardFactory.move(Task.to_map(reviewed_again), "merging")
-    done = run_stage(merging, "done")
+    orchestrator = Process.whereis(Orchestrator)
+    assert is_pid(orchestrator)
+    original_dispatch_enabled = :sys.get_state(orchestrator).dispatch_enabled
+
+    on_exit(fn -> restore_dispatch(orchestrator, original_dispatch_enabled) end)
+
+    :ok = :sys.suspend(orchestrator)
+
+    merging =
+      try do
+        {ready_review, _result} =
+          BoardFactory.move(Task.to_map(second_human_review), "automated_review")
+
+        merging = run_stage(ready_review, "merging")
+        assert merging.review_attestation["verdict"] == "pass"
+        assert merging.review_attestation["reviewed_head_sha"] == merging.source["head_sha"]
+        assert :none = MergeWorker.active()
+
+        merge_runs = Board.runs(merging.id)
+        assert length(merge_runs) == 5
+        refute Enum.any?(merge_runs, &(&1["start_column_id"] == "merging" or &1["stage_id"] == "merging"))
+        merging
+      after
+        :ok = :sys.resume(orchestrator)
+      end
+
+    enable_system_dispatch(orchestrator)
+    reviewed_head = merging.review_attestation["reviewed_head_sha"]
+
+    eventually(fn ->
+      case Board.task(merging.id) do
+        {:ok, task} -> task.column_id == "done"
+        _ -> false
+      end
+    end)
+
+    assert {:ok, done} = Board.task(merging.id)
+
     assert get_in(done.github, ["merged", "merged"]) == true
     assert get_in(done.github, ["merged", "merge_reachable"]) == true
+    assert File.regular?(Path.join(fixture.gh_state, "readiness_ran"))
+    assert File.read!(Path.join(fixture.gh_state, "guarded_head")) == reviewed_head
+
+    merge_sha = get_in(done.github, ["merged", "merge_sha"])
+    target_head = BoardFactory.git!(fixture.source.remote, ["rev-parse", "refs/heads/main"]) |> String.trim()
+    assert target_head == merge_sha
+
+    assert {_output, 0} =
+             System.cmd(
+               "git",
+               ["--git-dir", fixture.source.remote, "diff", "--quiet", "#{reviewed_head}^{tree}", "#{merge_sha}^{tree}"],
+               stderr_to_stdout: true
+             )
 
     eventually(fn ->
       done.id
@@ -97,7 +158,8 @@ defmodule SymphonyElixir.LiveE2ETest do
     event_types = Board.events(done.id) |> Enum.map(& &1["type"])
     assert "pull_request_linked" in event_types
     assert "github_ready_recorded" in event_types
-    assert "github_merged_recorded" in event_types
+    assert "deterministic_merge_completed" in event_types
+    refute "github_merged_recorded" in event_types
     assert "task_transitioned" in event_types
     assert "run_finished" in event_types
 
@@ -133,6 +195,27 @@ defmodule SymphonyElixir.LiveE2ETest do
     File.write!(fake_codex, fake_codex_script())
 
     source = BoardFactory.workflow_source()
+    readiness_script = Path.join(source.root, "merge-readiness.sh")
+
+    File.write!(
+      readiness_script,
+      "#!/bin/sh\nset -eu\n: > \"${FAKE_GH_STATE:?}/readiness_ran\"\n"
+    )
+
+    File.chmod!(readiness_script, 0o755)
+    BoardFactory.git!(source.root, ["add", "merge-readiness.sh"])
+
+    BoardFactory.git!(source.root, [
+      "-c",
+      "user.name=Symphony Live E2E",
+      "-c",
+      "user.email=symphony-live@example.com",
+      "commit",
+      "-m",
+      "add deterministic readiness fixture"
+    ])
+
+    BoardFactory.git!(source.root, ["push", "origin", "main"])
     github_url = "https://github.test/owner/repo.git"
     rewrite_key = "url.file://#{source.remote}.insteadOf"
     BoardFactory.git!(source.root, ["config", rewrite_key, github_url])
@@ -149,6 +232,7 @@ defmodule SymphonyElixir.LiveE2ETest do
       source.workflow
       |> File.read!()
       |> then(&Regex.replace(~r/^  command:.*$/m, &1, "  command: #{Jason.encode!(codex_command)}"))
+      |> then(&Regex.replace(~r/^  readiness_command:.*$/m, &1, "  readiness_command: ./merge-readiness.sh"))
       |> then(
         &Regex.replace(
           ~r/^board:\n  remote:.*$/m,
@@ -209,6 +293,17 @@ defmodule SymphonyElixir.LiveE2ETest do
 
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp enable_system_dispatch(orchestrator) do
+    :sys.replace_state(orchestrator, &%{&1 | dispatch_enabled: true})
+    Orchestrator.refresh()
+  end
+
+  defp restore_dispatch(orchestrator, dispatch_enabled) do
+    if Process.alive?(orchestrator) do
+      :sys.replace_state(orchestrator, &%{&1 | dispatch_enabled: dispatch_enabled})
+    end
+  end
 
   defp shell_escape(value) do
     "'" <> String.replace(to_string(value), "'", "'\"'\"'") <> "'"
@@ -290,18 +385,51 @@ defmodule SymphonyElixir.LiveE2ETest do
               previous="$argument"
             done
             ;;
+          merge)
+            match_head=""
+            previous=""
+            for argument in "$@"; do
+              if [ "$previous" = "--match-head-commit" ]; then match_head="$argument"; fi
+              previous="$argument"
+            done
+            reviewed_head=$(head_oid)
+            if [ "$match_head" != "$reviewed_head" ]; then
+              printf '%s\n' "head commit mismatch" >&2
+              exit 1
+            fi
+            git fetch origin main
+            target_head=$(git rev-parse origin/main)
+            reviewed_tree=$(git rev-parse "$reviewed_head^{tree}")
+            merge_sha=$(
+              printf '%s\n' 'squash live E2E' |
+                GIT_AUTHOR_NAME='Symphony Live E2E' \
+                GIT_AUTHOR_EMAIL='symphony-live@example.com' \
+                GIT_COMMITTER_NAME='Symphony Live E2E' \
+                GIT_COMMITTER_EMAIL='symphony-live@example.com' \
+                git commit-tree "$reviewed_tree" -p "$target_head"
+            )
+            git push origin "$merge_sha:refs/heads/main"
+            printf '%s' "$reviewed_head" > "$state/guarded_head"
+            printf '%s\n' "$merge_sha" > "$state/merge_sha"
+            : > "$state/merged"
+            ;;
           view)
             case "$*" in
+              *statusCheckRollup*)
+                if [ -f "$state/merge_sha" ]; then
+                  merge_commit=$(printf '{"oid":"%s"}' "$(cat "$state/merge_sha")")
+                else
+                  merge_commit=null
+                fi
+                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","isDraft":%s,"headRefOid":"%s","state":"%s","reviewDecision":"APPROVED","statusCheckRollup":[],"mergeCommit":%s}' "$(draft_value)" "$(head_oid)" "$(pr_state)" "$merge_commit"
+                ;;
               *--json\ body*)
                 markers=$(grep -o '<!-- symphony-[^>]* -->' "$state/pr_body" | tr '\n' ' ')
                 printf '{"body":"%s"}' "$markers"
                 ;;
               *mergeCommit*)
                 merge_sha=$(cat "$state/merge_sha")
-                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","state":"MERGED","mergeCommit":{"oid":"%s"}}' "$merge_sha"
-                ;;
-              *statusCheckRollup*)
-                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","isDraft":%s,"headRefOid":"%s","state":"%s","reviewDecision":"APPROVED","statusCheckRollup":[]}' "$(draft_value)" "$(head_oid)" "$(pr_state)"
+                printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","headRefOid":"%s","state":"MERGED","mergeCommit":{"oid":"%s"}}' "$(head_oid)" "$merge_sha"
                 ;;
               *)
                 printf '{"number":1,"url":"https://github.test/owner/repo/pull/1","isDraft":%s,"headRefOid":"%s","state":"%s"}' "$(draft_value)" "$(head_oid)" "$(pr_state)"
@@ -395,7 +523,7 @@ defmodule SymphonyElixir.LiveE2ETest do
         payload = successful_output!(result)
         task = payload["task"]
         apply_source_effect(state.stage, state.cwd)
-        run_id = task["active_run_id"]
+        run_id = payload["run"]["id"]
 
         next = Map.merge(state, %{phase: :workpad, task: task, run_id: run_id})
         args = %{"content" => "#{state.stage} workpad for #{task["identifier"]}"}
@@ -409,21 +537,30 @@ defmodule SymphonyElixir.LiveE2ETest do
       end
 
       defp handle(%{"id" => _id, "result" => result}, %{phase: :refreshed_context} = state) do
-        task = successful_output!(result)["task"]
+        payload = successful_output!(result)
+        task = payload["task"]
 
-        if state.stage == "implementation" do
-          criterion = hd(task["acceptance_criteria"])
+        cond do
+          state.stage == "implementation" ->
+            criterion = hd(payload["criteria"])
 
-          args = %{
-            "criterion_id" => criterion["id"],
-            "evidence" => [%{"command" => "fake live validation", "result" => "passed"}],
-            "expected_revision" => task["revision"]
-          }
+            args = %{
+              "criterion_id" => criterion["id"],
+              "evidence" => [%{"command" => "fake live validation", "result" => "passed"}],
+              "expected_revision" => task["revision"]
+            }
 
-          {%{state | phase: :acceptance},
-           tool_call("#{state.run_id}:acceptance", "symphony_acceptance_complete", args)}
-        else
-          transition(state, task["revision"])
+            {%{state | phase: :acceptance},
+             tool_call("#{state.run_id}:acceptance", "symphony_acceptance_complete", args)}
+
+          state.stage == "automated_review" and get_in(payload, ["github", "draft"]) == true ->
+            transition(state, task["revision"])
+
+          state.stage == "automated_review" ->
+            review_complete(state, task, payload["source"]["head_sha"])
+
+          true ->
+            transition(state, task["revision"])
         end
       end
 
@@ -432,7 +569,8 @@ defmodule SymphonyElixir.LiveE2ETest do
         transition(state, task["revision"])
       end
 
-      defp handle(%{"id" => _id, "result" => result}, %{phase: :transition} = state) do
+      defp handle(%{"id" => _id, "result" => result}, %{phase: phase} = state)
+           when phase in [:transition, :review] do
         successful_output!(result)
 
         usage = %{
@@ -465,14 +603,33 @@ defmodule SymphonyElixir.LiveE2ETest do
             %{
               "implementation" => "automated_review",
               "automated_review" => "human_review",
-              "rework" => "automated_review",
-              "merging" => "done"
+              "rework" => "automated_review"
             },
             state.stage
           )
 
         args = %{"column_id" => target, "expected_revision" => revision}
         {%{state | phase: :transition}, tool_call("#{state.run_id}:transition", "symphony_task_transition", args)}
+      end
+
+      defp review_complete(state, task, reviewed_head) do
+        args = %{
+          "expected_revision" => task["revision"],
+          "verdict" => "pass",
+          "reviewed_head_sha" => reviewed_head,
+          "route" => "merging",
+          "plan_policy" => %{
+            "status" => "followed",
+            "summary" => "The live fixture followed the repository plan policy."
+          },
+          "validation_evidence" => [
+            %{"command" => "fake live validation", "result" => "passed", "exit_status" => 0}
+          ],
+          "findings" => []
+        }
+
+        {%{state | phase: :review},
+         tool_call("#{state.run_id}:review", "symphony_review_complete", args)}
       end
 
       defp tool_call(id, tool, arguments) do
@@ -484,7 +641,6 @@ defmodule SymphonyElixir.LiveE2ETest do
 
       defp apply_source_effect("implementation", cwd), do: commit_change(cwd, 1, "implementation")
       defp apply_source_effect("rework", cwd), do: commit_change(cwd, 2, "rework")
-      defp apply_source_effect("merging", cwd), do: merge_change(cwd)
       defp apply_source_effect(_stage, _cwd), do: :ok
 
       defp commit_change(cwd, value, message) do
@@ -495,32 +651,6 @@ defmodule SymphonyElixir.LiveE2ETest do
         git!(cwd, ["config", "user.email", "symphony-live@example.com"])
         git!(cwd, ["add", "lib/live_e2e.ex"])
         git!(cwd, ["commit", "-m", message])
-      end
-
-      defp merge_change(cwd) do
-        git!(cwd, ["fetch", "origin", "main"])
-        head = git!(cwd, ["rev-parse", "HEAD"])
-        base = git!(cwd, ["rev-parse", "origin/main"])
-        tree = git!(cwd, ["rev-parse", "HEAD^{tree}"])
-
-        env = [
-          {"GIT_AUTHOR_NAME", "Symphony Live E2E"},
-          {"GIT_AUTHOR_EMAIL", "symphony-live@example.com"},
-          {"GIT_COMMITTER_NAME", "Symphony Live E2E"},
-          {"GIT_COMMITTER_EMAIL", "symphony-live@example.com"}
-        ]
-
-        {merge_sha, 0} =
-          System.cmd("git", ["-C", cwd, "commit-tree", tree, "-p", base, "-p", head, "-m", "merge live E2E"],
-            env: env,
-            stderr_to_stdout: true
-          )
-
-        merge_sha = String.trim(merge_sha)
-        git!(cwd, ["push", "origin", "#{merge_sha}:refs/heads/main"])
-        state = System.fetch_env!("FAKE_GH_STATE")
-        File.write!(Path.join(state, "merge_sha"), merge_sha <> "\n")
-        File.touch!(Path.join(state, "merged"))
       end
 
       defp git!(cwd, args) do

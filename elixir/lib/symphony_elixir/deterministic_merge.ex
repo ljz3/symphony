@@ -93,6 +93,7 @@ defmodule SymphonyElixir.DeterministicMerge do
       {changed_checks?(task, snapshot), "required check contexts changed after review"},
       {changed_criteria?(task), "acceptance criteria or evidence changed after review"},
       {not criteria_complete?(task), "acceptance criteria or evidence changed after review"},
+      {snapshot_value(snapshot, :draft) != false, "pull request is draft or otherwise not ready"},
       {snapshot_value(snapshot, :approved) != true, "pull-request approval is missing or changed"},
       {snapshot_value(snapshot, :unresolved_review_threads) != 0, "pull-request review threads are unresolved"},
       {snapshot_value(snapshot, :required_checks_green) != true, "required checks are not green"}
@@ -644,6 +645,7 @@ defmodule SymphonyElixir.DeterministicMerge do
     [
       {changed_pull_request_identity?(task, context.snapshot), "linked or observed pull-request identity changed during clean update"},
       {changed_criteria?(task), "acceptance criteria or evidence changed during clean update"},
+      {snapshot_value(context.snapshot, :draft) != false, "pull request is draft or otherwise not ready"},
       {task.source["head_sha"] != reviewed or task.github["head_sha"] != reviewed, "canonical source or pull-request head changed during clean update"}
     ]
     |> first_review_reason()
@@ -658,6 +660,7 @@ defmodule SymphonyElixir.DeterministicMerge do
       {changed_feedback?(task, snapshot), "pull-request feedback changed after review"},
       {changed_checks?(task, snapshot), "required check contexts changed after review"},
       {not criteria_complete?(task), "acceptance criteria or evidence changed after review"},
+      {snapshot_value(snapshot, :draft) != false, "pull request is draft or otherwise not ready"},
       {snapshot_value(snapshot, :approved) != true, "pull-request approval is missing or changed"},
       {snapshot_value(snapshot, :unresolved_review_threads) != 0, "pull-request review threads are unresolved"},
       {snapshot_value(snapshot, :required_checks_green) != true, "required checks are not green"}
@@ -760,6 +763,7 @@ defmodule SymphonyElixir.DeterministicMerge do
         path when is_binary(path) ->
           case worktree_module.reconcile(task, path, context.worker_host) do
             {:ok, _state} -> {:ok, Map.put(context, :worktree, path)}
+            {:error, {:ssh_transport_failed, 255, _diagnostic} = reason} -> {:error, {:transient, reason}}
             {:error, reason} -> {:error, {:invariant, {:worktree_reconcile_failed, reason}}}
           end
 

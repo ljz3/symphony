@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.DeterministicMergeTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureIO
+
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.{Config, DeterministicMerge, ReviewAttestation, Task}
 
@@ -91,6 +93,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       {:check_fingerprint, %{snapshot: %{checks_fingerprint: "changed"}}},
       {:approval_absent, %{snapshot: %{approved: false, review_decision: ""}}},
       {:changes_requested, %{snapshot: %{approved: false, review_decision: "CHANGES_REQUESTED"}}},
+      {:draft, %{snapshot: %{draft: true}}},
       {:checks, %{snapshot: %{required_checks_green: false}}}
     ]
 
@@ -149,6 +152,65 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     scenario(%{readiness: {:error, {:invariant, :bash_not_found}}})
     assert {:ok, :blocked} = run(task, bundle)
     assert current_task().column_id == "blocked"
+  end
+
+  test "OpenSSH 255 is transient at every direct remote system boundary", %{task: task, bundle: bundle} do
+    diagnostic = "Permission denied (publickey).\n"
+
+    with_fake_ssh(255, diagnostic, fn ->
+      context = %{
+        bundle: bundle,
+        worktree: "/remote/worktree",
+        worker_host: "worker.example",
+        readiness_command: "true",
+        target_head: @target,
+        merge_sha: @merge
+      }
+
+      parent = self()
+
+      leaked =
+        capture_io(:stderr, fn ->
+          results =
+            for operation <- [:readiness, :target_ancestor, :reachable, :ensure_worktree], into: %{} do
+              {operation, DeterministicMerge.SystemBoundary.call(operation, task, context)}
+            end
+
+          send(parent, {:boundary_results, results})
+        end)
+
+      assert leaked == ""
+      assert_receive {:boundary_results, results}
+
+      expected = {:error, {:transient, {:ssh_transport_failed, 255, diagnostic}}}
+      assert results.readiness == expected
+      assert results.target_ancestor == expected
+      assert results.reachable == expected
+      assert results.ensure_worktree == expected
+    end)
+  end
+
+  test "SSH transport failures leave readiness comparison reachability and reconcile merge-pending", %{
+    task: task,
+    bundle: bundle
+  } do
+    transport = {:transient, {:ssh_transport_failed, 255, "Connection refused\n"}}
+    checkpointed = %{task | merge_saga: %{"checkpoint" => "squash_started"}}
+
+    cases = [
+      {task, %{ensure_worktree: {:error, transport}}},
+      {task, %{readiness: {:error, transport}}},
+      {task, %{target_ancestor: {:error, transport}}},
+      {checkpointed, %{snapshot: %{state: "MERGED", merge_sha: @merge}, reachable: {:error, transport}}}
+    ]
+
+    Enum.each(cases, fn {candidate, values} ->
+      reset(candidate)
+      scenario(values)
+      assert {:ok, :pending} = run(candidate, bundle)
+      assert current_task().column_id == "merging"
+      assert count_call(:guarded_squash) == 0
+    end)
   end
 
   test "guarded head mismatch returns review and merge reachability resumes idempotently", %{
@@ -224,6 +286,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     bundle: bundle
   } do
     review_cases = [
+      %{snapshot: %{draft: true}},
       %{snapshot: %{approved: false}},
       %{snapshot: %{unresolved_review_threads: 1}},
       %{snapshot: %{required_checks_green: false}},
@@ -400,6 +463,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       {third_snapshot({:error, :pull_request_not_linked}), {:ok, :review_required}, "automated_review"},
       {third_snapshot({:error, :worktree_not_clean}), {:ok, :blocked}, "blocked"},
       {third_snapshot(fresh_updated.(%{head_sha: @updated})), {:ok, :review_required}, "automated_review"},
+      {third_snapshot(fresh_updated.(%{draft: true})), {:ok, :review_required}, "automated_review"},
       {third_snapshot(fresh_updated.(%{head_sha: @merge})), {:ok, :review_required}, "automated_review"},
       {third_snapshot(fresh_updated.(%{head_sha: "invalid"})), {:ok, :blocked}, "blocked"},
       {third_snapshot(fresh_updated.(%{state: "CLOSED"})), {:ok, :blocked}, "blocked"},
@@ -438,6 +502,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       {%{source_head: third_source({:error, {:transient, :head_busy}})}, {:ok, :pending}, "merging"},
       {%{review_snapshot: third_snapshot({:error, :pull_request_not_linked})}, {:ok, :review_required}, "automated_review"},
       {%{review_snapshot: third_snapshot({:error, :worktree_not_clean})}, {:ok, :blocked}, "blocked"},
+      {%{review_snapshot: third_snapshot({:ok, snapshot(%{draft: true})})}, {:ok, :review_required}, "automated_review"},
       {%{review_snapshot: third_snapshot({:ok, snapshot(%{approved: false})})}, {:ok, :review_required}, "automated_review"},
       {%{review_snapshot: third_snapshot({:ok, snapshot(%{state: "MERGED", merge_sha: @merge})})}, {:ok, :completed}, "done"},
       {%{review_snapshot: third_snapshot({:ok, snapshot(%{state: "CLOSED"})})}, {:ok, :blocked}, "blocked"}
@@ -744,6 +809,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       %{
         number: 7,
         state: "OPEN",
+        draft: false,
         head_sha: @head,
         source_head_sha: @head,
         approved: true,
@@ -898,6 +964,29 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     Process.put(:merge_scenario, %{})
     Process.delete(:merge_fake_ensure_context)
   end
+
+  defp with_fake_ssh(status, diagnostic, callback) do
+    root = Path.join(System.tmp_dir!(), "merge-fake-ssh-#{Ecto.UUID.generate()}")
+    executable = Path.join(root, "ssh")
+    original_path = System.get_env("PATH")
+    File.mkdir_p!(root)
+
+    File.write!(
+      executable,
+      "#!/bin/sh\nprintf '%s' #{shell_escape(diagnostic)} >&2\nexit #{status}\n"
+    )
+
+    File.chmod!(executable, 0o755)
+    System.put_env("PATH", root <> ":" <> original_path)
+
+    try do
+      callback.()
+    after
+      System.put_env("PATH", original_path)
+    end
+  end
+
+  defp shell_escape(value), do: "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
 
   defp wrap_ok({tag, _reason} = result) when tag in [:error, :conflict], do: result
   defp wrap_ok(value), do: {:ok, value}

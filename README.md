@@ -21,7 +21,8 @@ Symphony separates durable task authority from rebuildable runtime state:
   exact task lookup, and current-task listing by workflow state.
 - One persistent Git worktree and immutable branch belong to each task.
 - A service-owned `gh` client creates draft pull requests, publishes workpads, captures exact-head
-  structured review attestations, and performs checkpointed guarded squash merges without a model.
+  structured review attestations (including explicit draft/ready state), and performs checkpointed
+  guarded squash merges without a model.
   Publish-only transitions are accepted only after their workpad marker and local publication
   manifest are durable.
 - Completed, stopped, and failed Codex runs retain canonical runtime/turn/token statistics; the PR
@@ -41,8 +42,12 @@ Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merg
                               Rework ---+                         Merge Conflict
 ```
 
-Human Review, Blocked, and Cancelled are explicit side paths. A verified merge conflict receives a
-constrained repair run. It commits the recorded-path-only merge, validates that exact committed
+Human Review, Blocked, and Cancelled are explicit side paths. A draft or otherwise non-ready pull
+request moves from Automated Review to Human Review, where it is published and marked ready. A human
+then returns it to Automated Review for a fresh structured review; only that ready, non-draft review
+may pass into Merging. Human Review → Rework returns the pull request to draft and repeats the same
+ready/re-review cycle. A verified merge conflict receives a constrained repair run. It commits the
+recorded-path-only merge, validates that exact committed
 source once through the frozen full-validation job, pushes the same head, and then returns atomically
 to Automated Review; recurrence of the same head pair blocks.
 A failed agent invocation moves the task to Blocked; there is no agent retry queue.

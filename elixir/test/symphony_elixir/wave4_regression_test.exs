@@ -15,6 +15,16 @@ defmodule SymphonyElixir.Wave4RegressionTest do
     assert Workflow.Bundle.column(bundle, "merge_conflict").role == :dispatch
     assert bundle.merge.review_column == "automated_review"
     assert bundle.merge.conflict_column == "merge_conflict"
+    assert Workflow.Bundle.transition_allowed?(bundle, :human, "human_review", "automated_review")
+  end
+
+  test "automated review prompt requires the draft ready cycle before a fresh structured pass" do
+    prompt = Config.bundle!().stages["automated_review"].prompt
+
+    assert prompt =~ "draft or otherwise not ready"
+    assert prompt =~ "do not call `symphony_review_complete`"
+    assert prompt =~ "transition to `human_review`"
+    assert prompt =~ "human returns a ready pull request to `automated_review`"
   end
 
   test "loads a model-free deterministic merge saga" do

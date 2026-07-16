@@ -142,7 +142,7 @@ defmodule SymphonyElixir.BoardTest do
     assert moved["rank"] < first["rank"]
   end
 
-  test "an active agent can persist a scoped GitHub saga outcome" do
+  test "an active agent persists scoped GitHub saga outcomes and canonical draft state" do
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("GitHub saga")})
     {todo, _result} = BoardFactory.move(created, "todo")
 
@@ -166,16 +166,32 @@ defmodule SymphonyElixir.BoardTest do
              )
 
     assert get_in(recorded, ["github", "ready", "completed"]) == true
+    assert recorded["github"]["draft"] == false
+
+    assert {:ok, %{"task" => drafted}} =
+             Board.execute(
+               %Commands.RecordGitHubOutcome{
+                 task_id: recorded["id"],
+                 kind: "rework_draft",
+                 attrs: %{completed: true}
+               },
+               actor: %{type: :agent, identity: run["id"]},
+               expected_revision: recorded["revision"],
+               idempotency_key: BoardFactory.unique("github-draft-outcome")
+             )
+
+    assert get_in(drafted, ["github", "rework_draft", "completed"]) == true
+    assert drafted["github"]["draft"] == true
 
     assert {:ok, _result} =
              Board.execute(
                %Commands.RunFailed{
-                 task_id: recorded["id"],
+                 task_id: drafted["id"],
                  run_id: run["id"],
                  reason: "test cleanup"
                },
                actor: :system,
-               expected_revision: recorded["revision"],
+               expected_revision: drafted["revision"],
                idempotency_key: BoardFactory.unique("cleanup")
              )
   end

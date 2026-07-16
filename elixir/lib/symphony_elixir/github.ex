@@ -194,13 +194,15 @@ defmodule SymphonyElixir.GitHub do
                "view",
                Integer.to_string(number),
                "--json",
-               "number,headRefOid,mergeCommit,mergeable,reviewDecision,state,statusCheckRollup,url"
+               "number,headRefOid,isDraft,mergeCommit,mergeable,reviewDecision,state,statusCheckRollup,url"
              ],
              cd: directory
            ),
+         draft when is_boolean(draft) <- pr["isDraft"],
          {:ok, threads} <- review_threads_snapshot(directory, number),
          {:ok, checks} <- required_checks(directory, number) do
       feedback = %{
+        "draft" => draft,
         "mergeable" => pr["mergeable"],
         "review_decision" => pr["reviewDecision"],
         "threads" => threads
@@ -211,6 +213,7 @@ defmodule SymphonyElixir.GitHub do
          number: pr["number"],
          url: pr["url"],
          state: pr["state"],
+         draft: draft,
          head_sha: pr["headRefOid"],
          source_head_sha: source_head,
          approved: pr["reviewDecision"] == "APPROVED",
@@ -225,6 +228,7 @@ defmodule SymphonyElixir.GitHub do
     else
       {:ok, false} -> {:error, :worktree_not_clean}
       {:error, reason} -> {:error, reason}
+      _invalid_snapshot -> {:error, :invalid_review_snapshot}
     end
   end
 

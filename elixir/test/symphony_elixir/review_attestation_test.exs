@@ -76,6 +76,34 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     assert replayed.review_attestation == attested.review_attestation
   end
 
+  test "a pass requires an explicit provider-ready non-draft snapshot" do
+    cases = [
+      {:draft, Map.put(provider_snapshot(), :draft, true), "passing_review_not_merge_ready"},
+      {:missing, Map.delete(provider_snapshot(), :draft), "invalid_review_provider_snapshot"},
+      {:malformed, Map.put(provider_snapshot(), :draft, "false"), "invalid_review_provider_snapshot"}
+    ]
+
+    Enum.each(cases, fn {name, snapshot, expected_reason} ->
+      {review_task, review_run} = active_review()
+
+      opts =
+        review_opts(
+          review_task,
+          review_run,
+          BoardFactory.unique("#{name}-draft-review")
+        )
+        |> Keyword.put(:review_snapshotter, fn _task, _worktree, _opts -> {:ok, snapshot} end)
+
+      assert %{"success" => false, "output" => output} =
+               DynamicTool.execute("symphony_review_complete", pass_arguments(review_task), opts)
+
+      assert output =~ expected_reason
+      assert {:ok, unchanged} = Board.task(review_task["id"])
+      assert unchanged.column_id == "automated_review"
+      assert is_nil(unchanged.review_attestation)
+    end)
+  end
+
   test "human acceptance-set removal replacement and addition invalidate an exact pass" do
     mutations = [
       removal: fn [first, _second] -> [first] end,
@@ -709,6 +737,7 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     %{
       number: 1,
       state: "OPEN",
+      draft: false,
       head_sha: @head,
       source_head_sha: @head,
       approved: true,

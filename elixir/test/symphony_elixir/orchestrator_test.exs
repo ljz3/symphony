@@ -147,6 +147,7 @@ defmodule SymphonyElixir.OrchestratorTest do
   test "merge-role work uses only the system runner and verified conflict dispatches one agent" do
     task = canonical_merge_task()
     selected_task_id = task.id
+    runs_before_merge = Board.runs(selected_task_id)
     parent = self()
 
     merge_runner = fn merge_task, _bundle, _opts ->
@@ -180,6 +181,11 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert {:noreply, merging_state} = Orchestrator.handle_info(:reconcile, state)
     assert_receive {:merge_runner_called, ^selected_task_id, merge_pid}
     refute_receive {:agent_runner_called, ^selected_task_id, _run_id}, 100
+    assert Board.runs(selected_task_id) == runs_before_merge
+
+    refute Enum.any?(runs_before_merge, fn run ->
+             run["start_column_id"] == "merging" or run["stage_id"] == "merging"
+           end)
 
     paths = ["Sources/Conflict.swift"]
     conflict_id = DeterministicMerge.conflict_id(selected_task_id, @head, @target, paths)
@@ -453,6 +459,7 @@ defmodule SymphonyElixir.OrchestratorTest do
        %{
          number: 1,
          state: "OPEN",
+         draft: false,
          head_sha: @head,
          source_head_sha: @head,
          approved: true,

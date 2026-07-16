@@ -243,7 +243,7 @@ defmodule SymphonyElixir.Board.Validator do
          true <- nonblank?(command.kind),
          true <- is_map(command.attrs) do
       outcome = stringify_keys(command.attrs) |> Map.put("recorded_at", now())
-      github = Map.put(task.github, command.kind, outcome)
+      github = task.github |> Map.put(command.kind, outcome) |> project_github_outcome(command.kind, outcome)
       task = bump(task, %{github: github})
 
       external_effect = %{
@@ -957,6 +957,7 @@ defmodule SymphonyElixir.Board.Validator do
          true <- value(snapshot, :head_sha) == reviewed_head,
          true <- value(snapshot, :source_head_sha) == reviewed_head,
          state when state in ["OPEN", "open"] <- value(snapshot, :state),
+         draft when is_boolean(draft) <- value(snapshot, :draft),
          fingerprint when is_binary(fingerprint) and fingerprint != "" <- value(snapshot, :feedback_fingerprint),
          checks when is_binary(checks) and checks != "" <- value(snapshot, :checks_fingerprint) do
       :ok
@@ -974,6 +975,7 @@ defmodule SymphonyElixir.Board.Validator do
          true <- criteria_complete?(task),
          true <- value(command.plan_policy, :status) in ["not_required", "followed"],
          true <- no_open_findings?(command.findings),
+         true <- value(command.provider_snapshot, :draft) == false,
          true <- value(command.provider_snapshot, :approved) == true,
          true <- value(command.provider_snapshot, :required_checks_green) == true,
          true <- value(command.provider_snapshot, :unresolved_review_threads) == 0,
@@ -999,6 +1001,14 @@ defmodule SymphonyElixir.Board.Validator do
       _ -> {:error, :invalid_review_rework_route}
     end
   end
+
+  defp project_github_outcome(github, "ready", %{"completed" => true}),
+    do: Map.put(github, "draft", false)
+
+  defp project_github_outcome(github, "rework_draft", %{"completed" => true}),
+    do: Map.put(github, "draft", true)
+
+  defp project_github_outcome(github, _kind, _outcome), do: github
 
   defp route_review_attestation(task, run, %{verdict: "rework", route: route} = command, bundle) do
     target = Bundle.column(bundle, route)
