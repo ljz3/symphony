@@ -76,6 +76,86 @@ defmodule SymphonyElixir.JobManagerTest do
     assert File.read!(result["stderr_artifact"]) == "actionable stderr"
   end
 
+  test "finds only terminal success for an exact frozen job, run, and source", %{workspace: workspace} do
+    write_script!(workspace, "success.sh", "#!/bin/sh\nprintf success\n")
+    write_script!(workspace, "failure.sh", "#!/bin/sh\nexit 19\n")
+
+    root = Path.join(workspace, "proof-jobs")
+    name = String.to_atom("job_manager_#{System.unique_integer([:positive])}")
+    assert {:ok, pid} = JobManager.start_link(name: name, root: root)
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    success_request =
+      request(workspace,
+        executable: "./success.sh",
+        passthrough_policy: :forbidden,
+        run_id: "proof-run",
+        call_id: "success-call"
+      )
+
+    frozen = %{"validation" => success_request.job}
+    fingerprint = success_request.source_fingerprint
+
+    assert {:error, :conflict_validation_missing} =
+             JobManager.successful_for_source("proof-run", frozen, fingerprint, name)
+
+    assert {:ok, result} = JobManager.run(success_request, name)
+
+    assert {:ok, proof} =
+             JobManager.successful_for_source("proof-run", frozen, fingerprint, name)
+
+    assert proof == %{
+             "exit_code" => 0,
+             "finished_at" => result["finished_at"],
+             "job" => "validation",
+             "job_definition_fingerprint" => JobManager.job_definition_fingerprint(success_request.job),
+             "job_id" => result["job_id"],
+             "run_id" => "proof-run",
+             "source_fingerprint" => fingerprint,
+             "started_at" => result["started_at"],
+             "status" => "completed"
+           }
+
+    assert {:error, :conflict_validation_source_mismatch} =
+             JobManager.successful_for_source(
+               "proof-run",
+               frozen,
+               String.duplicate("0", 64),
+               name
+             )
+
+    changed_frozen = put_in(frozen, ["validation", "executable"], "./different.sh")
+
+    assert {:error, :conflict_validation_job_mismatch} =
+             JobManager.successful_for_source("proof-run", changed_frozen, fingerprint, name)
+
+    failure_request =
+      request(workspace,
+        executable: "./failure.sh",
+        passthrough_policy: :forbidden,
+        run_id: "failure-run",
+        call_id: "failure-call"
+      )
+
+    assert {:ok, %{"status" => "failed"}} = JobManager.run(failure_request, name)
+
+    assert {:error, :conflict_validation_failed} =
+             JobManager.successful_for_source(
+               "failure-run",
+               %{"validation" => failure_request.job},
+               failure_request.source_fingerprint,
+               name
+             )
+
+    assert {:error, :invalid_frozen_job_definition} =
+             JobManager.successful_for_source(
+               "proof-run",
+               %{"wrong-id" => success_request.job},
+               fingerprint,
+               name
+             )
+  end
+
   test "resolves bare executables through the configured PATH", %{workspace: workspace} do
     bin = Path.join(workspace, "bin")
     File.mkdir_p!(bin)
@@ -649,7 +729,7 @@ defmodule SymphonyElixir.JobManagerTest do
       task_id: "task-id",
       task_identifier: "FOODMAP-1",
       task_branch: "feature/FOODMAP-1",
-      run_id: "run-id",
+      run_id: Keyword.get(overrides, :run_id, "run-id"),
       call_id: Keyword.get(overrides, :call_id, Ecto.UUID.generate()),
       job: %{
         "id" => "validation",

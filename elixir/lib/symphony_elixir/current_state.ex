@@ -16,6 +16,11 @@ defmodule SymphonyElixir.CurrentState do
   @github_fields ~w(number url state draft head_sha)
   @preflight_fields ~w(status phase fingerprint reason started_at last_activity_at completed_at next_retry_at)
   @job_fields ~w(job_id job status started_at finished_at elapsed_ms source_fingerprint)
+  @attestation_fields ~w(verdict reviewed_head_sha route feedback_fingerprint checks_fingerprint criteria_fingerprint pull_request_number reviewer_identity run_id reviewed_at)
+  @plan_policy_fields ~w(status summary)
+  @validation_evidence_fields ~w(command result artifact exit_status)
+  @finding_fields ~w(severity summary path line)
+  @merge_conflict_fields ~w(id task_head target_head conflicted_paths recorded_at)
 
   @spec project(Task.t(), map(), Bundle.t() | map(), keyword()) :: map()
   def project(%Task{} = task, run, workflow, opts \\ []) when is_map(run) do
@@ -24,6 +29,8 @@ defmodule SymphonyElixir.CurrentState do
       "run" => take_present(run, @run_fields),
       "source" => take_present(task.source, @source_fields),
       "github" => github_projection(task.github),
+      "review_attestation" => review_attestation_projection(task.review_attestation),
+      "merge_conflict" => merge_conflict_projection(task.merge_saga),
       "criteria" => Enum.map(task.acceptance_criteria, &criterion_projection/1),
       "dependencies" => dependency_projections(task.dependencies, workflow),
       "allowed_transitions" => allowed_transition_projections(task.column_id, workflow),
@@ -63,6 +70,29 @@ defmodule SymphonyElixir.CurrentState do
   defp criterion_projection(criterion) do
     take_present(criterion, ~w(id text completed evidence))
   end
+
+  defp review_attestation_projection(attestation) when is_map(attestation) do
+    attestation
+    |> take_present(@attestation_fields)
+    |> maybe_put("plan_policy", nested_projection(attestation["plan_policy"], @plan_policy_fields))
+    |> maybe_put("validation_evidence", nested_list_projection(attestation["validation_evidence"], @validation_evidence_fields))
+    |> maybe_put("findings", nested_list_projection(attestation["findings"], @finding_fields))
+    |> reject_nil_values()
+  end
+
+  defp review_attestation_projection(_attestation), do: nil
+
+  defp merge_conflict_projection(%{"checkpoint" => "conflict_recorded", "last_conflict" => conflict})
+       when is_map(conflict),
+       do: take_present(conflict, @merge_conflict_fields)
+
+  defp merge_conflict_projection(_saga), do: nil
+
+  defp nested_projection(value, fields) when is_map(value), do: take_present(value, fields)
+  defp nested_projection(_value, _fields), do: nil
+
+  defp nested_list_projection(values, fields) when is_list(values), do: Enum.map(values, &take_present(&1, fields))
+  defp nested_list_projection(_values, _fields), do: nil
 
   defp dependency_projections(ids, workflow) do
     Enum.flat_map(ids, fn id ->
@@ -128,8 +158,6 @@ defmodule SymphonyElixir.CurrentState do
 
   defp current_preflights do
     Orchestrator.status()[:preflights] || []
-  rescue
-    _error -> []
   catch
     :exit, _reason -> []
   end

@@ -143,6 +143,81 @@ defmodule SymphonyElixir.Board.Commands do
     @type t :: %__MODULE__{task_id: String.t(), kind: String.t(), attrs: map()}
   end
 
+  defmodule RecordReviewAttestation do
+    @moduledoc "Record one exact-head automated-review verdict and route the active task."
+    defstruct [
+      :task_id,
+      :run_id,
+      :verdict,
+      :reviewed_head_sha,
+      :route,
+      :plan_policy,
+      :validation_evidence,
+      :findings,
+      :provider_snapshot
+    ]
+
+    @type t :: %__MODULE__{
+            task_id: String.t(),
+            run_id: String.t(),
+            verdict: String.t(),
+            reviewed_head_sha: String.t(),
+            route: String.t(),
+            plan_policy: map(),
+            validation_evidence: [map()],
+            findings: [map()],
+            provider_snapshot: map()
+          }
+  end
+
+  defmodule InvalidateReviewAttestation do
+    @moduledoc "Invalidate a stale review attestation and return the task to automated review."
+    defstruct [:task_id, :reason, :head_sha]
+    @type t :: %__MODULE__{task_id: String.t(), reason: String.t(), head_sha: String.t() | nil}
+  end
+
+  defmodule RecordMergeCheckpoint do
+    @moduledoc "Persist an idempotent deterministic-merge saga checkpoint."
+    defstruct [:task_id, :checkpoint, :attrs]
+    @type t :: %__MODULE__{task_id: String.t(), checkpoint: String.t(), attrs: map()}
+  end
+
+  defmodule RecordMergeConflict do
+    @moduledoc "Record a verified merge conflict and route it for conflict-only agent resolution."
+    defstruct [:task_id, :task_head, :target_head, :conflicted_paths, :conflict_id]
+
+    @type t :: %__MODULE__{
+            task_id: String.t(),
+            task_head: String.t(),
+            target_head: String.t(),
+            conflicted_paths: [String.t()],
+            conflict_id: String.t()
+          }
+  end
+
+  defmodule CompleteMergeConflictResolution do
+    @moduledoc "Atomically accept a verified conflict repair and return it to exact-head review."
+    defstruct [:task_id, :run_id, :proof]
+
+    @type t :: %__MODULE__{
+            task_id: String.t(),
+            run_id: String.t(),
+            proof: map()
+          }
+  end
+
+  defmodule CompleteDeterministicMerge do
+    @moduledoc "Record a reachable guarded squash merge and complete the task atomically."
+    defstruct [:task_id, :reviewed_head_sha, :merge_sha, :target_head]
+
+    @type t :: %__MODULE__{
+            task_id: String.t(),
+            reviewed_head_sha: String.t(),
+            merge_sha: String.t(),
+            target_head: String.t()
+          }
+  end
+
   defmodule RecordRunStatsPublication do
     @moduledoc "Record the successful GitHub publication of terminal run statistics."
     defstruct [:task_id, :run_id, :destination, :publication_id]
@@ -172,6 +247,12 @@ defmodule SymphonyElixir.Board.Commands do
           | RecordSourceHead.t()
           | LinkPullRequest.t()
           | RecordGitHubOutcome.t()
+          | RecordReviewAttestation.t()
+          | InvalidateReviewAttestation.t()
+          | RecordMergeCheckpoint.t()
+          | RecordMergeConflict.t()
+          | CompleteMergeConflictResolution.t()
+          | CompleteDeterministicMerge.t()
           | RecordRunStatsPublication.t()
 
   @spec type(t()) :: String.t()

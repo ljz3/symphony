@@ -22,6 +22,18 @@ prompts:
   base: workflow/prompts/base.md
   context: workflow/prompts/context.md
 
+jobs:
+  targeted_validation:
+    executable: ./elixir/scripts/symphony-targeted-validation.sh
+    arguments: []
+    passthrough_arguments: required
+    environment: {}
+  full_validation:
+    executable: ./elixir/scripts/symphony-full-validation.sh
+    arguments: []
+    passthrough_arguments: forbidden
+    environment: {}
+
 stages:
   implementation:
     prompt: workflow/prompts/implementation.md
@@ -38,9 +50,9 @@ stages:
     workpad: workflow/workpads/rework.md
     allowed_model_efforts:
       gpt-5.5: [xhigh]
-  merging:
-    prompt: workflow/prompts/merging.md
-    workpad: workflow/workpads/merging.md
+  merge_conflict:
+    prompt: workflow/prompts/merge_conflict.md
+    workpad: workflow/workpads/merge_conflict.md
     allowed_model_efforts:
       gpt-5.5: [xhigh]
 
@@ -71,10 +83,13 @@ columns:
     name: Rework
     role: dispatch
     stage: rework
+  - id: merge_conflict
+    name: Merge Conflict
+    role: dispatch
+    stage: merge_conflict
   - id: merging
     name: Merging
-    role: dispatch
-    stage: merging
+    role: merge
   - id: blocked
     name: Blocked
     role: blocked
@@ -93,9 +108,10 @@ transitions:
     todo: [backlog, cancelled]
     in_progress: [blocked, cancelled]
     automated_review: [blocked, cancelled]
-    human_review: [rework, merging, cancelled]
+    human_review: [automated_review, rework, cancelled]
     rework: [blocked, cancelled]
-    merging: [blocked, cancelled]
+    merge_conflict: [blocked, cancelled]
+    merging: []
     blocked: []
     done: []
     cancelled: []
@@ -106,10 +122,17 @@ transitions:
     automated_review: [human_review, rework, blocked]
     human_review: []
     rework: [automated_review, blocked]
-    merging: [done, blocked]
+    merge_conflict: [automated_review, blocked]
+    merging: []
     blocked: []
     done: []
     cancelled: []
+
+merge:
+  method: squash
+  readiness_command: ./elixir/scripts/symphony-merge-readiness.sh
+  review_column: automated_review
+  conflict_column: merge_conflict
 
 hooks:
   before_run: cd elixir && mise exec -- mix deps.get

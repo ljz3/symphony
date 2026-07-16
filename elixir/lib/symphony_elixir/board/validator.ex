@@ -5,6 +5,8 @@ defmodule SymphonyElixir.Board.Validator do
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.Board.Projection
   alias SymphonyElixir.Codex.RunStats
+  alias SymphonyElixir.JobManager
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.Bundle
   alias SymphonyElixir.Workflow.Bundle.Column
@@ -32,6 +34,7 @@ defmodule SymphonyElixir.Board.Validator do
          :ok <- mutable_contract?(task, actor),
          :ok <- reject_immutable_fields(attrs),
          {:ok, updated} <- update_task(task, attrs, bundle, actor) do
+      updated = invalidate_attestation_for_criteria(updated, bundle)
       mutation("task_updated", updated, nil)
     end
   end
@@ -61,7 +64,7 @@ defmodule SymphonyElixir.Board.Validator do
     end
   end
 
-  def validate(%Commands.CompleteAcceptance{} = command, actor, _bundle) do
+  def validate(%Commands.CompleteAcceptance{} = command, actor, bundle) do
     with {:ok, task} <- Projection.get_task(command.task_id),
          :ok <- agent_evidence(actor, command.evidence),
          {:ok, criteria} <-
@@ -71,16 +74,16 @@ defmodule SymphonyElixir.Board.Validator do
              command.evidence,
              actor
            ) do
-      task = bump(task, %{acceptance_criteria: criteria})
+      task = task |> bump(%{acceptance_criteria: criteria}) |> invalidate_attestation_for_criteria(bundle)
       mutation("acceptance_completed", task, nil)
     end
   end
 
-  def validate(%Commands.ReopenAcceptance{} = command, actor, _bundle) do
+  def validate(%Commands.ReopenAcceptance{} = command, actor, bundle) do
     with :ok <- human_actor(actor),
          {:ok, task} <- Projection.get_task(command.task_id),
          {:ok, criteria} <- reopen_criterion(task.acceptance_criteria, command.criterion_id, command.reason, actor) do
-      task = bump(task, %{acceptance_criteria: criteria})
+      task = task |> bump(%{acceptance_criteria: criteria}) |> invalidate_attestation_for_criteria(bundle)
       mutation("acceptance_reopened", task, nil)
     end
   end
@@ -124,6 +127,7 @@ defmodule SymphonyElixir.Board.Validator do
          false <- active?(task),
          {:ok, column} <- fetch_column(bundle, task.column_id),
          :dispatch <- column.role,
+         :ok <- conflict_claim_allowed(task, column, bundle),
          :ok <- dependencies_satisfied(task, bundle),
          {:ok, selection} <- fetch_stage_selection(task, column.stage_id, bundle) do
       claim_run(task, column, selection, command.worker_host, bundle)
@@ -178,7 +182,7 @@ defmodule SymphonyElixir.Board.Validator do
     end
   end
 
-  def validate(%Commands.RecordSourceHead{} = command, actor, _bundle) do
+  def validate(%Commands.RecordSourceHead{} = command, actor, bundle) do
     with :ok <- system_or_agent_actor(actor),
          {:ok, task} <- Projection.get_task(command.task_id),
          true <- sha?(command.head_sha),
@@ -190,7 +194,11 @@ defmodule SymphonyElixir.Board.Validator do
         "recorded_at" => now()
       }
 
-      task = bump(task, %{source: Map.merge(task.source, source)})
+      task =
+        task
+        |> bump(%{source: Map.merge(task.source, source)})
+        |> invalidate_attestation_for_head(command.head_sha, bundle, "source_head_changed")
+
       mutation("source_head_recorded", task, nil)
     else
       false -> {:error, :invalid_source_sha}
@@ -198,7 +206,7 @@ defmodule SymphonyElixir.Board.Validator do
     end
   end
 
-  def validate(%Commands.LinkPullRequest{} = command, actor, _bundle) do
+  def validate(%Commands.LinkPullRequest{} = command, actor, bundle) do
     with :ok <- system_actor(actor),
          {:ok, task} <- Projection.get_task(command.task_id),
          {:ok, run} <- Projection.get_run(command.run_id),
@@ -215,7 +223,10 @@ defmodule SymphonyElixir.Board.Validator do
         "linked_at" => now()
       }
 
-      task = bump(task, %{github: Map.merge(task.github, github)})
+      task =
+        task
+        |> bump(%{github: Map.merge(task.github, github)})
+        |> invalidate_attestation_for_pull_request(command.number, command.head_sha, bundle)
 
       run = pull_request_creator_run(task.id, run, command.created_by_run_id)
 
@@ -232,7 +243,7 @@ defmodule SymphonyElixir.Board.Validator do
          true <- nonblank?(command.kind),
          true <- is_map(command.attrs) do
       outcome = stringify_keys(command.attrs) |> Map.put("recorded_at", now())
-      github = Map.put(task.github, command.kind, outcome)
+      github = task.github |> Map.put(command.kind, outcome) |> project_github_outcome(command.kind, outcome)
       task = bump(task, %{github: github})
 
       external_effect = %{
@@ -248,6 +259,172 @@ defmodule SymphonyElixir.Board.Validator do
     else
       false -> {:error, :invalid_github_outcome}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def validate(%Commands.RecordReviewAttestation{} = command, actor, bundle) do
+    with :ok <- agent_actor(actor),
+         {:ok, task} <- Projection.get_task(command.task_id),
+         {:ok, run} <- Projection.get_run(command.run_id),
+         :ok <- active_run(task, run),
+         {:ok, merge} <- configured_merge(bundle),
+         :ok <- active_review_run(task, run, bundle, merge),
+         :ok <- valid_review_attestation(command, task),
+         :ok <- review_route(command, task, bundle, merge) do
+      reviewed_at = now()
+
+      attestation = %{
+        "verdict" => command.verdict,
+        "reviewed_head_sha" => command.reviewed_head_sha,
+        "route" => command.route,
+        "plan_policy" => stringify_keys(command.plan_policy),
+        "validation_evidence" => stringify_keys(command.validation_evidence),
+        "findings" => stringify_keys(command.findings),
+        "feedback_fingerprint" => value(command.provider_snapshot, :feedback_fingerprint),
+        "checks_fingerprint" => value(command.provider_snapshot, :checks_fingerprint),
+        "criteria_fingerprint" => ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
+        "pull_request_number" => value(command.provider_snapshot, :number),
+        "reviewer_identity" => actor.identity,
+        "run_id" => run["id"],
+        "reviewed_at" => reviewed_at
+      }
+
+      task = bump(task, %{review_attestation: attestation})
+      route_review_attestation(task, run, command, bundle)
+    end
+  end
+
+  def validate(%Commands.InvalidateReviewAttestation{} = command, actor, bundle) do
+    with :ok <- system_actor(actor),
+         {:ok, task} <- Projection.get_task(command.task_id),
+         {:ok, reason} <- nonempty(command.reason, :attestation_invalidation_reason),
+         {:ok, merge} <- configured_merge(bundle),
+         true <- is_nil(command.head_sha) or sha?(command.head_sha),
+         %Column{} = review <- Bundle.column(bundle, merge.review_column) do
+      {source, github} = invalidated_heads(task, command.head_sha)
+
+      saga =
+        merge_saga(task)
+        |> Map.put("checkpoint", "review_required")
+        |> Map.put("reason", reason)
+        |> Map.put("updated_at", now())
+
+      updated =
+        bump(task, %{
+          column_id: review.id,
+          rank: Projection.max_rank(review.id) + @rank_gap,
+          review_attestation: nil,
+          merge_saga: saga,
+          source: source,
+          github: github,
+          blocked_from_column_id: nil,
+          desired_column_id: nil,
+          runtime_state: nil,
+          active_run_id: nil
+        })
+
+      mutation("review_attestation_invalidated", updated, nil)
+    else
+      false -> {:error, :invalid_attestation_invalidation_head}
+      nil -> {:error, :merge_review_column_missing}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def validate(%Commands.RecordMergeCheckpoint{} = command, actor, bundle) do
+    with :ok <- system_actor(actor),
+         {:ok, task} <- Projection.get_task(command.task_id),
+         :ok <- task_in_merge_column(task, bundle),
+         true <- command.checkpoint in ["clean_update_started", "squash_started", "reachability_pending"],
+         true <- is_map(command.attrs) do
+      saga =
+        merge_saga(task)
+        |> Map.put("checkpoint", command.checkpoint)
+        |> Map.put("attrs", stringify_keys(command.attrs))
+        |> Map.put("updated_at", now())
+
+      task = bump(task, %{merge_saga: saga})
+      mutation("merge_checkpoint_recorded", task, nil)
+    else
+      false -> {:error, :invalid_merge_checkpoint}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def validate(%Commands.RecordMergeConflict{} = command, actor, bundle) do
+    with :ok <- system_actor(actor),
+         {:ok, task} <- Projection.get_task(command.task_id),
+         :ok <- task_in_merge_column(task, bundle),
+         true <- sha?(command.task_head) and sha?(command.target_head),
+         :ok <- verified_conflict_paths(command.conflicted_paths),
+         true <- command.conflict_id == conflict_id(task.id, command.task_head, command.target_head, command.conflicted_paths) do
+      record_or_block_conflict(task, command, bundle)
+    else
+      false -> {:error, :invalid_merge_conflict}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def validate(%Commands.CompleteMergeConflictResolution{} = command, actor, bundle) do
+    proof = stringify_keys(command.proof)
+
+    with {:ok, task} <- Projection.get_task(command.task_id),
+         {:ok, run} <- Projection.get_run(command.run_id),
+         :ok <- conflict_resolution_actor(actor, run),
+         :ok <- active_run(task, run),
+         {:ok, merge} <- configured_merge(bundle),
+         :ok <- active_conflict_resolution_run(task, run, bundle, merge),
+         :ok <- valid_conflict_resolution_proof(proof, task, run) do
+      complete_conflict_resolution(task, proof, bundle, merge)
+    end
+  end
+
+  def validate(%Commands.CompleteDeterministicMerge{} = command, actor, bundle) do
+    with :ok <- system_actor(actor),
+         {:ok, task} <- Projection.get_task(command.task_id),
+         :ok <- task_in_merge_column(task, bundle),
+         %{"verdict" => "pass", "reviewed_head_sha" => reviewed_head} <- task.review_attestation,
+         true <- reviewed_head == command.reviewed_head_sha,
+         true <-
+           task.review_attestation["criteria_fingerprint"] ==
+             ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
+         true <- sha?(command.merge_sha) and sha?(command.target_head),
+         %Column{} = done <- Bundle.done_column(bundle) do
+      recorded_at = now()
+
+      github =
+        Map.put(task.github, "merged", %{
+          "merged" => true,
+          "merge_sha" => command.merge_sha,
+          "merge_reachable" => true,
+          "reviewed_head_sha" => reviewed_head,
+          "recorded_at" => recorded_at
+        })
+
+      saga =
+        merge_saga(task)
+        |> Map.put("checkpoint", "completed")
+        |> Map.put("merge_sha", command.merge_sha)
+        |> Map.put("target_head", command.target_head)
+        |> Map.put("updated_at", recorded_at)
+
+      updated =
+        bump(task, %{
+          column_id: done.id,
+          rank: Projection.max_rank(done.id) + @rank_gap,
+          github: github,
+          merge_saga: saga,
+          runtime_state: nil,
+          active_run_id: nil,
+          desired_column_id: nil
+        })
+
+      mutation("deterministic_merge_completed", updated, nil)
+    else
+      false -> {:error, :invalid_merge_completion}
+      nil -> {:error, :merge_completion_invariant_broken}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :passing_review_attestation_required}
     end
   end
 
@@ -579,6 +756,445 @@ defmodule SymphonyElixir.Board.Validator do
      }}
   end
 
+  defp configured_merge(%{merge: %{} = merge}), do: {:ok, merge}
+  defp configured_merge(_bundle), do: {:error, :deterministic_merge_not_configured}
+
+  defp invalidated_heads(task, nil), do: {task.source, task.github}
+
+  defp invalidated_heads(task, head) do
+    recorded_at = now()
+
+    {
+      task.source |> Map.put("head_sha", head) |> Map.put("recorded_at", recorded_at),
+      Map.put(task.github, "head_sha", head)
+    }
+  end
+
+  defp active_review_run(task, run, bundle, merge) do
+    with %Column{role: :dispatch, stage_id: stage_id} <- Bundle.column(bundle, merge.review_column),
+         true <- task.column_id == merge.review_column,
+         true <- run["stage_id"] == stage_id do
+      :ok
+    else
+      false -> {:error, :review_tool_requires_active_automated_review_run}
+      nil -> {:error, :merge_review_column_missing}
+      _ -> {:error, :review_tool_requires_active_automated_review_run}
+    end
+  end
+
+  defp active_conflict_resolution_run(task, run, bundle, merge) do
+    with %Column{role: :dispatch, stage_id: stage_id} <- Bundle.column(bundle, merge.conflict_column),
+         true <- task.column_id == merge.conflict_column,
+         true <- run["stage_id"] == stage_id,
+         %{"checkpoint" => "conflict_recorded", "last_conflict" => %{} = _conflict} <- task.merge_saga do
+      :ok
+    else
+      _ -> {:error, :merge_conflict_run_not_current}
+    end
+  end
+
+  defp conflict_resolution_actor(%{type: :agent, identity: identity}, %{"id" => identity}), do: :ok
+  defp conflict_resolution_actor(_actor, _run), do: {:error, :merge_conflict_run_not_current}
+
+  defp valid_conflict_resolution_proof(proof, task, run) when is_map(proof) do
+    conflict = task.merge_saga["last_conflict"]
+    job = proof["job"]
+    pull_request = proof["pull_request"]
+    frozen_jobs = get_in(run, ["frozen_bundle", "jobs"])
+    frozen_job = (is_map(job) and is_map(frozen_jobs)) && frozen_jobs[job["job"]]
+
+    with true <- exact_conflict_proof_keys?(proof),
+         true <- canonical_conflict_proof?(proof, conflict, run),
+         true <- canonical_pre_resolution_heads?(task, conflict),
+         true <- valid_conflict_source_proof?(proof, conflict),
+         true <- valid_conflict_job?(job, run, frozen_job, proof),
+         true <- valid_conflict_pull_request?(pull_request, task, proof) do
+      :ok
+    else
+      _ -> {:error, :invalid_merge_conflict_resolution_proof}
+    end
+  end
+
+  defp valid_conflict_resolution_proof(_proof, _task, _run),
+    do: {:error, :invalid_merge_conflict_resolution_proof}
+
+  defp exact_conflict_proof_keys?(proof) do
+    Map.keys(proof) |> Enum.sort() ==
+      ~w(conflict_id conflicted_paths final_head_sha job merge_commit_sha pull_request remote_head_sha run_id source_fingerprint target_head task_head)
+  end
+
+  defp canonical_conflict_proof?(proof, conflict, run) do
+    is_map(conflict) and proof["conflict_id"] == conflict["id"] and
+      proof["task_head"] == conflict["task_head"] and proof["target_head"] == conflict["target_head"] and
+      proof["conflicted_paths"] == conflict["conflicted_paths"] and proof["run_id"] == run["id"]
+  end
+
+  defp canonical_pre_resolution_heads?(task, conflict) do
+    task.source["head_sha"] == conflict["task_head"] and task.source["clean"] == true and
+      task.github["head_sha"] == conflict["task_head"]
+  end
+
+  defp valid_conflict_source_proof?(proof, conflict) do
+    sha?(proof["final_head_sha"]) and proof["final_head_sha"] != conflict["task_head"] and
+      proof["remote_head_sha"] == proof["final_head_sha"] and sha?(proof["merge_commit_sha"]) and
+      sha256?(proof["source_fingerprint"])
+  end
+
+  defp valid_conflict_job?(job, run, frozen_job, proof) do
+    is_map(job) and
+      Map.keys(job) |> Enum.sort() ==
+        ~w(exit_code job job_definition_fingerprint job_id run_id source_fingerprint status) and
+      is_map(frozen_job) and nonblank?(job["job_id"]) and job["run_id"] == run["id"] and
+      job["status"] == "completed" and job["exit_code"] == 0 and
+      job["source_fingerprint"] == proof["source_fingerprint"] and
+      job["job_definition_fingerprint"] == JobManager.job_definition_fingerprint(frozen_job)
+  end
+
+  defp valid_conflict_pull_request?(pull_request, task, proof) do
+    is_map(pull_request) and Map.keys(pull_request) |> Enum.sort() == ~w(head_sha number state) and
+      is_integer(pull_request["number"]) and pull_request["number"] > 0 and
+      pull_request["number"] == task.github["number"] and pull_request["state"] == "OPEN" and
+      pull_request["head_sha"] == proof["final_head_sha"]
+  end
+
+  defp complete_conflict_resolution(task, proof, bundle, merge) do
+    timestamp = now()
+    review = Bundle.column(bundle, merge.review_column)
+
+    saga =
+      merge_saga(task)
+      |> Map.put("checkpoint", "conflict_resolved")
+      |> Map.put("resolution", stringify_keys(proof))
+      |> Map.put("updated_at", timestamp)
+
+    updated =
+      bump(task, %{
+        column_id: review.id,
+        rank: Projection.max_rank(review.id) + @rank_gap,
+        source:
+          task.source
+          |> Map.put("head_sha", proof["final_head_sha"])
+          |> Map.put("clean", true)
+          |> Map.put("recorded_at", timestamp),
+        github: Map.put(task.github, "head_sha", proof["final_head_sha"]),
+        review_attestation: nil,
+        merge_saga: saga,
+        blocked_from_column_id: nil,
+        desired_column_id: nil
+      })
+
+    mutation("merge_conflict_resolved", updated, nil)
+  end
+
+  defp valid_review_attestation(command, task) do
+    with true <- command.verdict in ["pass", "rework"],
+         true <- sha?(command.reviewed_head_sha),
+         true <- task.source["head_sha"] == command.reviewed_head_sha,
+         true <- task.github["head_sha"] == command.reviewed_head_sha,
+         :ok <- valid_plan_policy(command.plan_policy),
+         :ok <- valid_validation_evidence(command.validation_evidence),
+         :ok <- valid_findings(command.findings),
+         :ok <- valid_provider_snapshot(command.provider_snapshot, task, command.reviewed_head_sha) do
+      :ok
+    else
+      false -> {:error, :review_attestation_head_or_payload_invalid}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp valid_plan_policy(policy) when is_map(policy) do
+    policy = stringify_keys(policy)
+
+    if Map.keys(policy) |> Enum.sort() == ["status", "summary"] and
+         policy["status"] in ["not_required", "followed", "deviation"] and
+         nonblank?(policy["summary"]),
+       do: :ok,
+       else: {:error, :invalid_review_plan_policy}
+  end
+
+  defp valid_plan_policy(_policy), do: {:error, :invalid_review_plan_policy}
+
+  defp valid_validation_evidence(evidence) when is_list(evidence) and evidence != [] do
+    if Enum.all?(evidence, &valid_validation_item?/1),
+      do: :ok,
+      else: {:error, :invalid_review_validation_evidence}
+  end
+
+  defp valid_validation_evidence(_evidence), do: {:error, :invalid_review_validation_evidence}
+
+  defp valid_validation_item?(item) when is_map(item) do
+    item = stringify_keys(item)
+    allowed = ~w(artifact command exit_status result)
+
+    Enum.all?(Map.keys(item), &(&1 in allowed)) and nonblank?(item["command"]) and
+      nonblank?(item["result"]) and optional_string?(item["artifact"]) and
+      (is_nil(item["exit_status"]) or is_integer(item["exit_status"]))
+  end
+
+  defp valid_validation_item?(_item), do: false
+
+  defp valid_findings(findings) when is_list(findings) do
+    if Enum.all?(findings, &valid_finding?/1), do: :ok, else: {:error, :invalid_review_findings}
+  end
+
+  defp valid_findings(_findings), do: {:error, :invalid_review_findings}
+
+  defp valid_finding?(finding) when is_map(finding) do
+    finding = stringify_keys(finding)
+    allowed = ~w(line path severity summary)
+
+    Enum.all?(Map.keys(finding), &(&1 in allowed)) and
+      finding["severity"] in ["blocker", "high", "medium", "low", "note"] and
+      nonblank?(finding["summary"]) and optional_string?(finding["path"]) and
+      (is_nil(finding["line"]) or (is_integer(finding["line"]) and finding["line"] > 0))
+  end
+
+  defp valid_finding?(_finding), do: false
+
+  defp valid_provider_snapshot(snapshot, task, reviewed_head) when is_map(snapshot) do
+    with number when is_integer(number) and number > 0 <- value(snapshot, :number),
+         true <- number == task.github["number"],
+         true <- value(snapshot, :head_sha) == reviewed_head,
+         true <- value(snapshot, :source_head_sha) == reviewed_head,
+         state when state in ["OPEN", "open"] <- value(snapshot, :state),
+         draft when is_boolean(draft) <- value(snapshot, :draft),
+         fingerprint when is_binary(fingerprint) and fingerprint != "" <- value(snapshot, :feedback_fingerprint),
+         checks when is_binary(checks) and checks != "" <- value(snapshot, :checks_fingerprint) do
+      :ok
+    else
+      _ -> {:error, :invalid_review_provider_snapshot}
+    end
+  end
+
+  defp valid_provider_snapshot(_snapshot, _task, _reviewed_head),
+    do: {:error, :invalid_review_provider_snapshot}
+
+  defp review_route(%{verdict: "pass"} = command, task, bundle, merge) do
+    with %Column{id: merge_column} <- Enum.find(bundle.columns, &(&1.role == :merge)),
+         true <- command.route == merge_column,
+         true <- criteria_complete?(task),
+         true <- value(command.plan_policy, :status) in ["not_required", "followed"],
+         true <- no_open_findings?(command.findings),
+         true <- value(command.provider_snapshot, :draft) == false,
+         true <- value(command.provider_snapshot, :approved) == true,
+         true <- value(command.provider_snapshot, :required_checks_green) == true,
+         true <- value(command.provider_snapshot, :unresolved_review_threads) == 0,
+         true <- merge.review_column == task.column_id do
+      :ok
+    else
+      false -> {:error, :passing_review_not_merge_ready}
+      nil -> {:error, :merge_column_missing}
+    end
+  end
+
+  defp review_route(%{verdict: "rework"} = command, task, bundle, merge) do
+    target = Bundle.column(bundle, command.route)
+
+    with %Column{role: role} when role in [:dispatch, :blocked] <- target,
+         true <- command.route != merge.review_column,
+         true <- Bundle.transition_allowed?(bundle, :agent, task.column_id, command.route),
+         true <- command.findings != [] do
+      :ok
+    else
+      false -> {:error, :invalid_review_rework_route}
+      nil -> {:error, :invalid_review_rework_route}
+      _ -> {:error, :invalid_review_rework_route}
+    end
+  end
+
+  defp project_github_outcome(github, "ready", %{"completed" => true}),
+    do: github |> Map.put("draft", false) |> Map.delete("rework_draft")
+
+  defp project_github_outcome(github, "rework_draft", %{"completed" => true}),
+    do: Map.put(github, "draft", true)
+
+  defp project_github_outcome(github, _kind, _outcome), do: github
+
+  defp route_review_attestation(task, run, %{verdict: "rework", route: route} = command, bundle) do
+    target = Bundle.column(bundle, route)
+
+    if target.role == :blocked do
+      reason = Enum.map_join(command.findings, "; ", &value(&1, :summary))
+      block_task(task, reason, bundle, failed_run(run, {:review_rework, reason}))
+    else
+      rank = Projection.max_rank(target.id) + @rank_gap
+      updated = bump(task, %{column_id: target.id, rank: rank, blocked_from_column_id: nil, desired_column_id: nil})
+      mutation("review_attestation_recorded", updated, run)
+    end
+  end
+
+  defp route_review_attestation(task, run, command, bundle) do
+    target = Bundle.column(bundle, command.route)
+    rank = Projection.max_rank(target.id) + @rank_gap
+    updated = bump(task, %{column_id: target.id, rank: rank, blocked_from_column_id: nil, desired_column_id: nil})
+    mutation("review_attestation_recorded", updated, run)
+  end
+
+  defp criteria_complete?(task) do
+    Enum.all?(task.acceptance_criteria, fn criterion ->
+      criterion["completed"] == true and is_list(criterion["evidence"]) and criterion["evidence"] != []
+    end)
+  end
+
+  defp no_open_findings?(findings) do
+    Enum.all?(findings, &(value(&1, :severity) not in ["blocker", "high"]))
+  end
+
+  defp invalidate_attestation_for_head(%Task{review_attestation: nil} = task, _head, _bundle, _reason), do: task
+
+  defp invalidate_attestation_for_head(task, head, bundle, reason) do
+    if task.review_attestation["reviewed_head_sha"] == head do
+      task
+    else
+      invalidate_attestation(task, bundle, reason)
+    end
+  end
+
+  defp invalidate_attestation_for_pull_request(%Task{review_attestation: nil} = task, _number, _head, _bundle),
+    do: task
+
+  defp invalidate_attestation_for_pull_request(task, number, head, bundle) do
+    if task.review_attestation["reviewed_head_sha"] == head and
+         task.review_attestation["pull_request_number"] == number do
+      task
+    else
+      invalidate_attestation(task, bundle, "pull_request_identity_changed")
+    end
+  end
+
+  defp invalidate_attestation_for_criteria(%Task{review_attestation: nil} = task, _bundle), do: task
+
+  defp invalidate_attestation_for_criteria(task, bundle) do
+    if task.review_attestation["criteria_fingerprint"] ==
+         ReviewAttestation.criteria_fingerprint(task.acceptance_criteria) do
+      task
+    else
+      invalidate_attestation(task, bundle, "acceptance_criteria_changed")
+    end
+  end
+
+  defp invalidate_attestation(task, bundle, reason) do
+    task = %{task | review_attestation: nil}
+
+    case {bundle.merge, Bundle.column(bundle, task.column_id)} do
+      {%{} = merge, %Column{role: :merge}} ->
+        review = Bundle.column(bundle, merge.review_column)
+
+        %{
+          task
+          | column_id: review.id,
+            rank: Projection.max_rank(review.id) + @rank_gap,
+            merge_saga:
+              merge_saga(task)
+              |> Map.put("checkpoint", "review_required")
+              |> Map.put("reason", reason)
+              |> Map.put("updated_at", now())
+        }
+
+      _ ->
+        task
+    end
+  end
+
+  defp task_in_merge_column(task, bundle) do
+    case Bundle.column(bundle, task.column_id) do
+      %Column{role: :merge} -> :ok
+      _ -> {:error, :task_not_merge_pending}
+    end
+  end
+
+  defp verified_conflict_paths(paths) when is_list(paths) and paths != [] do
+    valid =
+      paths == Enum.sort(Enum.uniq(paths)) and
+        Enum.all?(paths, fn path ->
+          is_binary(path) and path != "" and Path.type(path) == :relative and
+            ".." not in Path.split(path)
+        end)
+
+    if valid, do: :ok, else: {:error, :invalid_conflicted_paths}
+  end
+
+  defp verified_conflict_paths(_paths), do: {:error, :invalid_conflicted_paths}
+
+  defp conflict_id(task_id, task_head, target_head, paths) do
+    :crypto.hash(:sha256, Enum.join([task_id, task_head, target_head | paths], "\0"))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp record_or_block_conflict(task, command, bundle) do
+    conflict = %{
+      "id" => command.conflict_id,
+      "task_head" => command.task_head,
+      "target_head" => command.target_head,
+      "conflicted_paths" => command.conflicted_paths,
+      "recorded_at" => now()
+    }
+
+    previous = get_in(merge_saga(task), ["last_conflict"])
+
+    if is_map(previous) and previous["task_head"] == command.task_head and
+         previous["target_head"] == command.target_head do
+      saga =
+        merge_saga(task)
+        |> Map.put("checkpoint", "blocked_repeated_conflict")
+        |> Map.put("last_conflict", conflict)
+        |> Map.put("updated_at", now())
+
+      task = %{task | merge_saga: saga, review_attestation: nil}
+
+      block_task(
+        task,
+        "Repeated merge conflict for task head #{command.task_head} and target head #{command.target_head}",
+        bundle,
+        nil
+      )
+    else
+      merge = bundle.merge
+      target = Bundle.column(bundle, merge.conflict_column)
+
+      saga =
+        merge_saga(task)
+        |> Map.put("checkpoint", "conflict_recorded")
+        |> Map.put("last_conflict", conflict)
+        |> Map.put("updated_at", now())
+
+      updated =
+        bump(task, %{
+          column_id: target.id,
+          rank: Projection.max_rank(target.id) + @rank_gap,
+          review_attestation: nil,
+          merge_saga: saga,
+          runtime_state: nil,
+          active_run_id: nil,
+          desired_column_id: nil
+        })
+
+      mutation("merge_conflict_recorded", updated, nil)
+    end
+  end
+
+  defp conflict_claim_allowed(task, column, %{merge: %{} = merge}) when column.id == merge.conflict_column do
+    case task.merge_saga do
+      %{
+        "checkpoint" => "conflict_recorded",
+        "last_conflict" => %{"conflicted_paths" => paths, "task_head" => head, "target_head" => target}
+      }
+      when is_list(paths) and paths != [] and is_binary(head) and is_binary(target) ->
+        :ok
+
+      _ ->
+        {:error, :verified_merge_conflict_required}
+    end
+  end
+
+  defp conflict_claim_allowed(_task, _column, _bundle), do: :ok
+
+  defp merge_saga(%Task{merge_saga: saga}) when is_map(saga), do: saga
+  defp merge_saga(_task), do: %{}
+
+  defp optional_string?(nil), do: true
+  defp optional_string?(value), do: is_binary(value)
+
   defp mutable_contract?(task, actor) do
     cond do
       actor.type == :agent -> {:error, :agent_cannot_edit_task_contract}
@@ -595,6 +1211,18 @@ defmodule SymphonyElixir.Board.Validator do
   end
 
   defp move_permission(_task, _target, true, %{type: :system}, _bundle), do: :ok
+
+  defp move_permission(_task, %Column{role: :merge}, _force, %{type: :agent}, _bundle),
+    do: {:error, :merge_column_requires_review_attestation}
+
+  defp move_permission(task, target, _force, %{type: :agent}, %{merge: merge} = bundle)
+       when not is_nil(merge) and task.column_id == merge.conflict_column do
+    cond do
+      target.id == merge.review_column -> {:error, :merge_conflict_resolution_required}
+      target.id == Bundle.blocked_column(bundle).id -> :ok
+      true -> {:error, :merge_conflict_must_return_to_review}
+    end
+  end
 
   defp move_permission(task, target, _force, actor, bundle) when actor.type in [:human, :agent] do
     if Bundle.transition_allowed?(bundle, actor.type, task.column_id, target.id) do
@@ -1020,6 +1648,9 @@ defmodule SymphonyElixir.Board.Validator do
   defp human_actor(%{type: :human}), do: :ok
   defp human_actor(actor), do: {:error, {:human_actor_required, actor}}
 
+  defp agent_actor(%{type: :agent}), do: :ok
+  defp agent_actor(actor), do: {:error, {:agent_actor_required, actor}}
+
   defp system_actor(%{type: :system}), do: :ok
   defp system_actor(actor), do: {:error, {:system_actor_required, actor}}
 
@@ -1033,6 +1664,7 @@ defmodule SymphonyElixir.Board.Validator do
   defp actor_json(actor), do: %{"type" => Atom.to_string(actor.type), "identity" => actor.identity}
 
   defp sha?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{40,64}\z/i, value)
+  defp sha256?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/i, value)
   defp nonblank?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp stringify_keys(value) when is_map(value) do

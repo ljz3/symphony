@@ -34,7 +34,16 @@ defmodule SymphonyElixir.BoardTest do
     assert claimed["column_id"] == "in_progress"
     assert claimed["runtime_state"] == "starting"
     assert run["frozen_bundle"]["stage"]["id"] == "implementation"
-    assert run["frozen_bundle"]["jobs"] == %{}
+
+    assert run["frozen_bundle"]["jobs"]
+           |> Map.keys()
+           |> Enum.sort() == ["full_validation", "targeted_validation"]
+
+    assert get_in(run, ["frozen_bundle", "jobs", "full_validation", "passthrough_arguments"]) ==
+             "forbidden"
+
+    assert get_in(run, ["frozen_bundle", "jobs", "targeted_validation", "passthrough_arguments"]) ==
+             "required"
 
     assert {:ok, %{"task" => blocked, "run" => failed}} =
              Board.execute(%Commands.RunFailed{task_id: claimed["id"], run_id: run["id"], reason: :boom},
@@ -133,7 +142,7 @@ defmodule SymphonyElixir.BoardTest do
     assert moved["rank"] < first["rank"]
   end
 
-  test "an active agent can persist a scoped GitHub saga outcome" do
+  test "an active agent persists scoped GitHub saga outcomes and canonical draft state" do
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("GitHub saga")})
     {todo, _result} = BoardFactory.move(created, "todo")
 
@@ -157,16 +166,62 @@ defmodule SymphonyElixir.BoardTest do
              )
 
     assert get_in(recorded, ["github", "ready", "completed"]) == true
+    assert recorded["github"]["draft"] == false
+
+    assert {:ok, %{"task" => drafted}} =
+             Board.execute(
+               %Commands.RecordGitHubOutcome{
+                 task_id: recorded["id"],
+                 kind: "rework_draft",
+                 attrs: %{completed: true}
+               },
+               actor: %{type: :agent, identity: run["id"]},
+               expected_revision: recorded["revision"],
+               idempotency_key: BoardFactory.unique("github-draft-outcome")
+             )
+
+    assert get_in(drafted, ["github", "rework_draft", "completed"]) == true
+    assert drafted["github"]["draft"] == true
+
+    assert {:ok, %{"task" => ready_again}} =
+             Board.execute(
+               %Commands.RecordGitHubOutcome{
+                 task_id: drafted["id"],
+                 kind: "ready",
+                 attrs: %{completed: true}
+               },
+               actor: %{type: :agent, identity: run["id"]},
+               expected_revision: drafted["revision"],
+               idempotency_key: BoardFactory.unique("github-ready-again")
+             )
+
+    assert ready_again["github"]["draft"] == false
+    refute Map.has_key?(ready_again["github"], "rework_draft")
+
+    assert {:ok, %{"task" => drafted_again}} =
+             Board.execute(
+               %Commands.RecordGitHubOutcome{
+                 task_id: ready_again["id"],
+                 kind: "rework_draft",
+                 attrs: %{completed: true}
+               },
+               actor: %{type: :agent, identity: run["id"]},
+               expected_revision: ready_again["revision"],
+               idempotency_key: BoardFactory.unique("github-draft-again")
+             )
+
+    assert drafted_again["github"]["draft"] == true
+    assert get_in(drafted_again, ["github", "rework_draft", "completed"]) == true
 
     assert {:ok, _result} =
              Board.execute(
                %Commands.RunFailed{
-                 task_id: recorded["id"],
+                 task_id: drafted_again["id"],
                  run_id: run["id"],
                  reason: "test cleanup"
                },
                actor: :system,
-               expected_revision: recorded["revision"],
+               expected_revision: drafted_again["revision"],
                idempotency_key: BoardFactory.unique("cleanup")
              )
   end
@@ -401,7 +456,7 @@ defmodule SymphonyElixir.BoardTest do
     assert recovered_creator["pull_request_created"] == true
     assert {:ok, %{"pull_request_created" => false}} = Board.run(second_run["id"])
 
-    assert {:ok, _result} =
+    assert {:ok, %{"task" => cleaned}} =
              Board.execute(
                %Commands.RunFailed{
                  task_id: linked_task["id"],
@@ -412,5 +467,21 @@ defmodule SymphonyElixir.BoardTest do
                expected_revision: linked_task["revision"],
                idempotency_key: BoardFactory.unique("creator-cleanup")
              )
+
+    assert {:ok, %{"run" => published_creator}} =
+             Board.execute(
+               %Commands.RecordRunStatsPublication{
+                 task_id: cleaned["id"],
+                 run_id: first_run["id"],
+                 destination: "pr_body",
+                 publication_id: "creator-recovery-test-cleanup"
+               },
+               actor: :system,
+               expected_revision: cleaned["revision"],
+               idempotency_key: BoardFactory.unique("creator-stats-cleanup")
+             )
+
+    assert published_creator["stats_publication"]["publication_id"] ==
+             "creator-recovery-test-cleanup"
   end
 end

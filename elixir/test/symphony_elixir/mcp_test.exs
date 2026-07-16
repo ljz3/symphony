@@ -61,6 +61,7 @@ defmodule SymphonyElixir.MCPTest do
              "automated_review",
              "human_review",
              "rework",
+             "merge_conflict",
              "merging",
              "blocked",
              "done",

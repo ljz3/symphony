@@ -4,6 +4,7 @@ defmodule SymphonyElixir.SSH do
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
     {timeout, command_opts} = Keyword.pop(opts, :timeout)
+    command_opts = Keyword.put(command_opts, :stderr_to_stdout, true)
 
     with {:ok, executable} <- ssh_executable() do
       run_command(executable, ssh_args(host, command), command_opts, timeout)
@@ -41,17 +42,22 @@ defmodule SymphonyElixir.SSH do
   end
 
   defp run_command(executable, args, opts, nil) do
-    {:ok, System.cmd(executable, args, opts)}
+    executable
+    |> System.cmd(args, opts)
+    |> normalize_result()
   end
 
   defp run_command(executable, args, opts, timeout) when is_integer(timeout) and timeout > 0 do
     task = Elixir.Task.async(fn -> System.cmd(executable, args, opts) end)
 
     case Elixir.Task.yield(task, timeout) || Elixir.Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> {:ok, result}
+      {:ok, result} -> normalize_result(result)
       nil -> {:error, {:ssh_timeout, timeout}}
     end
   end
+
+  defp normalize_result({diagnostic, 255}), do: {:error, {:ssh_transport_failed, 255, diagnostic}}
+  defp normalize_result({output, status}), do: {:ok, {output, status}}
 
   defp ssh_args(host, command) do
     %{destination: destination, port: port} = parse_target(host)

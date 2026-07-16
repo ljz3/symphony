@@ -26,6 +26,8 @@ defmodule SymphonyElixir.Application do
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+      {Registry, keys: :unique, name: SymphonyElixir.DeterministicMerge.WorkerRegistry},
+      {DynamicSupervisor, strategy: :one_for_one, name: SymphonyElixir.DeterministicMerge.WorkerSupervisor},
       SymphonyElixir.Workflow.Store,
       SymphonyElixir.JobSupervisor,
       SymphonyElixir.JobManager,

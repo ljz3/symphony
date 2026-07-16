@@ -42,7 +42,7 @@ Allow machine-local overrides for Symphony home, worktree root, logs, and port t
 - Event envelopes contain an internal format version, global sequence, event/command IDs, project/task/run IDs, task revision, actor type and identity, timestamp, event type, and typed payload.
 - Use a temporary Git index, `commit-tree`, and compare-and-swap `update-ref`; never depend on a mutable history working tree.
 - Commit Git first, then apply the event transactionally to SQLite and broadcast PubSub updates. A crash after Git but before SQLite is repaired by replay.
-- Cover task creation/update/reorder/archive, criteria and dependencies, transitions/block/resume, run lifecycle, branch/PR linkage, source heads, GitHub publication/readiness/merge outcomes, and external-effect saga state.
+- Cover task creation/update/reorder/archive, criteria and dependencies, transitions/block/resume, run lifecycle, branch/PR linkage, source heads, canonical review attestations, GitHub publication/readiness/merge outcomes, and checkpointed external-effect saga state.
 - Retry optional board-remote pushes independently with backoff. Local commits remain authoritative and the UI shows ahead/behind/error state.
 - Reject remote divergence and gate mutations/dispatch. Provide `symphony board reconcile --take-local|--take-remote`, preserving the losing head under a timestamped backup ref before reset or force-push.
 - Checkpoint SQLite on every 100 events, clean shutdown, and verified handoff. Store verified snapshots on a separate `checkpoints` branch with the corresponding event OID/sequence.
@@ -120,25 +120,28 @@ Backlog
 → Todo
 → In Progress
 → Automated Review
-→ Human Review
 → Merging
 → Done
 ```
 
-With Rework, Blocked, and Cancelled branches.
+With Human Review, Rework, Merge Conflict, Blocked, and Cancelled branches.
 
 - `Backlog`: initial pause column.
 - `Todo`: implementation dispatch; `on_claim` atomically moves to In Progress.
 - `In Progress`: implementation stage.
-- `Automated Review`: separately prompted review stage.
-- `Human Review`: pause; entering publishes workpads and marks the draft PR ready.
+- `Automated Review`: separately prompted review stage. A draft or otherwise non-ready PR routes to
+  Human Review without recording a structured verdict.
+- `Human Review`: pause; entering publishes workpads and marks the draft PR ready. A human may return
+  the ready PR to Automated Review for the fresh review required before a pass.
 - `Rework`: separately prompted rework stage, returning to Automated Review.
+- `Merge Conflict`: separately prompted repair stage entered only after the system verifies and records
+  a real Git conflict; it returns only to Automated Review or Blocked.
 - `Merging`: system-owned deterministic merge column when a merge policy is configured.
 - `Blocked`: unique special role; records prior column and resumes there.
 - `Done`: successful terminal state and the only dependency-satisfying terminal.
 - `Cancelled`: unsuccessful terminal state.
 
-Support `dispatch`, `merge`, `pause`, `blocked`, and `terminal` roles. A dispatch column must reference a named stage. An optional `on_claim` target must be dispatchable and use the same stage. A `merge` column must not reference a stage and cannot be agent-claimed. Merge configuration requires exactly one merge column and distinct review/conflict targets that are dispatch columns.
+Support `dispatch`, `merge`, `pause`, `blocked`, and `terminal` roles. A dispatch column must reference a named stage. An optional `on_claim` target must be dispatchable and use the same stage. A `merge` column must not reference a stage, cannot be human- or agent-targeted, and cannot be agent-claimed. Merge configuration requires exactly one merge column and distinct review/conflict targets that are dispatch columns with distinct stages. The merge column has no configured human or agent exits. The conflict stage's only agent exits are the configured review column and Blocked.
 
 Configure human/agent transitions in YAML. Hard-code system transitions for claim, any dispatch failure to Blocked, and terminal cleanup.
 
@@ -237,6 +240,11 @@ Preserve SSH workers through a worktree backend:
   failed probe terminates. Workflow host removal and shutdown cancel the supervised process tree.
 - Retain host capacity scheduling; an unhealthy worker is excluded, direct dispatch resumes after
   explicit health, and dispatch is globally gated only when no eligible worker remains.
+- Capture SSH stderr with stdout. OpenSSH exit status `255` is the only command status normalized to
+  a structured transport failure and preserves its diagnostic; all other statuses remain ordinary
+  command results. Deterministic-merge readiness, target comparison, reachability, and existing
+  worktree reconciliation classify that transport failure as merge-pending rather than invariant
+  failure. Do not add a timeout.
 
 ### Run-scoped Codex tools
 
@@ -246,11 +254,31 @@ Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
 - `symphony_workpad_read`
 - `symphony_workpad_write`
 - `symphony_acceptance_complete`
+- `symphony_review_complete` for the configured active review run
 - `symphony_task_transition`
 - `symphony_task_create`
 - `symphony_job_run` when the active run's frozen bundle defines jobs
 
 Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task. Return only the event type, task revision/current column, and run status when the command returns a run; never echo task/run identity, runtime state, active-run identity, or canonical payloads.
+
+`symphony_review_complete` accepts a strict nested object containing the expected revision, exact
+reviewed head, `pass` or `rework` verdict, route, plan-policy status and summary, nonempty validation
+evidence, and structured findings. The service, not the model, reads the current clean worktree,
+source head, PR head/state, aggregate review decision, every paginated review thread and comment,
+the bounded boolean PR draft state, and every required check context. The draft state participates
+in the feedback fingerprint. It stores the reviewer/run identity, observation time, PR number,
+and deterministic feedback/check fingerprints plus a canonical fingerprint of the exact acceptance-
+criterion multiset and its current evidence in a canonical review-attestation event. Current-state
+projection exposes only the explicit nested attestation allowlist, never raw provider payloads.
+
+A passing attestation requires the exact source/task/PR head, completed criteria with evidence, a
+non-deviating plan policy, no blocker/high findings, aggregate GitHub `APPROVED`, no unresolved
+threads, green required checks, and an explicitly non-draft PR, and routes only to the unique system
+merge column. A missing or non-boolean provider draft field invalidates the snapshot. A rework
+attestation requires findings and routes only along a configured agent edge to a non-review dispatch
+column or Blocked. Direct agent movement into the merge column is rejected. A later canonical source
+or PR-head change, linked PR identity change, or acceptance-criterion/evidence change clears a
+passing attestation and returns a merge-pending task to review.
 
 Derive the `symphony_job_run` name enum solely from the claimed run's frozen job definitions. One
 call starts or attaches to a supervised job and stays pending until a terminal result; do not expose
@@ -322,11 +350,52 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 - Each publication posts one PR comment containing every unpublished run workpad since the last publication. Include the stable hidden publication ID marker so retries across comment/manifest/SQLite crash windows are idempotent; changed content has a new hash and becomes unpublished.
 - After termination, append the creator run's compact status/model/effort/runtime/turn/token block to the PR body. Append every other run's block to the existing comment identified by its workpad publication marker, reconciling comments posted before final stats exist. Never create a stats-only comment, never copy a creator run into a workpad comment, and never expose Codex thread IDs or pricing estimates.
 - Include a hidden per-run stats marker and record successful publication as an idempotent canonical run event with destination, publication ID, and timestamp. GitHub failures stay in external-effect reconciliation and never retry or alter the agent run.
-- Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, then complete the board transition through a resumable saga.
-- Human Review → Rework converts the PR back to draft.
+- Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, project canonical `draft: false`, then complete the board transition through a resumable saga.
+- Human Review → Rework converts the PR back to draft and projects canonical `draft: true`. After
+  rework returns to Automated Review, a still-draft PR routes through Human Review again. The
+  configured human edge from Human Review to Automated Review starts a fresh review of the ready PR;
+  readiness alone cannot reuse or create a passing attestation.
 - Cancelled closes any open PR with a reason.
-- Done is accepted only after GitHub reports the PR merged and the merge SHA is reachable from the remote default branch.
-- Retain the existing land skill and squash-merge flow; task history is preserved in the separate board repository.
+- Reconcile at most one system merge worker at a time, separately from agent capacity and
+  `AgentRunner`. Revalidate the exact reviewed source/PR head, feedback fingerprint, aggregate
+  approval, boolean non-draft state, all review threads/comments, all required checks, and acceptance
+  evidence before any merge effect. Initial, post-readiness, clean-update, and guarded-squash gates
+  all require `draft: false`. A draft PR or valid failed/pending check payload returns to review;
+  provider transport, authentication, or process failure leaves the task merge-pending for
+  reconciliation.
+- Run the configured merge-readiness command to natural process exit without an elapsed-time,
+  inactivity, or output deadline. Fetch the current remote default branch and compare it with the
+  reviewed task head. If the task branch is behind, commit and push a normal merge of the target into
+  the task branch, then invalidate the attestation and require exact-head review again. Never rebase
+  or rewrite history.
+- After readiness exits, reload the canonical task and re-observe the clean local source plus the
+  provider PR identity, head, approval, threads, checks, and fingerprints before continuing. Repeat
+  that observation immediately before either clean-update push or guarded squash; any attested
+  criteria/evidence, linked PR identity, local source, or provider-state change returns to review or
+  blocks on an unsafe invariant.
+- Before the external clean-update push and guarded squash merge, record a canonical checkpoint.
+  Recovery observes both local Git and the actual remote PR head and resumes the same effect rather
+  than repeating a completed one; an already-updated remote head invalidates review without another
+  push. Use literal Git/`gh` argument vectors locally and safely quoted arguments over SSH.
+  Squash merge through `gh pr merge --squash --match-head-commit <reviewed-head>`.
+- Treat provider-reported conflict as a hint only. Reproduce it with Git, collect the complete sorted
+  unmerged-path set, and successfully abort the probe before recording a canonical conflict. The
+  first conflict for one task-head/target-head pair routes to the configured conflict stage and
+  clears the attestation; the same pair recurring later routes to Blocked. The conflict agent may
+  resolve only those recorded paths by merging the recorded target without rebase/history rewrite;
+  the recorded task head and target head must be the ordered parents of that merge, and every
+  resolution or follow-up commit may change only the recorded paths. The agent must commit a clean
+  final source, run one frozen managed job to terminal success for the current conflict run and that
+  exact source fingerprint, then push the same head before one atomic return to review. Pushing does
+  not change the source fingerprint, so a successful job is not repeated for the unchanged commit.
+  The final local, remote-branch, linked-PR, and provider-PR heads must agree. A missing, failed,
+  definition-mismatched, or stale-source job; dirty or uncommitted source; rewritten/wrong history;
+  out-of-scope path; unpushed head; stale conflict; or mismatched PR identity/state/head rejects the
+  transition. The conflict agent never lands the PR.
+- After guarded squash, fetch the target until the merge SHA is reachable. Atomically record the
+  reachable merge outcome and move to Done. Done cannot be reached by an agent and is accepted only
+  through this system completion event. Stale reviewed state returns to review, transient external
+  failure remains merge-pending, and missing/closed PRs or broken invariants route to Blocked.
 
 ### Board UI and public interfaces
 
@@ -386,7 +455,8 @@ Add targeted coverage for:
 - Stage-specific model resolution: singleton auto-selection, required multi-pair choices, catalog fallback during editing, exact dispatch validation, and Blocked failures.
 - Git event append/CAS/idempotency, replay, projection failure recovery, checkpoint restore/integrity fallback, push lag, divergence, handoff, and backup refs.
 - SQLite migrations, task invariants, evidence, dependency cycles, rank compaction, archive, Blocked resume, tri-state database recovery/quarantine/rollback, and sidecar-authoritative workpad loss/recovery semantics.
-- Actor-aware transitions and all external-effect saga crash windows.
+- Actor-aware transitions; canonical structured review-attestation pass/rework/replay/invalidation;
+  and all deterministic merge checkpoint crash windows.
 - Local and SSH worktree creation/reuse/removal, path/symlink safety, branch collisions, dirty worktrees, source fetch failures, and terminal cleanup.
 - Run-scoped dynamic-tool schemas, exact current-state allowlists, deterministic single-workpad selection across current/completed/failed/stopped runs, untouched-template skipping, legacy record recovery, active/cross-task isolation, compact mutation results, expected revisions, call-id idempotency, transition requirements, and follow-up creation.
 - Shared-listener MCP handshake/tool discovery for exactly three tools, strict schemas and read
@@ -399,7 +469,13 @@ Add targeted coverage for:
   claim/on-claim behavior, stage handoffs, no-retry blocking, orphan recovery, human stop,
   GitHub-wait exception, capacity, and dependency gating.
 - Cumulative-only token extraction, camel/snake-case token fields, cached tokens, high-water behavior, unique turns, telemetry migration/recovery/cleanup, terminal stats for completion/stop/failure, and `null` unavailable usage.
-- Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, meaningful-diff draft PR creation including documentation-only and zero-diff cases, publication markers, readiness prerequisites, rework-to-draft, cancellation, and merge validation.
+- Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, aggregate approval,
+  complete thread/comment pagination beyond 100 comments, meaningful-diff draft PR creation including
+  documentation-only and zero-diff cases, publication markers, readiness prerequisites,
+  rework-to-draft, cancellation, and guarded merge validation.
+- System merge/AgentRunner isolation, exact-head/feedback/check routing, delayed deadline-free
+  readiness, literal command arguments, real Git conflict path collection and abort, first/repeated
+  conflict routing, clean-update and guarded-squash recovery, and merge-SHA reachability.
 - Creator-run PR-body routing, existing workpad-comment routing before or after finalization, unpublished failed-run locality, retry-after-GitHub-failure, and crash-after-publication idempotency.
 - LiveView creation/editing, model selectors, drag/reorder, invalid transitions, active-stop confirmation, Blocked resume, archive, and health states.
 - Former REST paths returning generic 404s for every method, LiveView routing, and the complete MCP
@@ -411,10 +487,14 @@ Replace the Linear live E2E with:
 2. Local task creation through the board.
 3. Fake or real Codex implementation run in a task worktree.
 4. First-commit draft PR creation.
-5. Automated Review → Human Review workpad publication.
-6. Rework cycle with a second workpad comment.
-7. Merge → Done validation and cleanup.
-8. Service restart followed by event replay and identical board state.
+5. Automated Review observes the draft PR, records no verdict, and routes to Human Review for
+   workpad publication and readiness.
+6. Human Review → Rework converts the PR to draft; rework returns through Automated Review and a
+   second Human Review publication/readiness cycle.
+7. A human returns the ready PR to Automated Review, whose fresh passing attestation enters Merging.
+   Assert that no Merging agent run exists and that the deterministic system worker guards the exact
+   reviewed head, lands the squash, proves reachability, and moves to Done.
+8. Validate cleanup, then restart projection/writer state and prove identical event replay.
 
 Run targeted tests during implementation, then `mix specs.check` and the full `make all` gate.
 
@@ -427,4 +507,5 @@ Run targeted tests during implementation, then `mix specs.check` and the full `m
 - Workpads are intentionally less durable than task/event history.
 - There is no historical token backfill; only runs finalized after this behavior is deployed have complete stats. Cached-input tokens are shown separately and remain a subset of input tokens.
 - User-facing workflow configuration has no schema-version field; internal SQLite migrations and event-format compatibility remain implementation details.
-- The checked-in standard workflow includes Automated Review followed by optional Human Review.
+- The checked-in standard workflow includes Automated Review and the Human Review ready/re-review
+  cycle required before a draft PR can pass.

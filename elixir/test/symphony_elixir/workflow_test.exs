@@ -151,10 +151,7 @@ defmodule SymphonyElixir.WorkflowTest do
 
     source.workflow
     |> File.read!()
-    |> String.replace(
-      "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-      "  - id: merging\n    name: Merging\n    role: merge"
-    )
+    |> strip_jobs()
     |> Kernel.<>("""
 
     jobs:
@@ -168,11 +165,6 @@ defmodule SymphonyElixir.WorkflowTest do
       preflight:
         command: ./scripts/symphony-preflight.sh
         retry_after_failure_ms: 30000
-    merge:
-      method: squash
-      readiness_command: ./scripts/symphony-merge-readiness.sh
-      review_column: automated_review
-      conflict_column: rework
     """)
     |> then(&File.write!(source.workflow, &1))
 
@@ -199,9 +191,9 @@ defmodule SymphonyElixir.WorkflowTest do
 
     assert bundle.merge == %{
              method: :squash,
-             readiness_command: "./scripts/symphony-merge-readiness.sh",
+             readiness_command: "./elixir/scripts/symphony-merge-readiness.sh",
              review_column: "automated_review",
-             conflict_column: "rework"
+             conflict_column: "merge_conflict"
            }
 
     assert Workflow.Bundle.column(bundle, "merging").role == :merge
@@ -213,20 +205,7 @@ defmodule SymphonyElixir.WorkflowTest do
     original = File.read!(source.workflow)
 
     merge_workflow = fn key ->
-      original
-      |> String.replace(
-        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-        "  - id: merging\n    name: Merging\n    role: merge"
-      )
-      |> Kernel.<>("""
-
-      merge:
-        method: squash
-        readiness_command: ./merge-readiness.sh
-        review_column: automated_review
-        conflict_column: rework
-        #{key}: 1
-      """)
+      insert_under(original, "merge:", "  #{key}: 1")
     end
 
     cases = [
@@ -236,7 +215,7 @@ defmodule SymphonyElixir.WorkflowTest do
       {"codex", "stall_timeout_ms", insert_under(original, "codex:", "  stall_timeout_ms: 1")},
       {"hooks", "timeout_ms", insert_under(original, "hooks:", "  timeout_ms: 1")},
       {"jobs.validation", "max_output_bytes",
-       original <>
+       strip_jobs(original) <>
          """
 
          jobs:
@@ -248,7 +227,7 @@ defmodule SymphonyElixir.WorkflowTest do
              max_output_bytes: 1
          """},
       {"jobs.validation", "timeout_ms",
-       original <>
+       strip_jobs(original) <>
          """
 
          jobs:
@@ -305,12 +284,16 @@ defmodule SymphonyElixir.WorkflowTest do
         environment: {}
     """
 
-    File.write!(source.workflow, original <> job)
+    File.write!(source.workflow, strip_jobs(original) <> job)
 
     assert {:error, {:invalid_job_argument_token, "validation", "$SYMPHONY_TASK_ID"}} =
              Workflow.load(source.workflow)
 
-    File.write!(source.workflow, original <> String.replace(job, "$SYMPHONY_TASK_ID", "literal") <> "    mystery: true\n")
+    File.write!(
+      source.workflow,
+      strip_jobs(original) <>
+        String.replace(job, "$SYMPHONY_TASK_ID", "literal") <> "    mystery: true\n"
+    )
 
     assert {:error, {:unknown_workflow_keys, "jobs.validation", ["mystery"]}} =
              Workflow.load(source.workflow)
@@ -322,10 +305,7 @@ defmodule SymphonyElixir.WorkflowTest do
     merge_role_workflow =
       source.workflow
       |> File.read!()
-      |> String.replace(
-        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-        "  - id: merging\n    name: Merging\n    role: merge"
-      )
+      |> strip_merge()
 
     File.write!(source.workflow, merge_role_workflow)
     assert {:error, {:merge_columns_require_configuration, ["merging"]}} = Workflow.load(source.workflow)
@@ -350,4 +330,7 @@ defmodule SymphonyElixir.WorkflowTest do
   defp insert_under(yaml, heading, line) do
     String.replace(yaml, heading <> "\n", heading <> "\n" <> line <> "\n", global: false)
   end
+
+  defp strip_jobs(yaml), do: Regex.replace(~r/\njobs:\n(?:  .+\n)+(?=\nstages:\n)/, yaml, "")
+  defp strip_merge(yaml), do: Regex.replace(~r/\nmerge:\n(?:  .+\n)+(?=\nhooks:\n)/, yaml, "")
 end

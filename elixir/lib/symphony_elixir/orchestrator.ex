@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Board.{Commands, Lease, Projection, Sync, Writer}
   alias SymphonyElixir.Codex.{Activity, AppServer, RunStats}
   alias SymphonyElixir.Config
+  alias SymphonyElixir.DeterministicMerge
+  alias SymphonyElixir.DeterministicMerge.Worker, as: MergeWorker
   alias SymphonyElixir.GitHub
   alias SymphonyElixir.JobManager
   alias SymphonyElixir.SSH
@@ -34,6 +36,8 @@ defmodule SymphonyElixir.Orchestrator do
     defstruct started_at: nil,
               running: %{},
               refs: %{},
+              merging: %{},
+              merge_refs: %{},
               preflights: %{},
               preflight_refs: %{},
               preflight_failures: %{},
@@ -51,7 +55,11 @@ defmodule SymphonyElixir.Orchestrator do
               dispatch_enabled: nil,
               recover_orphans: true,
               task_filter: nil,
-              last_reconciled_at: nil
+              last_reconciled_at: nil,
+              agent_runner: nil,
+              merge_runner: nil,
+              rework_drafter: nil,
+              github_outcome_recorder: nil
 
     @type t :: %__MODULE__{}
   end
@@ -104,7 +112,11 @@ defmodule SymphonyElixir.Orchestrator do
        started_at: timestamp(),
        dispatch_enabled: Keyword.get(opts, :dispatch_enabled),
        recover_orphans: Keyword.get(opts, :recover_orphans, true),
-       task_filter: Keyword.get(opts, :task_filter)
+       task_filter: Keyword.get(opts, :task_filter),
+       agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
+       merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3),
+       rework_drafter: Keyword.get(opts, :rework_drafter),
+       github_outcome_recorder: Keyword.get(opts, :github_outcome_recorder)
      }}
   end
 
@@ -129,6 +141,10 @@ defmodule SymphonyElixir.Orchestrator do
        online: true,
        started_at: state.started_at,
        running: running,
+       merging:
+         state.merging
+         |> Enum.map(fn {task_id, runtime} -> %{task_id: task_id, started_at: runtime.started_at} end)
+         |> Enum.sort_by(& &1.task_id),
        preflights: preflight_status(state),
        worker_health: worker_health_status(state),
        rate_limits: state.rate_limits |> Map.values() |> Enum.sort_by(& &1["worker"]),
@@ -392,6 +408,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_preflight_or_runner_down(ref, reason, state) do
+    case Map.pop(state.merge_refs, ref) do
+      {nil, _merge_refs} ->
+        handle_preflight_or_runner_down_without_merge(ref, reason, state)
+
+      {task_id, merge_refs} ->
+        {_runtime, merging} = Map.pop(state.merging, task_id)
+        log_merge_exit(task_id, reason)
+
+        send(self(), :reconcile)
+        {:noreply, %{state | merge_refs: merge_refs, merging: merging}}
+    end
+  end
+
+  defp handle_preflight_or_runner_down_without_merge(ref, reason, state) do
     case Map.pop(state.preflight_refs, ref) do
       {nil, _preflight_refs} ->
         handle_runner_down(ref, reason, state)
@@ -575,9 +605,72 @@ defmodule SymphonyElixir.Orchestrator do
     {state, gate} = refresh_dispatch_health(state)
 
     case gate do
-      nil -> do_dispatch_candidates(%{state | dispatch_gate: nil})
+      nil -> state |> Map.put(:dispatch_gate, nil) |> dispatch_merge_candidates() |> do_dispatch_candidates()
       reason -> %{state | dispatch_gate: reason}
     end
+  end
+
+  defp dispatch_merge_candidates(%{merging: merging} = state) when map_size(merging) > 0, do: state
+
+  defp dispatch_merge_candidates(state) do
+    case MergeWorker.active() do
+      {:ok, task_id, pid} -> observe_merge_worker(state, task_id, pid)
+      :none -> do_dispatch_merge_candidate(state)
+    end
+  end
+
+  defp do_dispatch_merge_candidate(state) do
+    bundle = Config.bundle!()
+
+    candidate =
+      Board.tasks()
+      |> Enum.filter(&merge_eligible?(&1, bundle, state))
+      |> Enum.sort_by(&{Task.priority_weight(&1.priority), &1.rank, &1.number})
+      |> List.first()
+
+    case candidate do
+      nil -> state
+      task -> start_merge_worker(state, task, bundle)
+    end
+  end
+
+  defp merge_eligible?(task, bundle, state) do
+    not Task.archived?(task) and is_nil(task.runtime_state) and is_nil(task.active_run_id) and
+      match?(%{role: :merge}, Bundle.column(bundle, task.column_id)) and
+      selected_candidate?(task, state.task_filter)
+  end
+
+  defp start_merge_worker(state, task, bundle) do
+    case MergeWorker.ensure_started(task, bundle, state.merge_runner) do
+      {:ok, task_id, pid} ->
+        observe_merge_worker(state, task_id, pid)
+
+      :none ->
+        state
+
+      {:error, reason} ->
+        Logger.warning("deterministic merge worker start failed task_id=#{task.id} reason=#{inspect(reason)}")
+        state
+    end
+  end
+
+  defp observe_merge_worker(state, task_id, pid) do
+    ref = Process.monitor(pid)
+    runtime = %{pid: pid, ref: ref, started_at: timestamp()}
+
+    %{
+      state
+      | merging: Map.put(state.merging, task_id, runtime),
+        merge_refs: Map.put(state.merge_refs, ref, task_id)
+    }
+  end
+
+  defp log_merge_exit(task_id, :normal) do
+    Logger.info("deterministic merge worker exited task_id=#{task_id} reason=normal")
+  end
+
+  defp log_merge_exit(task_id, reason) do
+    Logger.warning("deterministic merge worker exited task_id=#{task_id} reason=#{inspect(reason)}")
   end
 
   defp do_dispatch_candidates(state) do
@@ -748,9 +841,11 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %{"run" => run}} ->
         recipient = self()
 
+        runner = state.agent_runner
+
         async =
           Elixir.Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
-            AgentRunner.run(task.id, run["id"], recipient)
+            runner.(task.id, run["id"], recipient)
           end)
 
         runtime = %{
@@ -780,7 +875,8 @@ defmodule SymphonyElixir.Orchestrator do
     column = Bundle.column(bundle, task.column_id)
 
     not Task.archived?(task) and is_nil(task.runtime_state) and is_nil(task.active_run_id) and
-      match?(%{role: :dispatch}, column) and dependencies_done?(task, bundle)
+      match?(%{role: :dispatch}, column) and dependencies_done?(task, bundle) and
+      rework_draft_complete?(task)
   end
 
   @doc false
@@ -1206,18 +1302,38 @@ defmodule SymphonyElixir.Orchestrator do
 
     Enum.reduce(tasks, state, fn task, acc ->
       acc
-      |> maybe_rework_to_draft(task)
+      |> reconcile_rework_draft(task)
       |> maybe_publish_run_stats(task)
       |> maybe_terminal_cleanup(task.id)
     end)
   end
 
-  defp maybe_rework_to_draft(state, %{column_id: "rework", github: %{"number" => _number, "draft" => false}} = task) do
-    unless get_in(task.github, ["rework_draft", "completed"]) == true do
-      {worktree, worker_host} = last_location(task)
+  @doc false
+  @spec reconcile_rework_draft(State.t(), Task.t()) :: State.t()
+  def reconcile_rework_draft(state, task) do
+    drafter = state.rework_drafter || (&convert_rework_to_draft/1)
+    outcome_recorder = state.github_outcome_recorder || (&record_github_outcome/3)
+    recorder = &outcome_recorder.(&1, "rework_draft", %{completed: true})
+    reconcile_rework_draft(state, task, drafter, recorder)
+  end
 
-      with :ok <- GitHub.convert_to_draft(task, worktree, worker_host: worker_host),
-           {:ok, _result} <- record_github_outcome(task, "rework_draft", %{completed: true}) do
+  @doc false
+  @spec reconcile_rework_draft(
+          State.t(),
+          Task.t(),
+          (Task.t() -> :ok | {:error, term()}),
+          (Task.t() -> {:ok, term()} | {:error, term()})
+        ) :: State.t()
+  def reconcile_rework_draft(
+        state,
+        %{column_id: "rework", active_run_id: nil, github: %{"number" => _number}} = task,
+        drafter,
+        recorder
+      )
+      when is_function(drafter, 1) and is_function(recorder, 1) do
+    unless rework_draft_complete?(task) do
+      with :ok <- maybe_convert_rework_to_draft(task, drafter),
+           {:ok, _result} <- recorder.(task) do
         :ok
       else
         {:error, reason} -> Logger.warning("rework draft saga pending task_id=#{task.id} reason=#{inspect(reason)}")
@@ -1227,7 +1343,21 @@ defmodule SymphonyElixir.Orchestrator do
     state
   end
 
-  defp maybe_rework_to_draft(state, _task), do: state
+  def reconcile_rework_draft(state, _task, _drafter, _recorder), do: state
+
+  defp maybe_convert_rework_to_draft(%{github: %{"draft" => true}}, _drafter), do: :ok
+  defp maybe_convert_rework_to_draft(task, drafter), do: drafter.(task)
+
+  defp rework_draft_complete?(%{column_id: "rework", github: %{"number" => _number} = github}) do
+    github["draft"] == true and get_in(github, ["rework_draft", "completed"]) == true
+  end
+
+  defp rework_draft_complete?(_task), do: true
+
+  defp convert_rework_to_draft(task) do
+    {worktree, worker_host} = last_location(task)
+    GitHub.convert_to_draft(task, worktree, worker_host: worker_host)
+  end
 
   @doc false
   @spec reconcile_workpad_publications(

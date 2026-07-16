@@ -178,6 +178,81 @@ defmodule SymphonyElixir.GitHub do
     end
   end
 
+  @doc "Returns the exact current source/PR head and deterministic feedback/check fingerprints for review attestation."
+  @spec review_snapshot(Task.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def review_snapshot(%Task{} = task, worktree, opts \\ []) do
+    worker_host = Keyword.get(opts, :worker_host)
+    directory = github_directory(worktree, worker_host)
+
+    with {:ok, number} <- pull_request_number(task),
+         {:ok, true} <- Worktree.clean?(worktree, worker_host),
+         {:ok, source_head} <- Worktree.head(worktree, worker_host),
+         {:ok, pr} <-
+           Client.json(
+             [
+               "pr",
+               "view",
+               Integer.to_string(number),
+               "--json",
+               "number,headRefOid,isDraft,mergeCommit,mergeable,reviewDecision,state,statusCheckRollup,url"
+             ],
+             cd: directory
+           ),
+         draft when is_boolean(draft) <- pr["isDraft"],
+         {:ok, threads} <- review_threads_snapshot(directory, number),
+         {:ok, checks} <- required_checks(directory, number) do
+      feedback = %{
+        "draft" => draft,
+        "mergeable" => pr["mergeable"],
+        "review_decision" => pr["reviewDecision"],
+        "threads" => threads
+      }
+
+      {:ok,
+       %{
+         number: pr["number"],
+         url: pr["url"],
+         state: pr["state"],
+         draft: draft,
+         head_sha: pr["headRefOid"],
+         source_head_sha: source_head,
+         approved: pr["reviewDecision"] == "APPROVED",
+         mergeable: pr["mergeable"],
+         merge_sha: get_in(pr, ["mergeCommit", "oid"]),
+         unresolved_review_threads: Enum.count(threads, &(&1["is_resolved"] != true)),
+         required_checks_green: checks_green?(checks),
+         feedback_fingerprint: fingerprint(feedback),
+         checks_fingerprint: fingerprint(checks |> Enum.map(&check_fingerprint_fields/1) |> Enum.sort()),
+         observed_at: timestamp()
+       }}
+    else
+      {:ok, false} -> {:error, :worktree_not_clean}
+      {:error, reason} -> {:error, reason}
+      _invalid_snapshot -> {:error, :invalid_review_snapshot}
+    end
+  end
+
+  @doc "Returns the live pull-request identity and source head for conflict-resolution verification."
+  @spec pull_request_source_snapshot(Task.t(), Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def pull_request_source_snapshot(%Task{} = task, worktree, opts \\ []) do
+    directory = github_directory(worktree, Keyword.get(opts, :worker_host))
+
+    with {:ok, number} <- pull_request_number(task),
+         {:ok, pr} <-
+           Client.json(
+             ["pr", "view", Integer.to_string(number), "--json", "number,headRefOid,state,url"],
+             cd: directory
+           ) do
+      {:ok,
+       %{
+         "number" => pr["number"],
+         "head_sha" => pr["headRefOid"],
+         "state" => pr["state"],
+         "url" => pr["url"]
+       }}
+    end
+  end
+
   @spec convert_to_draft(Task.t(), Path.t(), keyword()) :: :ok | {:error, term()}
   def convert_to_draft(%Task{} = task, worktree, opts \\ []) do
     gh_directory = github_directory(worktree, Keyword.get(opts, :worker_host))
@@ -572,6 +647,145 @@ defmodule SymphonyElixir.GitHub do
       {:error, reason} -> {:error, reason}
       _ -> {:error, :invalid_github_repository_name}
     end
+  end
+
+  defp review_threads_snapshot(worktree, number) do
+    with {:ok, repo} <- repository(worktree),
+         [owner, name] <- String.split(repo, "/", parts: 2) do
+      review_threads_snapshot_page(worktree, owner, name, number, nil, [], %{})
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_github_repository_name}
+    end
+  end
+
+  defp review_threads_snapshot_page(worktree, owner, name, number, cursor, accumulated, seen) do
+    query =
+      "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{id isResolved}pageInfo{hasNextPage endCursor}}}}}"
+
+    args =
+      [
+        "api",
+        "graphql",
+        "-f",
+        "query=#{query}",
+        "-F",
+        "owner=#{owner}",
+        "-F",
+        "name=#{name}",
+        "-F",
+        "number=#{number}"
+      ] ++ if(cursor, do: ["-f", "after=#{cursor}"], else: [])
+
+    with {:ok, response} <- Client.json(args, cd: worktree),
+         threads when is_map(threads) <-
+           get_in(response, ["data", "repository", "pullRequest", "reviewThreads"]),
+         nodes when is_list(nodes) <- threads["nodes"],
+         page_info when is_map(page_info) <- threads["pageInfo"],
+         {:ok, hydrated} <- hydrate_review_threads(worktree, nodes) do
+      normalized = accumulated ++ hydrated
+      next_cursor = page_info["endCursor"]
+
+      cond do
+        page_info["hasNextPage"] != true ->
+          {:ok, Enum.sort_by(normalized, & &1["id"])}
+
+        not is_binary(next_cursor) or next_cursor == "" ->
+          {:error, :invalid_review_thread_cursor}
+
+        Map.has_key?(seen, next_cursor) ->
+          {:error, {:repeated_review_thread_cursor, next_cursor}}
+
+        true ->
+          review_threads_snapshot_page(
+            worktree,
+            owner,
+            name,
+            number,
+            next_cursor,
+            normalized,
+            Map.put(seen, next_cursor, true)
+          )
+      end
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_review_threads_payload}
+    end
+  end
+
+  defp hydrate_review_threads(worktree, threads) do
+    Enum.reduce_while(threads, {:ok, []}, fn thread, {:ok, acc} ->
+      case review_thread_comments(worktree, thread["id"]) do
+        {:ok, comments} ->
+          normalized = %{
+            "id" => thread["id"],
+            "is_resolved" => thread["isResolved"] == true,
+            "comments" => comments
+          }
+
+          {:cont, {:ok, [normalized | acc]}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, hydrated} -> {:ok, Enum.reverse(hydrated)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp review_thread_comments(worktree, thread_id) when is_binary(thread_id) do
+    review_thread_comments_page(worktree, thread_id, nil, [], %{})
+  end
+
+  defp review_thread_comments(_worktree, _thread_id), do: {:error, :invalid_review_thread_id}
+
+  defp review_thread_comments_page(worktree, thread_id, cursor, accumulated, seen) do
+    query =
+      "query($id:ID!,$after:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$after){nodes{id updatedAt}pageInfo{hasNextPage endCursor}}}}}"
+
+    args =
+      ["api", "graphql", "-f", "query=#{query}", "-F", "id=#{thread_id}"] ++
+        if(cursor, do: ["-f", "after=#{cursor}"], else: [])
+
+    with {:ok, response} <- Client.json(args, cd: worktree),
+         comments when is_map(comments) <- get_in(response, ["data", "node", "comments"]),
+         nodes when is_list(nodes) <- comments["nodes"],
+         page_info when is_map(page_info) <- comments["pageInfo"] do
+      normalized = accumulated ++ Enum.map(nodes, &Map.take(&1, ["id", "updatedAt"]))
+      next_cursor = page_info["endCursor"]
+
+      cond do
+        page_info["hasNextPage"] != true ->
+          {:ok, Enum.sort_by(normalized, & &1["id"])}
+
+        not is_binary(next_cursor) or next_cursor == "" ->
+          {:error, {:invalid_review_comment_cursor, thread_id}}
+
+        Map.has_key?(seen, next_cursor) ->
+          {:error, {:repeated_review_comment_cursor, thread_id, next_cursor}}
+
+        true ->
+          review_thread_comments_page(
+            worktree,
+            thread_id,
+            next_cursor,
+            normalized,
+            Map.put(seen, next_cursor, true)
+          )
+      end
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, {:invalid_review_comments_payload, thread_id}}
+    end
+  end
+
+  defp check_fingerprint_fields(check), do: Map.take(check, ["bucket", "name", "state", "workflow"])
+
+  defp fingerprint(value) do
+    :crypto.hash(:sha256, Jason.encode!(value))
+    |> Base.encode16(case: :lower)
   end
 
   defp review_threads_page(worktree, owner, name, number, cursor, count, seen) do

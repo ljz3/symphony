@@ -110,6 +110,7 @@ defmodule SymphonyElixir.DynamicToolTest do
              "symphony_workpad_read",
              "symphony_workpad_write",
              "symphony_acceptance_complete",
+             "symphony_review_complete",
              "symphony_task_transition",
              "symphony_task_create"
            ]
@@ -190,7 +191,7 @@ defmodule SymphonyElixir.DynamicToolTest do
 
     File.write!(
       source.workflow,
-      File.read!(source.workflow) <>
+      Regex.replace(~r/\njobs:\n(?:  .+\n)+(?=\nstages:\n)/, File.read!(source.workflow), "") <>
         """
 
         jobs:
@@ -556,7 +557,7 @@ defmodule SymphonyElixir.DynamicToolTest do
     {review_task, review_run} = claim(review_ready)
     :ok = Board.write_workpad(review_run["id"], 1, "review workpad")
 
-    opts = [task_id: review_task["id"], run_id: review_run["id"], call_id: "merge-transition"]
+    opts = [task_id: review_task["id"], run_id: review_run["id"], call_id: "publish-transition"]
     parent = self()
 
     failing_publisher = fn _task, _worktree, _publisher_opts ->
@@ -567,7 +568,7 @@ defmodule SymphonyElixir.DynamicToolTest do
     assert %{"success" => false} =
              DynamicTool.execute(
                "symphony_task_transition",
-               %{"column_id" => "merging", "expected_revision" => review_task["revision"]},
+               %{"column_id" => "rework", "expected_revision" => review_task["revision"]},
                Keyword.put(opts, :workpad_publisher, failing_publisher)
              )
 
@@ -581,14 +582,14 @@ defmodule SymphonyElixir.DynamicToolTest do
     assert %{"success" => true} =
              DynamicTool.execute(
                "symphony_task_transition",
-               %{"column_id" => "merging", "expected_revision" => unchanged.revision},
+               %{"column_id" => "rework", "expected_revision" => unchanged.revision},
                opts
                |> Keyword.put(:call_id, "merge-transition-retry")
                |> Keyword.put(:workpad_publisher, successful_publisher)
              )
 
     assert {:ok, merged} = Board.task(review_task["id"])
-    assert merged.column_id == "merging"
+    assert merged.column_id == "rework"
     cleanup_active_run(merged.id, review_run["id"])
   end
 
@@ -686,12 +687,8 @@ defmodule SymphonyElixir.DynamicToolTest do
       source.workflow
       |> File.read!()
       |> String.replace(
-        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging",
-        "  - id: merging\n    name: Merging\n    role: dispatch\n    stage: merging\n    publish_workpad: true"
-      )
-      |> String.replace(
-        "    automated_review: [human_review, rework, blocked]",
-        "    automated_review: [human_review, merging, rework, blocked]"
+        "  - id: rework\n    name: Rework\n    role: dispatch\n    stage: rework",
+        "  - id: rework\n    name: Rework\n    role: dispatch\n    stage: rework\n    publish_workpad: true"
       )
 
     File.write!(source.workflow, workflow)
