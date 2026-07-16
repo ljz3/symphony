@@ -7,16 +7,15 @@ defmodule SymphonyElixir.CurrentState do
   into model context.
   """
 
-  alias SymphonyElixir.{Board, Orchestrator, Task}
+  alias SymphonyElixir.{Board, JobManager, Orchestrator, Task}
   alias SymphonyElixir.Workflow.Bundle
 
-  @task_fields ~w(id identifier title type priority brief branch column_id revision runtime_state desired_column_id)
+  @task_fields ~w(id identifier title type priority brief branch column_id revision)
   @run_fields ~w(id stage_id status model effort worker_host claimed_at started_at updated_at)
-  @source_fields ~w(head_sha base_sha clean recorded_at)
+  @source_fields ~w(head_sha base_sha clean)
   @github_fields ~w(number url state draft head_sha)
   @preflight_fields ~w(status phase fingerprint reason started_at last_activity_at completed_at next_retry_at)
   @job_fields ~w(job_id job status started_at finished_at elapsed_ms source_fingerprint)
-  @attestation_fields ~w(verdict reviewed_head_sha route plan_policy validation_evidence findings recorded_at)
 
   @spec project(Task.t(), map(), Bundle.t() | map(), keyword()) :: map()
   def project(%Task{} = task, run, workflow, opts \\ []) when is_map(run) do
@@ -29,8 +28,7 @@ defmodule SymphonyElixir.CurrentState do
       "dependencies" => dependency_projections(task.dependencies, workflow),
       "allowed_transitions" => allowed_transition_projections(task.column_id, workflow),
       "preflight" => preflight_projection(task.id, opts),
-      "job" => job_projection(run, opts),
-      "review_attestation" => review_attestation(task)
+      "job" => job_projection(run, opts)
     }
     |> reject_nil_values()
   end
@@ -137,17 +135,20 @@ defmodule SymphonyElixir.CurrentState do
   end
 
   defp job_projection(run, opts) do
-    case Keyword.get(opts, :job, run["current_job"]) do
+    job = active_job(run["id"], Keyword.get(opts, :job_manager, JobManager))
+
+    case job do
       job when is_map(job) -> take_present(job, @job_fields)
       _ -> nil
     end
   end
 
-  defp review_attestation(task) do
-    case task.metadata["review_attestation"] do
-      attestation when is_map(attestation) -> take_present(attestation, @attestation_fields)
-      _ -> nil
-    end
+  defp active_job(run_id, server) do
+    JobManager.active_for_run(run_id, server)
+  rescue
+    _error -> nil
+  catch
+    :exit, _reason -> nil
   end
 
   defp workflow_columns(%Bundle{columns: columns}), do: columns

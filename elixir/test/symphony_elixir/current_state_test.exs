@@ -71,13 +71,13 @@ defmodule SymphonyElixir.CurrentStateTest do
              ~w(allowed_transitions criteria dependencies github run source task)
 
     assert Map.keys(projection["task"]) |> Enum.sort() ==
-             ~w(branch brief column_id id identifier priority revision runtime_state title type)
+             ~w(branch brief column_id id identifier priority revision title type)
 
     assert Map.keys(projection["run"]) |> Enum.sort() ==
              ~w(claimed_at effort id model stage_id started_at status updated_at)
 
     assert Map.keys(projection["source"]) |> Enum.sort() ==
-             ~w(base_sha clean head_sha recorded_at)
+             ~w(base_sha clean head_sha)
 
     assert Map.keys(projection["github"]) |> Enum.sort() ==
              ~w(draft head_sha merged number reachable ready state url)
@@ -110,9 +110,12 @@ defmodule SymphonyElixir.CurrentStateTest do
     refute encoded =~ "evidence_history"
     refute encoded =~ "invocations"
     refute encoded =~ "metadata"
+    refute encoded =~ "runtime_state"
+    refute encoded =~ "desired_column_id"
+    refute encoded =~ "recorded_at"
   end
 
-  test "includes only explicit current block, preflight, job, and review fields when present" do
+  test "includes only explicit current block and preflight fields when present" do
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Optional state")})
     {:ok, %Task{} = task} = Board.task(created["id"])
 
@@ -155,8 +158,6 @@ defmodule SymphonyElixir.CurrentStateTest do
     projection =
       CurrentState.project(task, run, Config.bundle!(), preflights: [preflight])
 
-    assert projection["task"]["desired_column_id"] == "cancelled"
-
     assert projection["task"]["block"] == %{
              "from_column_id" => "in_progress",
              "reason" => "Concrete blocker"
@@ -169,21 +170,14 @@ defmodule SymphonyElixir.CurrentStateTest do
              "next_retry_at" => "2026-01-01T00:01:00Z"
            }
 
-    assert projection["job"] == %{
-             "job_id" => "job-current",
-             "job" => "validation",
-             "status" => "running",
-             "started_at" => "2026-01-01T00:00:00Z"
-           }
-
-    assert projection["review_attestation"] == %{
-             "verdict" => "pass",
-             "reviewed_head_sha" => String.duplicate("c", 40)
-           }
+    refute Map.has_key?(projection["task"], "desired_column_id")
+    refute Map.has_key?(projection, "job")
+    refute Map.has_key?(projection, "review_attestation")
 
     encoded = Jason.encode!(projection)
     refute encoded =~ "/private/secret"
     refute encoded =~ "must-not-leak"
     refute encoded =~ "do-not-copy"
+    refute encoded =~ "reviewed_head_sha"
   end
 end

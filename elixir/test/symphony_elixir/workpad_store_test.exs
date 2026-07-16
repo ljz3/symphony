@@ -82,6 +82,46 @@ defmodule SymphonyElixir.WorkpadStoreTest do
     Process.flag(:trap_exit, previous_trap_exit)
   end
 
+  test "record v2 rejects missing, uppercase, and non-hexadecimal template hashes with the exact path" do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    variants = [
+      {:missing, :missing},
+      {:uppercase, String.duplicate("A", 64)},
+      {:non_hexadecimal, String.duplicate("g", 64)}
+    ]
+
+    try do
+      Enum.each(variants, fn {label, template_sha256} ->
+        root = Path.join(System.tmp_dir!(), "symphony-invalid-template-hash-#{label}-#{Ecto.UUID.generate()}")
+        run_id = "invalid-template-hash-#{label}-#{Ecto.UUID.generate()}"
+        directory = Path.join([root, "records", run_id])
+        path = Path.join(directory, "1.json")
+        File.mkdir_p!(directory)
+
+        record = %{
+          "format_version" => 2,
+          "run_id" => run_id,
+          "invocation" => 1,
+          "content" => "workpad",
+          "content_sha256" => sha256("workpad"),
+          "updated_at" => "2026-01-01T00:00:00Z",
+          "template_sha256" => template_sha256
+        }
+
+        record = if template_sha256 == :missing, do: Map.delete(record, "template_sha256"), else: record
+        File.write!(path, Jason.encode!(record))
+        name = {:global, {__MODULE__, label, make_ref()}}
+        on_exit(fn -> File.rm_rf!(root) end)
+
+        assert {:error, {:malformed_workpad_sidecar, ^path, _reason}} =
+                 WorkpadStore.start_link(name: name, project_id: "symphony", root: root)
+      end)
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
+  end
+
   test "publication IDs ignore timestamps and input order" do
     task_id = Ecto.UUID.generate()
 

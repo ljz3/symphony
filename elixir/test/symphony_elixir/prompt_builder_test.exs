@@ -1,10 +1,11 @@
 defmodule SymphonyElixir.PromptBuilderTest do
   use ExUnit.Case, async: false
 
+  alias Ecto.Adapters.SQL
   alias SymphonyElixir.Board
-  alias SymphonyElixir.Board.Commands
+  alias SymphonyElixir.Board.{Commands, Projection}
   alias SymphonyElixir.BoardFactory
-  alias SymphonyElixir.PromptBuilder
+  alias SymphonyElixir.{PromptBuilder, Repo}
 
   test "composes the hard runner contract, base, context, and frozen stage in order" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Prompt")})
@@ -42,6 +43,48 @@ defmodule SymphonyElixir.PromptBuilderTest do
       expected_revision: task.revision,
       idempotency_key: BoardFactory.unique("cleanup")
     )
+  end
+
+  test "templates receive only stage identity and cannot inspect the frozen stage contract" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Minimal stage")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    {:ok, %{"task" => claimed, "run" => run}} =
+      Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+        actor: :system,
+        expected_revision: todo["revision"],
+        idempotency_key: BoardFactory.unique("minimal-stage-claim")
+      )
+
+    on_exit(fn -> cleanup_active_run(claimed["id"], run["id"]) end)
+
+    sentinel = "FROZEN-STAGE-SECRET"
+
+    frozen_stage =
+      run["frozen_bundle"]["stage"]
+      |> Map.put("workpad_template", sentinel)
+      |> Map.put("prompt_path", sentinel)
+      |> Map.put("workpad_template_path", sentinel)
+      |> Map.put("allowed_model_efforts", %{sentinel => ["high"]})
+
+    safe_run =
+      run
+      |> put_in(["frozen_bundle", "stage"], frozen_stage)
+      |> put_in(["frozen_bundle", "context_prompt"], "stage={{ stage }} id={{ stage.id }}")
+
+    {:ok, task} = Board.task(claimed["id"])
+    prompt = PromptBuilder.build_prompt(task, safe_run)
+
+    assert prompt =~ "id=implementation"
+    refute prompt =~ sentinel
+
+    for field <- ~w(prompt prompt_path workpad_template workpad_template_path allowed_model_efforts) do
+      forbidden_run = put_in(run, ["frozen_bundle", "context_prompt"], "{{ stage.#{field} }}")
+
+      assert_raise RuntimeError, ~r/context prompt render failed/, fn ->
+        PromptBuilder.build_prompt(task, forbidden_run)
+      end
+    end
   end
 
   test "injects exactly one latest meaningful workpad body without prior-run lists" do
@@ -147,6 +190,67 @@ defmodule SymphonyElixir.PromptBuilderTest do
     end)
   end
 
+  test "historical run volume cannot change prompt output beyond the one selected workpad" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Bounded prompt history")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+
+    {:ok, %{"task" => claimed, "run" => current_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+        actor: :system,
+        expected_revision: todo["revision"],
+        idempotency_key: BoardFactory.unique("bounded-history-claim")
+      )
+
+    selected_id = "selected-history-#{Ecto.UUID.generate()}"
+    historical_ids = Enum.map(1..60, &"historical-#{&1}-#{Ecto.UUID.generate()}")
+    run_ids = [selected_id | historical_ids]
+
+    on_exit(fn ->
+      cleanup_active_run(claimed["id"], current_run["id"])
+
+      Enum.each(run_ids, fn run_id ->
+        SQL.query!(Repo, "DELETE FROM board_workpads WHERE run_id = ?", [run_id])
+        SQL.query!(Repo, "DELETE FROM board_runs WHERE id = ?", [run_id])
+      end)
+    end)
+
+    insert_terminal_run(selected_id, claimed["id"], "2026-02-01T00:00:00Z", %{"outcome" => "selected"})
+
+    assert :ok =
+             Projection.put_workpad(%{
+               run_id: selected_id,
+               invocation: 7,
+               content: "ONLY-SELECTED-WORKPAD",
+               template_sha256: nil,
+               updated_at: "2026-02-01T00:00:00Z"
+             })
+
+    prompt_run = put_in(current_run, ["frozen_bundle", "context_prompt"], "latest={{ latest_workpad.content }}")
+    {:ok, task} = Board.task(claimed["id"])
+    baseline = PromptBuilder.build_prompt(task, prompt_run)
+
+    Enum.with_index(historical_ids, 1)
+    |> Enum.each(fn {run_id, index} ->
+      sentinel = "HISTORICAL-SENTINEL-#{index}-" <> String.duplicate("x", 2_000)
+      insert_terminal_run(run_id, claimed["id"], "2026-01-01T00:00:00Z", %{"outcome" => sentinel})
+
+      assert :ok =
+               Projection.put_workpad(%{
+                 run_id: run_id,
+                 invocation: index,
+                 content: sentinel,
+                 template_sha256: nil,
+                 updated_at: "2026-01-01T00:00:00Z"
+               })
+    end)
+
+    after_history = PromptBuilder.build_prompt(task, prompt_run)
+
+    assert after_history == baseline
+    assert length(String.split(after_history, "ONLY-SELECTED-WORKPAD")) == 2
+    refute after_history =~ "HISTORICAL-SENTINEL"
+  end
+
   defp index(string, pattern), do: :binary.match(string, pattern) |> elem(0)
 
   defp cleanup_active_run(task_id, run_id) do
@@ -161,6 +265,27 @@ defmodule SymphonyElixir.PromptBuilderTest do
       _ ->
         :ok
     end
+  end
+
+  defp insert_terminal_run(id, task_id, finished_at, extra) do
+    run =
+      Map.merge(
+        %{
+          "id" => id,
+          "task_id" => task_id,
+          "stage_id" => "implementation",
+          "status" => "failed",
+          "finished_at" => finished_at,
+          "updated_at" => finished_at
+        },
+        extra
+      )
+
+    SQL.query!(
+      Repo,
+      "INSERT INTO board_runs(id, task_id, stage_id, status, run_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [id, task_id, "implementation", "failed", Jason.encode!(run), finished_at]
+    )
   end
 
   defp terminal_handoff_fixture(status) do

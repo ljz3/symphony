@@ -59,7 +59,7 @@ defmodule SymphonyElixir.PromptBuilder do
 
   defp assigns(task, run, opts) do
     bundle = run["frozen_bundle"]
-    stage = bundle["stage"]
+    stage = %{"id" => get_in(bundle, ["stage", "id"])}
 
     task
     |> CurrentState.project(run, bundle)

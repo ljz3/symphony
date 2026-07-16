@@ -5,7 +5,7 @@ defmodule SymphonyElixir.DynamicToolTest do
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.BoardFactory
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.{JobManager, PromptBuilder, Workflow}
 
   test "tools are scoped to one active task/run and use call IDs for idempotency" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Tool")})
@@ -77,13 +77,17 @@ defmodule SymphonyElixir.DynamicToolTest do
       "expected_revision" => refreshed.revision
     }
 
-    assert %{"success" => true} =
+    assert %{"success" => true, "output" => blocked_json} =
              DynamicTool.execute(
                "symphony_task_transition",
                blocked_args,
                Keyword.put(opts, :call_id, "block-call")
              )
 
+    blocked_payload = Jason.decode!(blocked_json)
+    assert Map.keys(blocked_payload) |> Enum.sort() == ["event_type", "run", "task"]
+    assert Map.keys(blocked_payload["task"]) |> Enum.sort() == ~w(column_id revision)
+    assert blocked_payload["run"] == %{"status" => "failed"}
     assert {:ok, %{"status" => "failed"}} = Board.run(run["id"])
 
     {other, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Other")})
@@ -117,6 +121,36 @@ defmodule SymphonyElixir.DynamicToolTest do
     create = Enum.find(DynamicTool.tool_specs(), &(&1["name"] == "symphony_task_create"))
     refute "project_id" in create["inputSchema"]["required"]
     refute Map.has_key?(create["inputSchema"]["properties"], "project_id")
+  end
+
+  test "zero-argument tools reject null, scalar, and array inputs as non-objects" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Strict empty object")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+    {task, run} = claim(todo)
+
+    on_exit(fn -> cleanup_active_run(task["id"], run["id"]) end)
+
+    failures =
+      for tool <- ["symphony_task_context", "symphony_workpad_read"],
+          arguments <- [nil, "scalar", 42, []] do
+        DynamicTool.execute(tool, arguments,
+          task_id: task["id"],
+          run_id: run["id"],
+          call_id: "#{tool}-#{inspect(arguments)}"
+        )
+      end
+
+    assert Enum.all?(failures, &(&1["success"] == false))
+    assert Enum.all?(failures, &(&1["output"] =~ "tool_arguments_must_be_object"))
+
+    assert %{"success" => true} =
+             DynamicTool.execute("symphony_workpad_write", %{content: "atom-key-map"},
+               task_id: task["id"],
+               run_id: run["id"],
+               call_id: "atom-key-write"
+             )
+
+    assert {:ok, "atom-key-map"} = Board.read_workpad(run["id"], 1)
   end
 
   test "derives the blocking job enum only from the run's frozen definitions" do
@@ -220,6 +254,114 @@ defmodule SymphonyElixir.DynamicToolTest do
     cleanup_active_run(running_task["id"], running_run["id"])
   end
 
+  test "context and prompts project the actual running job without internal record data" do
+    source = BoardFactory.workflow_source()
+    release = Path.join(source.root, "context-job-release")
+    script = Path.join(source.root, "context-job.sh")
+
+    File.write!(script, """
+    #!/bin/sh
+    printf 'MODEL-SECRET-STDOUT'
+    printf 'MODEL-SECRET-STDERR' >&2
+    while [ ! -f "$1" ]; do sleep 0.05; done
+    """)
+
+    File.chmod!(script, 0o755)
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Active job context")})
+    {todo, _result} = BoardFactory.move(created, "todo")
+    {claimed_task, claimed_run} = claim(todo)
+
+    assert {:ok, %{"task" => running_task, "run" => running_run}} =
+             Board.execute(
+               %Commands.RunStarted{
+                 task_id: claimed_task["id"],
+                 run_id: claimed_run["id"],
+                 session_id: "context-job-session",
+                 workspace_path: source.root
+               },
+               actor: :system,
+               expected_revision: claimed_task["revision"],
+               idempotency_key: BoardFactory.unique("context-job-start")
+             )
+
+    on_exit(fn ->
+      File.touch(release)
+      JobManager.cancel_run(running_run["id"])
+      cleanup_active_run(running_task["id"], running_run["id"])
+    end)
+
+    call_id = "MODEL-SECRET-CALL-ID"
+
+    job_task =
+      Task.async(fn ->
+        JobManager.run(%{
+          task_id: running_task["id"],
+          task_identifier: running_task["identifier"],
+          task_branch: running_task["branch"],
+          run_id: running_run["id"],
+          call_id: call_id,
+          job: %{
+            "id" => "context_validation",
+            "executable" => "./context-job.sh",
+            "arguments" => [],
+            "passthrough_arguments" => :required,
+            "environment" => %{}
+          },
+          arguments: [release],
+          workspace: source.root,
+          worker_host: nil,
+          source_fingerprint: JobManager.source_fingerprint(source.root, nil)
+        })
+      end)
+
+    eventually(fn -> is_map(JobManager.active_for_run(running_run["id"])) end)
+
+    assert %{"success" => true, "output" => context_json} =
+             DynamicTool.execute("symphony_task_context", %{},
+               task_id: running_task["id"],
+               run_id: running_run["id"],
+               call_id: "context-with-job"
+             )
+
+    context = Jason.decode!(context_json)
+
+    assert Map.keys(context["job"]) |> Enum.sort() ==
+             ~w(job job_id source_fingerprint started_at status)
+
+    assert context["job"]["job"] == "context_validation"
+    assert context["job"]["status"] == "running"
+
+    prompt_run =
+      put_in(
+        running_run,
+        ["frozen_bundle", "context_prompt"],
+        "active-job={{ job.job_id }}:{{ job.job }}:{{ job.status }}"
+      )
+
+    {:ok, prompt_task} = Board.task(running_task["id"])
+    assert PromptBuilder.build_prompt(prompt_task, prompt_run) =~ "active-job=#{context["job"]["job_id"]}:context_validation:running"
+
+    for forbidden <- [
+          "MODEL-SECRET-STDOUT",
+          "MODEL-SECRET-STDERR",
+          call_id,
+          "stdout_path",
+          "stderr_artifact",
+          "call_ids",
+          "single_flight_key",
+          "workspace",
+          "arguments",
+          "environment"
+        ] do
+      refute context_json =~ forbidden
+    end
+
+    File.touch!(release)
+    assert {:ok, {:ok, result}} = Task.yield(job_task, 5_000)
+    assert result["status"] == "completed"
+    cleanup_active_run(running_task["id"], running_run["id"])
+  end
+
   test "mutation call IDs are idempotent within one run and independent across runs" do
     {first_created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("First call namespace")})
     {first_todo, _} = BoardFactory.move(first_created, "todo")
@@ -258,16 +400,21 @@ defmodule SymphonyElixir.DynamicToolTest do
     first_payload = Jason.decode!(first_json)
     second_payload = Jason.decode!(second_json)
 
-    assert Map.keys(first_payload) |> Enum.sort() == ["event_type", "run", "task"]
-
-    assert Map.keys(first_payload["task"]) |> Enum.sort() ==
-             ~w(active_run_id column_id id identifier revision runtime_state)
-
-    assert first_payload["task"]["id"] == first_task["id"]
-    assert first_payload["run"] == %{"id" => first_run["id"], "status" => "starting"}
-    assert second_payload["task"]["id"] == second_task["id"]
+    assert Map.keys(first_payload) |> Enum.sort() == ["event_type", "task"]
+    assert Map.keys(first_payload["task"]) |> Enum.sort() == ~w(column_id revision)
+    assert first_payload["task"]["column_id"] == first_task["column_id"]
+    assert first_payload["task"]["revision"] > first_task["revision"]
+    refute Map.has_key?(first_payload, "run")
+    assert Map.keys(second_payload["task"]) |> Enum.sort() == ~w(column_id revision)
+    assert second_payload["task"]["column_id"] == second_task["column_id"]
+    refute Map.has_key?(second_payload, "run")
     refute first_json =~ "acceptance_criteria"
     refute first_json =~ "frozen_bundle"
+    refute first_json =~ first_task["id"]
+    refute first_json =~ first_task["identifier"]
+    refute first_json =~ first_run["id"]
+    refute first_json =~ "runtime_state"
+    refute first_json =~ "active_run_id"
 
     assert %{"success" => true, "output" => ^first_json} =
              DynamicTool.execute("symphony_acceptance_complete", first_args, first_opts)
@@ -562,6 +709,18 @@ defmodule SymphonyElixir.DynamicToolTest do
 
       _ ->
         :ok
+    end
+  end
+
+  defp eventually(fun, attempts \\ 100)
+  defp eventually(_fun, 0), do: flunk("condition did not become true")
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(25)
+      eventually(fun, attempts - 1)
     end
   end
 end

@@ -144,8 +144,9 @@ owner can be reclaimed safely even when the operating system hostname changes.
 Workpad records and publication manifests are versioned JSON with owner-only permissions. Symphony
 writes, syncs, and atomically renames a record before updating SQLite. Existing sidecars win during
 startup reconciliation; SQLite-only records are exported once, then the projection is rehydrated
-from sidecars. Record v2 preserves the initial rendered-template hash across edits; v1 records remain
-readable and count as meaningful, while publication manifests stay at v1. Publication state is true
+from sidecars. Record v2 preserves the nullable initial rendered-template hash across edits, and
+every non-null value is exactly 64 lowercase hexadecimal characters. V1 records remain readable and
+count as meaningful, while publication manifests stay at v1. Publication state is true
 only when a manifest's run/invocation/content hashes match
 the current records. Startup stops on a malformed sidecar and reports its exact path rather than
 discarding local history. These files remain private, local, and noncanonical; do not publish or
@@ -284,8 +285,9 @@ The agent can use only the task/run-scoped `symphony_*` tools advertised by the 
 complete a permitted transition before the invocation ends. A transition into another dispatch
 stage schedules a new run with that stage's frozen prompt and workpad. Mutating tool calls combine
 the run ID with the app-server call ID for idempotency, so call IDs may restart in a later run without
-replaying a prior run's result. Successful mutations return only the event type, compact current task
-identity/status, and run ID/status rather than echoing the canonical task and run payloads.
+replaying a prior run's result. Successful mutations return only the event type, task revision/current
+column, and run status when present rather than echoing identities, runtime state, or canonical task
+and run payloads.
 
 Runs with configured jobs additionally advertise `symphony_job_run`, with its `job` enum derived
 only from that run's frozen bundle. The call remains pending until the command exits; there is no
@@ -307,14 +309,18 @@ group, with bounded force escalation used only after that human cancellation req
 remote signal delivery never blocks cancellation progress.
 
 Prompts and `symphony_task_context` share one explicit current-state projector. It includes only the
-current task/status, active run, curated source/GitHub state, current criterion evidence, shallow
-dependency status, and allowed transitions; raw metadata, evidence history, frozen bundles, prior
-runs/invocations, and raw provider payloads are excluded. `symphony_workpad_read` accepts only `{}`
-and returns the same one `latest_workpad` used by PromptBuilder, or `null`: the current run's highest
-meaningful invocation, otherwise the newest completed, failed, or stopped same-task run's highest
-meaningful invocation. Generated templates are stored as record-v2 hashes and skipped until edited;
-legacy v1 records remain readable and meaningful. Publication manifests remain v1, and cross-task
-or non-current active work is never selected.
+current task contract/column, active run, curated source/GitHub state, current criterion evidence,
+shallow dependency status, allowed transitions, current preflight state, and the actual active
+JobManager record reduced to job identity/status/timing/source fingerprint. Raw metadata, task
+runtime/desired state, evidence history, frozen bundles, prior runs/invocations, provider payloads,
+and job output/artifact/call internals are excluded. Templates receive only `stage.id`, never the
+frozen prompt/template/path/model contract. `symphony_task_context` and `symphony_workpad_read`
+require the literal empty object `{}` and reject null, scalar, and array inputs.
+`symphony_workpad_read` returns the same one `latest_workpad` used by PromptBuilder, or `null`: the
+current run's highest meaningful invocation, otherwise the newest completed, failed, or stopped
+same-task run's highest meaningful invocation. Generated templates are stored as record-v2 hashes
+and skipped until edited; legacy v1 records remain readable and meaningful. Publication manifests
+remain v1, and cross-task or non-current active work is never selected.
 
 After the first meaningful committed diff from the remote default branch, Symphony pushes the task
 branch and creates a deterministic draft PR. Documentation, product-specification, configuration,

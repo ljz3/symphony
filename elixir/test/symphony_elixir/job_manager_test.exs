@@ -503,6 +503,69 @@ defmodule SymphonyElixir.JobManagerTest do
     assert duplicate == result_a
   end
 
+  test "active run snapshot comes from real records and selects deterministically", %{workspace: workspace} do
+    release_a = Path.join(workspace, "snapshot-release-a")
+    release_b = Path.join(workspace, "snapshot-release-b")
+    run_id = "snapshot-run-#{Ecto.UUID.generate()}"
+
+    write_script!(workspace, "snapshot-wait.sh", """
+    #!/bin/sh
+    while [ ! -f "$1" ]; do sleep 0.05; done
+    """)
+
+    on_exit(fn ->
+      File.touch(release_a)
+      File.touch(release_b)
+      JobManager.cancel_run(run_id)
+    end)
+
+    first =
+      request(workspace,
+        executable: "./snapshot-wait.sh",
+        passthrough: [release_a],
+        call_id: "snapshot-call-a"
+      )
+      |> Map.put(:run_id, run_id)
+
+    second =
+      request(workspace,
+        executable: "./snapshot-wait.sh",
+        passthrough: [release_b],
+        call_id: "snapshot-call-b"
+      )
+      |> Map.put(:run_id, run_id)
+
+    first_task = Task.async(fn -> JobManager.run(first) end)
+    second_task = Task.async(fn -> JobManager.run(second) end)
+
+    eventually(fn ->
+      JobManager
+      |> :sys.get_state()
+      |> Map.fetch!(:records)
+      |> Map.values()
+      |> Enum.count(&(&1["run_id"] == run_id and &1["status"] == "running"))
+      |> Kernel.==(2)
+    end)
+
+    active_records =
+      JobManager
+      |> :sys.get_state()
+      |> Map.fetch!(:records)
+      |> Map.values()
+      |> Enum.filter(&(&1["run_id"] == run_id and &1["status"] == "running"))
+
+    expected = Enum.max_by(active_records, &{&1["started_at"], &1["job_id"]})
+
+    assert JobManager.active_for_run("missing-run") == nil
+    assert JobManager.active_for_run(run_id) == expected
+
+    File.touch!(release_a)
+    File.touch!(release_b)
+    assert {:ok, {:ok, _result}} = Task.yield(first_task, 5_000)
+    assert {:ok, {:ok, _result}} = Task.yield(second_task, 5_000)
+    assert JobManager.active_for_run(run_id) == nil
+  end
+
   test "cancelling a run terminates the job process group", %{workspace: workspace} do
     child_pid_path = Path.join(workspace, "child.pid")
 

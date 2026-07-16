@@ -19,7 +19,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     with {:ok, scope} <- scope(opts),
-         {:ok, result} <- execute_scoped(tool, normalize_arguments(arguments), scope, opts) do
+         {:ok, normalized_arguments} <- normalize_arguments(arguments),
+         {:ok, result} <- execute_scoped(tool, normalized_arguments, scope, opts) do
       success_response(result)
     else
       {:error, reason} -> failure_response(reason)
@@ -255,7 +256,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
              expected_revision: expected_revision,
              idempotency_key: key
            ) do
-      {:ok, compact_mutation_result(result, scope.run)}
+      {:ok, compact_mutation_result(result)}
     end
   end
 
@@ -275,9 +276,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp normalize_arguments(arguments) when is_map(arguments), do: stringify_keys(arguments)
-  defp normalize_arguments(nil), do: %{}
-  defp normalize_arguments(_arguments), do: %{}
+  defp normalize_arguments(arguments) when is_map(arguments), do: {:ok, stringify_keys(arguments)}
+  defp normalize_arguments(_arguments), do: {:error, :tool_arguments_must_be_object}
 
   defp required_string(arguments, key), do: arguments |> Map.get(key) |> nonempty(key)
 
@@ -349,22 +349,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp compact_mutation_result(result, active_run) do
+  defp compact_mutation_result(result) do
     %{
       "event_type" => result["event_type"],
       "task" => compact_mutation_task(result["task"]),
-      "run" => compact_mutation_run(result["run"] || active_run)
+      "run" => compact_mutation_run(result["run"])
     }
     |> Map.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   defp compact_mutation_task(task) when is_map(task) do
-    Map.take(task, ~w(id identifier column_id revision runtime_state active_run_id))
+    Map.take(task, ~w(revision column_id))
   end
 
   defp compact_mutation_task(_task), do: nil
 
-  defp compact_mutation_run(run) when is_map(run), do: Map.take(run, ~w(id status))
+  defp compact_mutation_run(run) when is_map(run), do: Map.take(run, ~w(status))
   defp compact_mutation_run(_run), do: nil
 
   defp success_response(payload), do: response(true, payload)

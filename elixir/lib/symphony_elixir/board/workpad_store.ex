@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Board.WorkpadStore do
 
   @record_format_version 2
   @manifest_format_version 1
+  @sha256_pattern ~r/\A[0-9a-f]{64}\z/
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -442,8 +443,11 @@ defmodule SymphonyElixir.Board.WorkpadStore do
     do: {:ok, nil}
 
   defp validate_template_sha256(@record_format_version, %{"template_sha256" => hash})
-       when is_binary(hash) and byte_size(hash) == 64,
-       do: {:ok, hash}
+       when is_binary(hash) do
+    if Regex.match?(@sha256_pattern, hash),
+      do: {:ok, hash},
+      else: {:error, :invalid_template_sha256}
+  end
 
   defp validate_template_sha256(_version, _record), do: {:error, :invalid_template_sha256}
 
