@@ -677,6 +677,54 @@ defmodule SymphonyElixir.JobManagerTest do
     refute cancelled_result["job_id"] == replacement_result["job_id"]
   end
 
+  @tag timeout: 20_000
+  test "a cancelled terminal cannot erase its active replacement single-flight", %{workspace: workspace} do
+    starts = Path.join(workspace, "replacement-race-starts")
+    release = Path.join(workspace, "replacement-race-release")
+
+    write_script!(workspace, "replacement-race.sh", """
+    #!/bin/sh
+    printf '%s\n' "$SYMPHONY_RUN_ID" >> "$1"
+    if [ "$SYMPHONY_RUN_ID" = "race-cancelling-run" ]; then
+      trap '' TERM
+      while :; do sleep 1; done
+    fi
+    while [ ! -f "$2" ]; do sleep 0.05; done
+    printf replacement-result
+    """)
+
+    first =
+      request(workspace,
+        executable: "./replacement-race.sh",
+        passthrough: [starts, release],
+        run_id: "race-cancelling-run",
+        call_id: "race-cancelling-call"
+      )
+
+    replacement = %{first | run_id: "race-replacement-run", call_id: "race-replacement-call"}
+    third = %{first | run_id: "race-third-run", call_id: "race-third-call"}
+
+    first_task = Task.async(fn -> JobManager.run(first) end)
+    eventually(fn -> start_count(starts) == 1 end)
+    assert :ok = JobManager.cancel_run(first.run_id)
+
+    replacement_task = Task.async(fn -> JobManager.run(replacement) end)
+    eventually(fn -> start_count(starts) == 2 end)
+
+    assert {:ok, {:ok, cancelled}} = Task.yield(first_task, 10_000)
+    assert cancelled["status"] == "cancelled"
+
+    third_task = Task.async(fn -> JobManager.run(third) end)
+    Process.sleep(100)
+    File.touch!(release)
+
+    assert {:ok, {:ok, replacement_result}} = Task.yield(replacement_task, 5_000)
+    assert {:ok, {:ok, third_result}} = Task.yield(third_task, 5_000)
+    assert replacement_result["job_id"] == third_result["job_id"]
+    assert replacement_result["output"] == "replacement-result"
+    assert start_count(starts) == 2
+  end
+
   test "active run snapshot comes from real records and selects deterministically", %{workspace: workspace} do
     release_a = Path.join(workspace, "snapshot-release-a")
     release_b = Path.join(workspace, "snapshot-release-b")
@@ -855,6 +903,17 @@ defmodule SymphonyElixir.JobManagerTest do
     else
       Process.sleep(25)
       eventually(fun, attempts - 1)
+    end
+  end
+
+  defp start_count(path) do
+    if File.exists?(path) do
+      path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> length()
+    else
+      0
     end
   end
 

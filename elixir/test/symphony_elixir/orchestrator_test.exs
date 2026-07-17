@@ -560,6 +560,84 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert second_id == second.id
   end
 
+  @tag timeout: 20_000
+  test "a restarted Orchestrator cancels an inherited readiness tree after the task leaves merge" do
+    assert :none = MergeWorker.active()
+    task = canonical_merge_task()
+    readiness = start_inherited_readiness(task, Config.bundle!(), "task-moved")
+    readiness_ref = readiness.ref
+    readiness_pid = readiness.pid
+
+    on_exit(fn -> cleanup_inherited_readiness(readiness) end)
+
+    assert {:ok, %{"task" => moved}} =
+             Board.execute(
+               %Commands.InvalidateReviewAttestation{
+                 task_id: task.id,
+                 reason: "task moved while orchestrator was down",
+                 head_sha: @target
+               },
+               actor: :system,
+               expected_revision: task.revision,
+               idempotency_key: BoardFactory.unique("inherited-task-moved")
+             )
+
+    assert moved["column_id"] == "automated_review"
+    assert {:noreply, state} = Orchestrator.handle_info(:reconcile, inherited_merge_state(task.id))
+    assert state.merging[task.id].cancelling
+    assert_receive {:DOWN, ^readiness_ref, :process, ^readiness_pid, _reason}, 4_000
+    refute process_alive?(readiness.parent_pid)
+    refute process_alive?(readiness.child_pid)
+  end
+
+  @tag timeout: 20_000
+  test "a restarted Orchestrator cancels an inherited worker from another workflow hash" do
+    assert :none = MergeWorker.active()
+    task = canonical_merge_task()
+    stale_bundle = %{Config.bundle!() | hash: "stale-workflow-hash"}
+    readiness = start_inherited_readiness(task, stale_bundle, "workflow-changed")
+    readiness_ref = readiness.ref
+    readiness_pid = readiness.pid
+
+    on_exit(fn -> cleanup_inherited_readiness(readiness) end)
+
+    assert {:noreply, state} = Orchestrator.handle_info(:reconcile, inherited_merge_state(task.id))
+    assert state.merging[task.id].cancelling
+    assert_receive {:DOWN, ^readiness_ref, :process, ^readiness_pid, _reason}, 4_000
+    refute process_alive?(readiness.parent_pid)
+    refute process_alive?(readiness.child_pid)
+  end
+
+  @tag timeout: 20_000
+  test "a restarted Orchestrator retains an inherited worker across saga-only checkpoints" do
+    assert :none = MergeWorker.active()
+    task = canonical_merge_task()
+    readiness = start_inherited_readiness(task, Config.bundle!(), "saga-checkpoint")
+    readiness_ref = readiness.ref
+    readiness_pid = readiness.pid
+
+    on_exit(fn -> cleanup_inherited_readiness(readiness) end)
+
+    assert {:ok, %{"task" => checkpointed}} =
+             Board.execute(
+               %Commands.RecordMergeCheckpoint{
+                 task_id: task.id,
+                 checkpoint: "clean_update_started",
+                 attrs: %{"task_head" => @head, "target_head" => @target}
+               },
+               actor: :system,
+               expected_revision: task.revision,
+               idempotency_key: BoardFactory.unique("inherited-saga-checkpoint")
+             )
+
+    assert checkpointed["merge_saga"]["checkpoint"] == "clean_update_started"
+    assert {:noreply, state} = Orchestrator.handle_info(:reconcile, inherited_merge_state(task.id))
+    refute state.merging[task.id].cancelling
+    assert state.merging[task.id].pid == readiness.pid
+    refute_receive {:DOWN, ^readiness_ref, :process, ^readiness_pid, _reason}, 200
+    assert Process.alive?(readiness.pid)
+  end
+
   test "pending merge outcomes obey a per-task retry cadence" do
     task = canonical_merge_task()
     parent = self()
@@ -732,6 +810,63 @@ defmodule SymphonyElixir.OrchestratorTest do
     eventually(fn -> MergeWorker.active() == :none end)
     assert :atomics.get(invocations, 1) == 2
     safe_stop(restarted_orchestrator)
+  end
+
+  defp start_inherited_readiness(task, bundle, label) do
+    root = Path.join(System.tmp_dir!(), BoardFactory.unique("inherited-readiness-#{label}"))
+    File.mkdir_p!(root)
+    parent_path = Path.join(root, "parent.pid")
+    child_path = Path.join(root, "child.pid")
+
+    command = """
+    trap '' TERM
+    (trap '' TERM; while :; do sleep 1; done) &
+    child=$!
+    printf %s $$ > #{shell_escape(parent_path)}
+    printf %s "$child" > #{shell_escape(child_path)}
+    wait "$child"
+    """
+
+    runner = fn merge_task, _bundle, _opts ->
+      DeterministicMerge.SystemBoundary.call(:readiness, merge_task, %{
+        worktree: root,
+        worker_host: nil,
+        readiness_command: command
+      })
+    end
+
+    assert {:ok, task_id, pid} = MergeWorker.ensure_started(task, bundle, runner)
+    assert task_id == task.id
+    ref = Process.monitor(pid)
+    eventually(fn -> File.exists?(parent_path) and File.exists?(child_path) end)
+
+    %{
+      task_id: task.id,
+      pid: pid,
+      ref: ref,
+      parent_pid: parent_path |> File.read!() |> String.trim() |> String.to_integer(),
+      child_pid: child_path |> File.read!() |> String.trim() |> String.to_integer()
+    }
+  end
+
+  defp inherited_merge_state(task_id) do
+    struct(State,
+      dispatch_enabled: true,
+      recover_orphans: false,
+      task_filter: &(&1.id == task_id),
+      github_health: %{available: true, authenticated: true, error: nil},
+      github_health_checked_at: System.monotonic_time(:millisecond)
+    )
+  end
+
+  defp cleanup_inherited_readiness(readiness) do
+    if Process.alive?(readiness.pid) do
+      MergeWorker.cancel(readiness.pid, readiness.task_id)
+      eventually(fn -> not Process.alive?(readiness.pid) end)
+    end
+
+    kill_process(readiness.parent_pid)
+    kill_process(readiness.child_pid)
   end
 
   defp publish_merging_bundle do
