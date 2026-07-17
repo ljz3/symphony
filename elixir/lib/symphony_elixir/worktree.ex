@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Worktree do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Paths, PathSafety, SSH, Task}
+  alias SymphonyElixir.{Config, ManagedCommand, Paths, PathSafety, SSH, Task}
 
   @type worker_host :: String.t() | nil
 
@@ -153,11 +153,19 @@ defmodule SymphonyElixir.Worktree do
         opts \\ []
       )
       when is_binary(worktree) and is_binary(command) and is_binary(workflow_hash) and is_list(opts) do
-    owner = Keyword.get(opts, :owner)
+    owner = Keyword.get(opts, :owner, self())
     cancellation_ref = Keyword.get(opts, :cancellation_ref, make_ref())
 
-    with {:ok, port} <- start_preflight_port(task, worktree, command, workflow_hash, worker_host),
-         {:ok, {output, status}} <- collect_preflight_port(port, owner, cancellation_ref) do
+    with {:ok, {output, status}} <-
+           ManagedCommand.run(
+             command,
+             worktree,
+             preflight_env(task, workflow_hash),
+             worker_host,
+             owner: owner,
+             cancellation_message: {:cancel_preflight, cancellation_ref},
+             cancellation_reason: :preflight_cancelled
+           ) do
       if status == 0,
         do: {:ok, output},
         else: {:error, {:preflight_failed, status, output}}
@@ -562,90 +570,26 @@ defmodule SymphonyElixir.Worktree do
   end
 
   defp execute_hook(command, kind, task, worktree, nil) do
-    env = hook_env(task)
-
-    case System.cmd("bash", ["-lc", command], cd: worktree, env: env, stderr_to_stdout: true) do
-      {_output, 0} -> :ok
-      {output, status} -> {:error, {:worktree_hook_failed, kind, status, output}}
-    end
+    execute_managed_hook(command, kind, task, worktree, nil)
   end
 
   defp execute_hook(command, kind, task, worktree, host) do
-    exports = hook_env(task) |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
-    script = "cd #{shell_escape(worktree)} && env #{exports} bash -lc #{shell_escape(command)}"
+    execute_managed_hook(command, kind, task, worktree, host)
+  end
 
-    case SSH.run(host, script) do
+  defp execute_managed_hook(command, kind, task, worktree, worker_host) do
+    case ManagedCommand.run(command, worktree, hook_env(task), worker_host) do
       {:ok, {_output, 0}} -> :ok
-      {:ok, {output, status}} -> {:error, {:worktree_hook_failed, kind, host, status, output}}
+      {:ok, {output, status}} -> hook_failure(kind, worker_host, status, output)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_preflight_port(task, worktree, command, workflow_hash, nil) do
-    case System.find_executable("bash") do
-      nil ->
-        {:error, :bash_not_found}
+  defp hook_failure(kind, nil, status, output),
+    do: {:error, {:worktree_hook_failed, kind, status, output}}
 
-      executable ->
-        port_opts = [
-          :binary,
-          :exit_status,
-          :stderr_to_stdout,
-          args: [~c"-lc", String.to_charlist(command)],
-          cd: String.to_charlist(worktree),
-          env: preflight_env(task, workflow_hash) |> Enum.map(&port_env/1)
-        ]
-
-        {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
-    end
-  rescue
-    error -> {:error, {:preflight_start_failed, Exception.message(error)}}
-  end
-
-  defp start_preflight_port(task, worktree, command, workflow_hash, host) do
-    exports =
-      task
-      |> preflight_env(workflow_hash)
-      |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
-
-    script = "cd #{shell_escape(worktree)} && env #{exports} bash -lc #{shell_escape(command)}"
-    SSH.start_port(host, script)
-  end
-
-  defp collect_preflight_port(port, owner, cancellation_ref) when is_pid(owner) do
-    owner_ref = Process.monitor(owner)
-
-    try do
-      collect_preflight_port(port, owner_ref, cancellation_ref, [])
-    after
-      Process.demonitor(owner_ref, [:flush])
-    end
-  end
-
-  defp collect_preflight_port(port, _owner, cancellation_ref) do
-    collect_preflight_port(port, make_ref(), cancellation_ref, [])
-  end
-
-  defp collect_preflight_port(port, owner_ref, cancellation_ref, chunks) do
-    receive do
-      {^port, {:data, data}} ->
-        collect_preflight_port(port, owner_ref, cancellation_ref, [data | chunks])
-
-      {^port, {:exit_status, status}} ->
-        {:ok, {chunks |> Enum.reverse() |> IO.iodata_to_binary(), status}}
-
-      {^port, :closed} ->
-        {:error, :preflight_port_closed}
-
-      {:DOWN, ^owner_ref, :process, _owner, _reason} ->
-        terminate_preflight_port(port)
-        {:error, :preflight_owner_down}
-
-      {:cancel_preflight, ^cancellation_ref} ->
-        terminate_preflight_port(port)
-        {:error, :preflight_cancelled}
-    end
-  end
+  defp hook_failure(kind, worker_host, status, output),
+    do: {:error, {:worktree_hook_failed, kind, worker_host, status, output}}
 
   defp terminate_preflight_port(port) do
     with {:os_pid, os_pid} when is_integer(os_pid) <- Port.info(port, :os_pid) do
@@ -681,12 +625,7 @@ defmodule SymphonyElixir.Worktree do
       {output, 0} ->
         output
         |> String.split(~r/\s+/, trim: true)
-        |> Enum.flat_map(fn value ->
-          case Integer.parse(value) do
-            {child, ""} -> [child]
-            _ -> []
-          end
-        end)
+        |> Enum.flat_map(&parse_child_process/1)
 
       {_output, _status} ->
         []
@@ -695,14 +634,19 @@ defmodule SymphonyElixir.Worktree do
     _error -> []
   end
 
+  defp parse_child_process(value) do
+    case Integer.parse(value) do
+      {child, ""} -> [child]
+      _ -> []
+    end
+  end
+
   defp signal_process(pid, signal) do
     _result = System.cmd("kill", ["-#{signal}", Integer.to_string(pid)], stderr_to_stdout: true)
     :ok
   rescue
     _error -> :ok
   end
-
-  defp port_env({key, value}), do: {String.to_charlist(key), String.to_charlist(value)}
 
   defp preflight_env(task, workflow_hash) do
     hook_env(task) ++ [{"SYMPHONY_WORKFLOW_HASH", workflow_hash}]

@@ -805,7 +805,7 @@ defmodule SymphonyElixir.Board.Validator do
 
     with true <- exact_conflict_proof_keys?(proof),
          true <- canonical_conflict_proof?(proof, conflict, run),
-         true <- canonical_pre_resolution_heads?(task, conflict),
+         true <- canonical_conflict_heads?(task, conflict, proof),
          true <- valid_conflict_source_proof?(proof, conflict),
          true <- valid_conflict_job?(job, run, frozen_job, proof),
          true <- valid_conflict_pull_request?(pull_request, task, proof) do
@@ -829,9 +829,11 @@ defmodule SymphonyElixir.Board.Validator do
       proof["conflicted_paths"] == conflict["conflicted_paths"] and proof["run_id"] == run["id"]
   end
 
-  defp canonical_pre_resolution_heads?(task, conflict) do
-    task.source["head_sha"] == conflict["task_head"] and task.source["clean"] == true and
-      task.github["head_sha"] == conflict["task_head"]
+  defp canonical_conflict_heads?(task, conflict, proof) do
+    allowed_heads = [conflict["task_head"], proof["final_head_sha"]]
+
+    task.source["head_sha"] in allowed_heads and task.source["clean"] == true and
+      task.github["head_sha"] in allowed_heads
   end
 
   defp valid_conflict_source_proof?(proof, conflict) do

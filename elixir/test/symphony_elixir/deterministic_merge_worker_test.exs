@@ -12,7 +12,7 @@ defmodule SymphonyElixir.DeterministicMerge.WorkerTest do
 
     on_exit(fn ->
       case Worker.active() do
-        {:ok, _task_id, pid} -> release_and_wait(pid)
+        {:ok, _task_id, pid, _guard} -> release_and_wait(pid)
         :none -> :ok
       end
     end)
@@ -32,12 +32,13 @@ defmodule SymphonyElixir.DeterministicMerge.WorkerTest do
       end
     end
 
-    assert {:ok, ^task_id, pid} = Worker.ensure_started(task, bundle, runner)
+    expected_guard = Worker.semantic_guard(task, bundle)
+    assert {:ok, ^task_id, pid, ^expected_guard} = Worker.ensure_started(task, bundle, runner)
     assert_receive {:runner_started, ^pid}
-    assert {:ok, ^task_id, ^pid} = Worker.active()
+    assert {:ok, ^task_id, ^pid, ^expected_guard} = Worker.active()
 
     other_task = %{task | id: "other-merge-worker"}
-    assert {:ok, ^task_id, ^pid} = Worker.ensure_started(other_task, bundle, runner)
+    assert {:ok, ^task_id, ^pid, ^expected_guard} = Worker.ensure_started(other_task, bundle, runner)
 
     ref = Process.monitor(pid)
     send(pid, :release)
@@ -57,18 +58,65 @@ defmodule SymphonyElixir.DeterministicMerge.WorkerTest do
     assert :none = Worker.active()
   end
 
+  test "reports a legacy registered worker without an invented semantic guard" do
+    parent = self()
+    task_id = "legacy-merge-worker"
+
+    pid =
+      spawn(fn ->
+        {:ok, _owner} =
+          Registry.register(SymphonyElixir.DeterministicMerge.WorkerRegistry, :active, task_id)
+
+        send(parent, {:legacy_worker_registered, self()})
+
+        receive do
+          :release -> :ok
+        end
+      end)
+
+    assert_receive {:legacy_worker_registered, ^pid}
+    assert {:ok, ^task_id, ^pid, nil} = Worker.active()
+
+    ref = Process.monitor(pid)
+    send(pid, :release)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    eventually(fn -> Worker.active() == :none end)
+  end
+
   test "logs a non-success result and releases its identity", %{bundle: bundle, task: task} do
     task_id = task.id
 
     log =
       capture_log(fn ->
-        assert {:ok, ^task_id, pid} = Worker.ensure_started(task, bundle, fn _, _, [] -> {:error, :expected} end)
+        assert {:ok, ^task_id, pid, _guard} =
+                 Worker.ensure_started(task, bundle, fn _, _, [] -> {:error, :expected} end)
+
         ref = Process.monitor(pid)
         assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
       end)
 
     assert log =~ "deterministic merge worker failed"
     assert log =~ "{:error, :expected}"
+    eventually(fn -> Worker.active() == :none end)
+  end
+
+  test "escalates an explicit cancellation when a runner does not cooperate", %{bundle: bundle, task: task} do
+    parent = self()
+
+    runner = fn _task, _bundle, [] ->
+      send(parent, {:stubborn_runner_started, self()})
+
+      receive do
+        :never_sent -> {:ok, :unexpected}
+      end
+    end
+
+    assert {:ok, task_id, pid, _guard} = Worker.ensure_started(task, bundle, runner)
+    assert_receive {:stubborn_runner_started, ^pid}
+    ref = Process.monitor(pid)
+
+    assert :ok = Worker.cancel(pid, task_id)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 3_000
     eventually(fn -> Worker.active() == :none end)
   end
 

@@ -28,5 +28,10 @@ defmodule SymphonyElixir.ReviewAttestation do
   defp canonical_value(value) when is_list(value), do: Enum.map(value, &canonical_value/1)
   defp canonical_value(value), do: value
 
-  defp value(map, key), do: Map.get(map, key, Map.get(map, String.to_existing_atom(key)))
+  defp value(map, key), do: Map.get(map, key, Map.get(map, atom_key(key)))
+
+  defp atom_key("id"), do: :id
+  defp atom_key("text"), do: :text
+  defp atom_key("completed"), do: :completed
+  defp atom_key("evidence"), do: :evidence
 end

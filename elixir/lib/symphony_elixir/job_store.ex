@@ -141,12 +141,25 @@ defmodule SymphonyElixir.JobStore do
     Enum.all?(~w(job task_id run_id single_flight_key started_at source_fingerprint), &nonempty_string?(record[&1])) and
       is_list(record["call_ids"]) and record["call_ids"] != [] and
       Enum.all?(record["call_ids"], &nonempty_string?/1) and
+      valid_deliveries?(record) and
       record["job_id"] == Path.basename(directory) and
       record["stdout_path"] == Path.join(directory, @stdout_name) and
       record["stderr_artifact"] == Path.join(directory, @stderr_name)
   end
 
   defp nonempty_string?(value), do: is_binary(value) and value != ""
+
+  defp valid_deliveries?(%{"deliveries" => deliveries}) do
+    is_list(deliveries) and deliveries != [] and Enum.all?(deliveries, &valid_delivery?/1)
+  end
+
+  defp valid_deliveries?(_legacy_record), do: true
+
+  defp valid_delivery?(%{"run_id" => run_id, "call_id" => call_id} = delivery) do
+    map_size(delivery) == 2 and nonempty_string?(run_id) and nonempty_string?(call_id)
+  end
+
+  defp valid_delivery?(_delivery), do: false
 
   defp record_path(root, job_id), do: Path.join([root, job_id, @record_name])
 

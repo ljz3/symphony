@@ -753,7 +753,7 @@ defmodule SymphonyElixir.DeterministicMerge do
 
     alias SymphonyElixir.GitHub
     alias SymphonyElixir.GitHub.Client
-    alias SymphonyElixir.{SSH, Worktree}
+    alias SymphonyElixir.{ManagedCommand, SSH, Worktree}
 
     @spec call(atom(), SymphonyElixir.Task.t(), map()) :: term()
     def call(:ensure_worktree, task, context) do
@@ -961,32 +961,15 @@ defmodule SymphonyElixir.DeterministicMerge do
       command = context.readiness_command
       env = readiness_env(task)
 
-      if context.worker_host do
-        script =
-          "cd #{shell_escape(context.worktree)} && env " <>
-            Enum.map_join(env, " ", fn {key, value} -> "#{key}=#{shell_escape(value)}" end) <>
-            " bash -lc #{shell_escape(command)}"
-
-        case SSH.run(context.worker_host, script) do
-          {:ok, {output, 0}} -> {:ok, output}
-          {:ok, {output, status}} -> {:error, {:readiness_failed, status, output}}
-          {:error, reason} -> {:error, {:transient, reason}}
-        end
-      else
-        run_local_readiness(command, context.worktree, env)
-      end
-    end
-
-    defp run_local_readiness(command, worktree, env) do
-      case System.find_executable("bash") do
-        nil ->
-          {:error, {:invariant, :bash_not_found}}
-
-        bash ->
-          case System.cmd(bash, ["-lc", command], cd: worktree, env: env, stderr_to_stdout: true) do
-            {output, 0} -> {:ok, output}
-            {output, status} -> {:error, {:readiness_failed, status, output}}
-          end
+      case ManagedCommand.run(command, context.worktree, env, context.worker_host,
+             cancellation_message: {:cancel_deterministic_merge, task.id},
+             cancellation_reason: :merge_readiness_cancelled
+           ) do
+        {:ok, {output, 0}} -> {:ok, output}
+        {:ok, {output, status}} -> {:error, {:readiness_failed, status, output}}
+        {:error, :bash_not_found} -> {:error, {:invariant, :bash_not_found}}
+        {:error, reason} when is_binary(context.worker_host) -> {:error, {:transient, reason}}
+        {:error, reason} -> {:error, {:readiness_transport_failed, inspect(reason)}}
       end
     rescue
       error -> {:error, {:readiness_transport_failed, Exception.message(error)}}

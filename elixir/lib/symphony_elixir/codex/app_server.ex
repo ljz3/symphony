@@ -112,10 +112,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port,
           metadata: metadata,
           approval_policy: approval_policy,
-          auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           effort: effort,
-          model: model,
           thread_id: thread_id,
           workspace: workspace
         } = session,
@@ -135,66 +133,60 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case start_turn(port, thread_id, prompt, task, workspace, approval_policy, turn_sandbox_policy, effort) do
       {:ok, turn_id} ->
-        session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{task_context(task)} session_id=#{session_id} model=#{model_for_log(model)} effort=#{effort_for_log(effort)}")
-
-        emit_message(
-          on_message,
-          :session_started,
-          %{
-            session_id: session_id,
-            thread_id: thread_id,
-            turn_id: turn_id,
-            effort: effort,
-            model: model
-          },
-          metadata
-        )
-
-        case await_turn_with_reconnect(
-               session,
-               thread_id,
-               turn_id,
-               on_message,
-               tool_executor,
-               auto_approve_requests,
-               on_session_reconnected
-             ) do
-          {:ok, result, active_session} ->
-            Logger.info("Codex session completed for #{task_context(task)} session_id=#{session_id}")
-
-            {:ok,
-             %{
-               result: result,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id,
-               effort: effort,
-               model: model,
-               session: active_session
-             }}
-
-          {:error, reason, active_session} ->
-            if active_session.port != session.port, do: stop_session(active_session)
-
-            Logger.warning("Codex session ended with error for #{task_context(task)} session_id=#{session_id}: #{inspect(reason)}")
-
-            emit_message(
-              on_message,
-              :turn_ended_with_error,
-              %{
-                session_id: session_id,
-                reason: reason
-              },
-              metadata
-            )
-
-            {:error, reason}
-        end
+        finish_started_turn(session, turn_id, task, on_message, tool_executor, on_session_reconnected)
 
       {:error, reason} ->
         Logger.error("Codex session failed for #{task_context(task)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+        {:error, reason}
+    end
+  end
+
+  defp finish_started_turn(session, turn_id, task, on_message, tool_executor, on_session_reconnected) do
+    %{thread_id: thread_id, effort: effort, model: model, metadata: metadata} = session
+    session_id = "#{thread_id}-#{turn_id}"
+
+    Logger.info(
+      "Codex session started for #{task_context(task)} session_id=#{session_id} " <>
+        "model=#{model_for_log(model)} effort=#{effort_for_log(effort)}"
+    )
+
+    emit_message(
+      on_message,
+      :session_started,
+      %{session_id: session_id, thread_id: thread_id, turn_id: turn_id, effort: effort, model: model},
+      metadata
+    )
+
+    case await_turn_with_reconnect(
+           session,
+           thread_id,
+           turn_id,
+           on_message,
+           tool_executor,
+           session.auto_approve_requests,
+           on_session_reconnected
+         ) do
+      {:ok, result, active_session} ->
+        Logger.info("Codex session completed for #{task_context(task)} session_id=#{session_id}")
+
+        {:ok,
+         %{
+           result: result,
+           session_id: session_id,
+           thread_id: thread_id,
+           turn_id: turn_id,
+           effort: effort,
+           model: model,
+           session: active_session
+         }}
+
+      {:error, reason, active_session} ->
+        if active_session.port != session.port, do: stop_session(active_session)
+
+        Logger.warning("Codex session ended with error for #{task_context(task)} session_id=#{session_id}: #{inspect(reason)}")
+
+        emit_message(on_message, :turn_ended_with_error, %{session_id: session_id, reason: reason}, metadata)
         {:error, reason}
     end
   end
@@ -604,31 +596,69 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_session_reconnected
        ) do
     if reconnectable_transport_error?(reason) do
-      case resume_session(session) do
-        {:ok, resumed_session, thread} ->
-          case notify_session_reconnected(on_session_reconnected, resumed_session) do
-            :ok ->
-              continue_resumed_turn(
-                resumed_session,
-                thread,
-                thread_id,
-                turn_id,
-                on_message,
-                tool_executor,
-                auto_approve_requests,
-                on_session_reconnected
-              )
-
-            {:error, callback_reason} ->
-              stop_session(resumed_session)
-              {:error, {:app_server_reconnect_callback_failed, callback_reason}, session}
-          end
-
-        {:error, reconnect_reason} ->
-          {:error, {:app_server_reconnect_failed, reason, reconnect_reason}, session}
-      end
+      resume_reconnect(
+        session,
+        thread_id,
+        turn_id,
+        reason,
+        on_message,
+        tool_executor,
+        auto_approve_requests,
+        on_session_reconnected
+      )
     else
       {:error, reason, session}
+    end
+  end
+
+  defp resume_reconnect(
+         session,
+         thread_id,
+         turn_id,
+         reason,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         on_session_reconnected
+       ) do
+    case resume_session(session) do
+      {:ok, resumed_session, thread} ->
+        finish_reconnect(
+          session,
+          resumed_session,
+          thread,
+          %{
+            thread_id: thread_id,
+            turn_id: turn_id,
+            on_message: on_message,
+            tool_executor: tool_executor,
+            auto_approve_requests: auto_approve_requests,
+            on_session_reconnected: on_session_reconnected
+          }
+        )
+
+      {:error, reconnect_reason} ->
+        {:error, {:app_server_reconnect_failed, reason, reconnect_reason}, session}
+    end
+  end
+
+  defp finish_reconnect(original_session, resumed_session, thread, continuation) do
+    case notify_session_reconnected(continuation.on_session_reconnected, resumed_session) do
+      :ok ->
+        continue_resumed_turn(
+          resumed_session,
+          thread,
+          continuation.thread_id,
+          continuation.turn_id,
+          continuation.on_message,
+          continuation.tool_executor,
+          continuation.auto_approve_requests,
+          continuation.on_session_reconnected
+        )
+
+      {:error, callback_reason} ->
+        stop_session(resumed_session)
+        {:error, {:app_server_reconnect_callback_failed, callback_reason}, original_session}
     end
   end
 
@@ -1589,10 +1619,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp deliver_message(port, message) do
-    case send_message(port, message) do
-      true -> :ok
-      false -> {:error, :port_closed}
-    end
+    send_message(port, message)
+    :ok
   rescue
     ArgumentError -> {:error, :port_closed}
   end

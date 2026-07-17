@@ -25,9 +25,9 @@ defmodule SymphonyElixir.MergeConflictResolution do
 
     with {:ok, conflict} <- current_conflict(task),
          :ok <- current_conflict_run(task, run),
-         :ok <- canonical_recorded_heads(task, conflict),
          {:ok, source} <- source_snapshotter.(task, worktree, conflict, opts),
          :ok <- valid_source_snapshot(source, conflict),
+         :ok <- canonical_resolution_heads(task, conflict, source),
          source_fingerprint when is_binary(source_fingerprint) <-
            source_fingerprinter.(worktree, worker_host),
          {:ok, frozen_jobs} <- frozen_jobs(run),
@@ -181,9 +181,11 @@ defmodule SymphonyElixir.MergeConflictResolution do
        else: {:error, :merge_conflict_run_not_current}
   end
 
-  defp canonical_recorded_heads(task, conflict) do
-    if task.source["head_sha"] == conflict["task_head"] and
-         task.github["head_sha"] == conflict["task_head"],
+  defp canonical_resolution_heads(task, conflict, source) do
+    allowed_heads = [conflict["task_head"], source["final_head_sha"]]
+
+    if task.source["head_sha"] in allowed_heads and task.source["clean"] == true and
+         task.github["head_sha"] in allowed_heads,
        do: :ok,
        else: {:error, :merge_conflict_stale}
   end
