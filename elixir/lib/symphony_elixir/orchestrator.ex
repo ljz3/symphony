@@ -185,7 +185,7 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info(:scheduled_reconcile, state) do
     schedule_periodic_reconcile(state, @reconcile_interval_ms)
-    {:noreply, state |> clear_pending_immediate_reconcile() |> reconcile()}
+    {:noreply, request_immediate_reconcile(state)}
   end
 
   def handle_info(:reconcile, state),
