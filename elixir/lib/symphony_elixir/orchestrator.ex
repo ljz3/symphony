@@ -40,8 +40,12 @@ defmodule SymphonyElixir.Orchestrator do
               merge_refs: %{},
               merge_retry_after: %{},
               merge_retry_ms: 1_000,
-              monotonic_clock: &System.monotonic_time/1,
-              reconcile_scheduler: nil,
+              pending_immediate_reconcile: nil,
+              runtime_hooks: %{
+                monotonic_clock: &System.monotonic_time/1,
+                reconcile_observer: nil,
+                reconcile_scheduler: nil
+              },
               preflights: %{},
               preflight_refs: %{},
               preflight_failures: %{},
@@ -101,7 +105,7 @@ defmodule SymphonyElixir.Orchestrator do
   @spec refresh(pid() | atom()) :: :ok
   def refresh(server) when is_pid(server) or is_atom(server) do
     case resolve_server(server) do
-      pid when is_pid(pid) -> send(pid, :reconcile)
+      pid when is_pid(pid) -> send(pid, :request_reconcile)
       _ -> :ok
     end
 
@@ -125,8 +129,11 @@ defmodule SymphonyElixir.Orchestrator do
       agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
       merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3),
       merge_retry_ms: Keyword.get(opts, :merge_retry_ms, @reconcile_interval_ms),
-      monotonic_clock: Keyword.get(opts, :monotonic_clock, &System.monotonic_time/1),
-      reconcile_scheduler: Keyword.get(opts, :reconcile_scheduler),
+      runtime_hooks: %{
+        monotonic_clock: Keyword.get(opts, :monotonic_clock, &System.monotonic_time/1),
+        reconcile_observer: Keyword.get(opts, :reconcile_observer),
+        reconcile_scheduler: Keyword.get(opts, :reconcile_scheduler)
+      },
       rework_drafter: Keyword.get(opts, :rework_drafter),
       github_outcome_recorder: Keyword.get(opts, :github_outcome_recorder)
     }
@@ -178,10 +185,23 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info(:scheduled_reconcile, state) do
     schedule_periodic_reconcile(state, @reconcile_interval_ms)
-    {:noreply, reconcile(state)}
+    {:noreply, state |> clear_pending_immediate_reconcile() |> reconcile()}
   end
 
-  def handle_info(:reconcile, state), do: {:noreply, reconcile(state)}
+  def handle_info(:reconcile, state),
+    do: {:noreply, state |> clear_pending_immediate_reconcile() |> reconcile()}
+
+  def handle_info(:request_reconcile, state),
+    do: {:noreply, request_immediate_reconcile(state)}
+
+  def handle_info(
+        {:run_immediate_reconcile, token},
+        %{pending_immediate_reconcile: token} = state
+      ) do
+    {:noreply, state |> clear_pending_immediate_reconcile() |> reconcile()}
+  end
+
+  def handle_info({:run_immediate_reconcile, _stale_token}, state), do: {:noreply, state}
 
   def handle_info({:task_changed, task_id}, state) do
     previous = state
@@ -194,8 +214,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> maybe_terminal_cleanup(task_id)
       |> broadcast_preflight_change(previous)
 
-    send(self(), :reconcile)
-    {:noreply, state}
+    {:noreply, request_immediate_reconcile(state)}
   end
 
   def handle_info({:workflow_activated, _hash}, state) do
@@ -211,8 +230,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> broadcast_preflight_change(previous)
       |> reconcile_worker_health_if_dispatching(bundle)
 
-    send(self(), :reconcile)
-    {:noreply, state}
+    {:noreply, request_immediate_reconcile(state)}
   end
 
   def handle_info({:github_wait, _task_id, _run_id, reason, _backoff_ms}, state) do
@@ -297,8 +315,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> finish_worker_health_probe(host, probe_id, result)
           |> broadcast_worker_health_change(previous)
 
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -315,8 +332,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> finish_worker_health_probe(host, probe_id, {:error, {:worker_health_process_exit, reason}})
           |> broadcast_worker_health_change(previous)
 
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -372,6 +388,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile(state) do
+    observe_reconciliation(state)
+
     state
     |> recover_orphan_runs()
     |> reconcile_desired_stops()
@@ -379,6 +397,23 @@ defmodule SymphonyElixir.Orchestrator do
     |> dispatch_candidates()
     |> Map.put(:last_reconciled_at, timestamp())
   end
+
+  defp observe_reconciliation(%{runtime_hooks: %{reconcile_observer: observer}})
+       when is_function(observer, 0),
+       do: observer.()
+
+  defp observe_reconciliation(_state), do: :ok
+
+  defp request_immediate_reconcile(%{pending_immediate_reconcile: nil} = state) do
+    token = make_ref()
+    send(self(), {:run_immediate_reconcile, token})
+    %{state | pending_immediate_reconcile: token}
+  end
+
+  defp request_immediate_reconcile(state), do: state
+
+  defp clear_pending_immediate_reconcile(state),
+    do: %{state | pending_immediate_reconcile: nil}
 
   defp handle_runner_result(ref, result, state) do
     case Map.pop(state.refs, ref) do
@@ -391,8 +426,7 @@ defmodule SymphonyElixir.Orchestrator do
         cancel_stop_timers(runtime)
         state = %{state | refs: refs, running: running}
         state = finalize_runner_result(task_id, runtime.run_id, result, state)
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -411,8 +445,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> finish_preflight(preflight, result)
           |> broadcast_preflight_change(previous)
 
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -426,8 +459,7 @@ defmodule SymphonyElixir.Orchestrator do
         cancel_stop_timers(runtime)
         state = %{state | refs: refs, running: running}
         state = finalize_runner_result(task_id, runtime.run_id, {:error, {:runner_exit, reason}}, state)
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -444,8 +476,7 @@ defmodule SymphonyElixir.Orchestrator do
           %{state | merge_refs: merge_refs, merging: merging}
           |> maybe_schedule_merge_retry(task_id, runtime)
 
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -463,8 +494,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> finish_preflight(preflight, {:error, nil, {:preflight_process_exit, reason}})
           |> broadcast_preflight_change(previous)
 
-        send(self(), :reconcile)
-        {:noreply, state}
+        {:noreply, request_immediate_reconcile(state)}
     end
   end
 
@@ -820,7 +850,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp monotonic_time(state, unit), do: state.monotonic_clock.(unit)
+  defp monotonic_time(state, unit), do: state.runtime_hooks.monotonic_clock.(unit)
 
   defp clear_stale_merge_retry(state, task_id, bundle) do
     case {state.merge_retry_after[task_id], Board.task(task_id)} do
@@ -1900,7 +1930,11 @@ defmodule SymphonyElixir.Orchestrator do
     :exit, _reason -> %{mutable: false, projection_error: :writer_unavailable}
   end
 
-  defp schedule_periodic_reconcile(%{reconcile_scheduler: scheduler}, delay) when is_function(scheduler, 2) do
+  defp schedule_periodic_reconcile(
+         %{runtime_hooks: %{reconcile_scheduler: scheduler}},
+         delay
+       )
+       when is_function(scheduler, 2) do
     scheduler.(self(), delay)
   end
 

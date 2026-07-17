@@ -661,8 +661,11 @@ defmodule SymphonyElixir.OrchestratorTest do
         task_filter: &(&1.id == task.id),
         merge_runner: merge_runner,
         github_health: %{available: true, authenticated: true, error: nil},
-        github_health_checked_at: System.monotonic_time(:millisecond),
-        monotonic_clock: fn :millisecond -> :atomics.get(clock, 1) end
+        github_health_checked_at: System.monotonic_time(:millisecond)
+      )
+      |> put_in(
+        [Access.key(:runtime_hooks), :monotonic_clock],
+        fn :millisecond -> :atomics.get(clock, 1) end
       )
       |> Map.put(:merge_retry_ms, 250)
       |> Map.put(:merge_retry_after, %{})
@@ -797,18 +800,29 @@ defmodule SymphonyElixir.OrchestratorTest do
       send(parent, {:burst_full_reconcile, count})
     end
 
+    opts = [
+      name: name,
+      dispatch_enabled: false,
+      recover_orphans: false,
+      task_filter: fn _task -> false end,
+      reconcile_scheduler: scheduler,
+      reconcile_observer: observer
+    ]
+
     orchestrator =
       start_supervised!(
-        {Orchestrator, name: name, dispatch_enabled: false, recover_orphans: false, task_filter: fn _task -> false end, reconcile_scheduler: scheduler, reconcile_observer: observer},
+        {Orchestrator, opts},
         id: name
       )
 
     assert_receive {:burst_periodic_reconcile_scheduled, ^orchestrator, 0}
+    assert :ok = :sys.suspend(orchestrator)
 
     Enum.each(1..30_000, fn _iteration ->
       assert :ok = Orchestrator.refresh(orchestrator)
     end)
 
+    assert :ok = :sys.resume(orchestrator)
     assert %{online: true} = GenServer.call(orchestrator, :status)
     assert_receive {:burst_full_reconcile, 1}, 5_000
     assert %{online: true} = GenServer.call(orchestrator, :status)

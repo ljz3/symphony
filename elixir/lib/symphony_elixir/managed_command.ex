@@ -132,10 +132,10 @@ defmodule SymphonyElixir.ManagedCommand do
 
     def handle_info(
           {port, {:exit_status, 255}},
-          %{port: port, cancel_reason: nil, pgid: nil, worker_host: worker_host} = state
+          %{port: port, cancel_reason: nil, worker_host: worker_host} = state
         )
         when is_binary(worker_host) do
-      finish(state, {:error, {:ssh_transport_failed, 255, state.control_buffer}})
+      finish(state, {:error, {:ssh_transport_failed, 255, transport_diagnostic(state)}})
     end
 
     def handle_info({port, {:exit_status, status}}, %{port: port, cancel_reason: nil} = state) do
@@ -380,6 +380,9 @@ defmodule SymphonyElixir.ManagedCommand do
       |> Enum.reverse()
       |> IO.iodata_to_binary()
     end
+
+    defp transport_diagnostic(%{pgid: nil} = state), do: state.control_buffer
+    defp transport_diagnostic(state), do: command_output(state)
 
     defp finish(state, result) do
       cancel_timer(state.escalation_timer)
