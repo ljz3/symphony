@@ -681,11 +681,13 @@ defmodule SymphonyElixir.JobManagerTest do
   test "a cancelled terminal cannot erase its active replacement single-flight", %{workspace: workspace} do
     starts = Path.join(workspace, "replacement-race-starts")
     release = Path.join(workspace, "replacement-race-release")
+    suffix = Ecto.UUID.generate()
+    cancelling_run_id = "race-cancelling-run-#{suffix}"
 
     write_script!(workspace, "replacement-race.sh", """
     #!/bin/sh
     printf '%s\n' "$SYMPHONY_RUN_ID" >> "$1"
-    if [ "$SYMPHONY_RUN_ID" = "race-cancelling-run" ]; then
+    if [ "$SYMPHONY_RUN_ID" = "$3" ]; then
       trap '' TERM
       while :; do sleep 1; done
     fi
@@ -696,13 +698,18 @@ defmodule SymphonyElixir.JobManagerTest do
     first =
       request(workspace,
         executable: "./replacement-race.sh",
-        passthrough: [starts, release],
-        run_id: "race-cancelling-run",
-        call_id: "race-cancelling-call"
+        passthrough: [starts, release, cancelling_run_id],
+        run_id: cancelling_run_id,
+        call_id: "race-cancelling-call-#{suffix}"
       )
 
-    replacement = %{first | run_id: "race-replacement-run", call_id: "race-replacement-call"}
-    third = %{first | run_id: "race-third-run", call_id: "race-third-call"}
+    replacement = %{
+      first
+      | run_id: "race-replacement-run-#{suffix}",
+        call_id: "race-replacement-call-#{suffix}"
+    }
+
+    third = %{first | run_id: "race-third-run-#{suffix}", call_id: "race-third-call-#{suffix}"}
 
     first_task = Task.async(fn -> JobManager.run(first) end)
     eventually(fn -> start_count(starts) == 1 end)
@@ -715,7 +722,14 @@ defmodule SymphonyElixir.JobManagerTest do
     assert cancelled["status"] == "cancelled"
 
     third_task = Task.async(fn -> JobManager.run(third) end)
-    Process.sleep(100)
+
+    eventually(fn ->
+      case {JobManager.active_for_run(replacement.run_id), JobManager.active_for_run(third.run_id)} do
+        {%{"job_id" => job_id}, %{"job_id" => job_id}} -> true
+        _active_jobs -> false
+      end
+    end)
+
     File.touch!(release)
 
     assert {:ok, {:ok, replacement_result}} = Task.yield(replacement_task, 5_000)

@@ -656,7 +656,7 @@ defmodule SymphonyElixir.JobManager do
     %{
       state
       | records: Map.put(state.records, job_id, record),
-        active_single_flight: Map.delete(state.active_single_flight, record["single_flight_key"]),
+        active_single_flight: delete_single_flight(state.active_single_flight, record["single_flight_key"], job_id),
         workers: Map.delete(state.workers, job_id),
         monitors: Map.drop(state.monitors, monitor_refs),
         waiters: Map.delete(state.waiters, job_id)

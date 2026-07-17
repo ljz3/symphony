@@ -583,6 +583,7 @@ defmodule SymphonyElixir.OrchestratorTest do
              )
 
     assert moved["column_id"] == "automated_review"
+    assert MergeWorker.semantic_guard(Task.from_map(moved), Config.bundle!()) != readiness.guard
     assert {:noreply, state} = Orchestrator.handle_info(:reconcile, inherited_merge_state(task.id))
     assert state.merging[task.id].cancelling
     assert_receive {:DOWN, ^readiness_ref, :process, ^readiness_pid, _reason}, 4_000
@@ -601,6 +602,7 @@ defmodule SymphonyElixir.OrchestratorTest do
 
     on_exit(fn -> cleanup_inherited_readiness(readiness) end)
 
+    assert MergeWorker.semantic_guard(task, Config.bundle!()) != readiness.guard
     assert {:noreply, state} = Orchestrator.handle_info(:reconcile, inherited_merge_state(task.id))
     assert state.merging[task.id].cancelling
     assert_receive {:DOWN, ^readiness_ref, :process, ^readiness_pid, _reason}, 4_000
@@ -631,6 +633,7 @@ defmodule SymphonyElixir.OrchestratorTest do
              )
 
     assert checkpointed["merge_saga"]["checkpoint"] == "clean_update_started"
+    assert MergeWorker.semantic_guard(Task.from_map(checkpointed), Config.bundle!()) == readiness.guard
     assert {:noreply, state} = Orchestrator.handle_info(:reconcile, inherited_merge_state(task.id))
     refute state.merging[task.id].cancelling
     assert state.merging[task.id].pid == readiness.pid
@@ -642,6 +645,8 @@ defmodule SymphonyElixir.OrchestratorTest do
     task = canonical_merge_task()
     parent = self()
     attempts = :atomics.new(1, [])
+    clock = :atomics.new(1, [])
+    :atomics.put(clock, 1, 10_000)
 
     merge_runner = fn merge_task, _bundle, _opts ->
       attempt = :atomics.add_get(attempts, 1, 1)
@@ -656,7 +661,8 @@ defmodule SymphonyElixir.OrchestratorTest do
         task_filter: &(&1.id == task.id),
         merge_runner: merge_runner,
         github_health: %{available: true, authenticated: true, error: nil},
-        github_health_checked_at: System.monotonic_time(:millisecond)
+        github_health_checked_at: System.monotonic_time(:millisecond),
+        monotonic_clock: fn :millisecond -> :atomics.get(clock, 1) end
       )
       |> Map.put(:merge_retry_ms, 250)
       |> Map.put(:merge_retry_after, %{})
@@ -679,12 +685,74 @@ defmodule SymphonyElixir.OrchestratorTest do
         next
       end)
 
-    refute_receive {:merge_retry_attempt, 2, ^task_id, _pid}, 100
+    refute_receive {:merge_retry_attempt, 2, ^task_id, _pid}
     assert :atomics.get(attempts, 1) == 1
 
-    Process.sleep(275)
+    :atomics.put(clock, 1, 10_250)
     assert {:noreply, _retried_state} = Orchestrator.handle_info(:reconcile, waiting_state)
     assert_receive {:merge_retry_attempt, 2, ^task_id, _pid}, 2_000
+  end
+
+  test "immediate reconciliation triggers do not create periodic timer chains" do
+    parent = self()
+
+    scheduler = fn recipient, delay ->
+      send(parent, {:periodic_reconcile_scheduled, recipient, delay})
+      make_ref()
+    end
+
+    assert {:ok, state} =
+             Orchestrator.init(
+               dispatch_enabled: false,
+               recover_orphans: false,
+               task_filter: fn _task -> false end,
+               reconcile_scheduler: scheduler
+             )
+
+    assert_receive {:periodic_reconcile_scheduled, recipient, 0}
+    assert recipient == self()
+
+    state = %{
+      state
+      | github_health: %{available: true, authenticated: true, error: nil},
+        github_health_checked_at: System.monotonic_time(:millisecond)
+    }
+
+    assert {:noreply, state} = Orchestrator.handle_info(:scheduled_reconcile, state)
+    assert_receive {:periodic_reconcile_scheduled, recipient, 1_000}
+    assert recipient == self()
+    refute_receive {:periodic_reconcile_scheduled, _recipient, _delay}
+
+    state =
+      Enum.reduce(1..3, state, fn _iteration, current ->
+        assert :ok = Orchestrator.refresh(self())
+        assert_receive :reconcile
+        assert {:noreply, next} = Orchestrator.handle_info(:reconcile, current)
+        next
+      end)
+
+    state =
+      Enum.reduce(1..3, state, fn iteration, current ->
+        assert {:noreply, next} =
+                 Orchestrator.handle_info({:task_changed, "missing-reconcile-task-#{iteration}"}, current)
+
+        assert_receive :reconcile
+        assert {:noreply, reconciled} = Orchestrator.handle_info(:reconcile, next)
+        reconciled
+      end)
+
+    state =
+      Enum.reduce(1..3, state, fn iteration, current ->
+        assert {:noreply, next} =
+                 Orchestrator.handle_info({:workflow_activated, "new-workflow-hash-#{iteration}"}, current)
+
+        assert_receive :reconcile
+        assert {:noreply, reconciled} = Orchestrator.handle_info(:reconcile, next)
+        reconciled
+      end)
+
+    assert %State{} = state
+    refute_receive {:periodic_reconcile_scheduled, _recipient, _delay}
   end
 
   test "merge worker identity survives an Orchestrator-only restart and prevents duplicate effects" do
@@ -740,7 +808,7 @@ defmodule SymphonyElixir.OrchestratorTest do
       end
 
       case MergeWorker.active() do
-        {:ok, _task_id, pid} ->
+        {:ok, _task_id, pid, _guard} ->
           ref = Process.monitor(pid)
           send(pid, {:release_merge_effect, 1})
           send(pid, {:release_merge_effect, 2})
@@ -768,7 +836,7 @@ defmodule SymphonyElixir.OrchestratorTest do
           )
       end
 
-    assert {:ok, ^selected_task_id, ^worker} = MergeWorker.active()
+    assert {:ok, ^selected_task_id, ^worker, original_guard} = MergeWorker.active()
 
     send(first_orchestrator, :reconcile)
     send(first_orchestrator, :reconcile)
@@ -777,7 +845,7 @@ defmodule SymphonyElixir.OrchestratorTest do
 
     GenServer.stop(first_orchestrator, :normal)
     assert Process.alive?(worker)
-    assert {:ok, ^selected_task_id, ^worker} = MergeWorker.active()
+    assert {:ok, ^selected_task_id, ^worker, ^original_guard} = MergeWorker.active()
 
     {:ok, restarted_orchestrator} = Orchestrator.start_link(opts)
     enable_dispatch(restarted_orchestrator)
@@ -785,7 +853,10 @@ defmodule SymphonyElixir.OrchestratorTest do
     send(restarted_orchestrator, :reconcile)
 
     eventually(fn ->
-      match?(%{pid: ^worker}, :sys.get_state(restarted_orchestrator).merging[selected_task_id])
+      match?(
+        %{pid: ^worker, guard: ^original_guard, cancelling: false},
+        :sys.get_state(restarted_orchestrator).merging[selected_task_id]
+      )
     end)
 
     refute_receive {:merge_effect_invoked, 2, ^selected_task_id, _pid}, 200
@@ -802,7 +873,7 @@ defmodule SymphonyElixir.OrchestratorTest do
 
     enable_dispatch(restarted_orchestrator)
     assert_receive {:merge_effect_invoked, 2, ^selected_task_id, retry_worker}, 2_000
-    assert {:ok, ^selected_task_id, ^retry_worker} = MergeWorker.active()
+    assert {:ok, ^selected_task_id, ^retry_worker, _retry_guard} = MergeWorker.active()
     assert retry_worker != worker
 
     disable_dispatch(restarted_orchestrator)
@@ -835,7 +906,7 @@ defmodule SymphonyElixir.OrchestratorTest do
       })
     end
 
-    assert {:ok, task_id, pid} = MergeWorker.ensure_started(task, bundle, runner)
+    assert {:ok, task_id, pid, guard} = MergeWorker.ensure_started(task, bundle, runner)
     assert task_id == task.id
     ref = Process.monitor(pid)
     eventually(fn -> File.exists?(parent_path) and File.exists?(child_path) end)
@@ -844,6 +915,7 @@ defmodule SymphonyElixir.OrchestratorTest do
       task_id: task.id,
       pid: pid,
       ref: ref,
+      guard: guard,
       parent_pid: parent_path |> File.read!() |> String.trim() |> String.to_integer(),
       child_pid: child_path |> File.read!() |> String.trim() |> String.to_integer()
     }

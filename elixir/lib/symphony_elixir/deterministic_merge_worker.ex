@@ -10,6 +10,7 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
   use GenServer
   require Logger
 
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.Bundle
 
@@ -19,15 +20,35 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
   @cancel_escalation_ms 2_000
 
   @type runner :: (Task.t(), Bundle.t(), keyword() -> term())
-  @type active_worker :: {:ok, String.t(), pid()} | :none
+  @type semantic_guard :: String.t()
+  @type active_worker :: {:ok, String.t(), pid(), semantic_guard() | nil} | :none
 
   @doc "Returns the single active merge worker, if one exists."
   @spec active() :: active_worker()
   def active do
     case Registry.lookup(@registry, @slot) do
-      [{pid, task_id}] -> {:ok, task_id, pid}
+      [{pid, {task_id, guard}}] -> {:ok, task_id, pid, guard}
+      [{pid, task_id}] -> {:ok, task_id, pid, nil}
       [] -> :none
     end
+  end
+
+  @doc "Hashes the immutable task and workflow semantics owned by a merge worker."
+  @spec semantic_guard(Task.t(), Bundle.t()) :: semantic_guard()
+  def semantic_guard(%Task{} = task, %Bundle{} = bundle) do
+    canonical = %{
+      workflow_hash: bundle.hash,
+      column_id: task.column_id,
+      source: Map.take(task.source, ~w(head_sha base_sha clean)),
+      github: Map.take(task.github, ~w(number head_sha state draft)),
+      acceptance: ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
+      review_attestation: task.review_attestation
+    }
+
+    canonical
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   @doc "Starts the merge worker or returns the worker that already owns the slot."
@@ -43,10 +64,11 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
   def ensure_started(%Task{} = task, %Bundle{} = bundle, runner, opts)
       when is_function(runner, 3) and is_list(opts) do
     supervisor = Keyword.get(opts, :supervisor, @supervisor)
-    worker_opts = [task: task, bundle: bundle, runner: runner]
+    guard = semantic_guard(task, bundle)
+    worker_opts = [task: task, bundle: bundle, runner: runner, semantic_guard: guard]
 
     case DynamicSupervisor.start_child(supervisor, {__MODULE__, worker_opts}) do
-      {:ok, pid} -> {:ok, task.id, pid}
+      {:ok, pid} -> {:ok, task.id, pid, guard}
       {:error, {:already_started, _pid}} -> active()
       {:error, reason} -> {:error, reason}
     end
@@ -65,7 +87,8 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     task = Keyword.fetch!(opts, :task)
-    name = {:via, Registry, {@registry, @slot, task.id}}
+    guard = Keyword.fetch!(opts, :semantic_guard)
+    name = {:via, Registry, {@registry, @slot, {task.id, guard}}}
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
@@ -84,7 +107,8 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
     state = %{
       task: Keyword.fetch!(opts, :task),
       bundle: Keyword.fetch!(opts, :bundle),
-      runner: Keyword.fetch!(opts, :runner)
+      runner: Keyword.fetch!(opts, :runner),
+      semantic_guard: Keyword.fetch!(opts, :semantic_guard)
     }
 
     {:ok, state, {:continue, :run}}

@@ -18,7 +18,6 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.DeterministicMerge.Worker, as: MergeWorker
   alias SymphonyElixir.GitHub
   alias SymphonyElixir.JobManager
-  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.SSH
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.{Bundle, Store}
@@ -41,6 +40,8 @@ defmodule SymphonyElixir.Orchestrator do
               merge_refs: %{},
               merge_retry_after: %{},
               merge_retry_ms: 1_000,
+              monotonic_clock: &System.monotonic_time/1,
+              reconcile_scheduler: nil,
               preflights: %{},
               preflight_refs: %{},
               preflight_failures: %{},
@@ -94,8 +95,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @spec refresh() :: :ok
-  def refresh do
-    case Process.whereis(__MODULE__) do
+  def refresh, do: refresh(__MODULE__)
+
+  @doc false
+  @spec refresh(pid() | atom()) :: :ok
+  def refresh(server) when is_pid(server) or is_atom(server) do
+    case resolve_server(server) do
       pid when is_pid(pid) -> send(pid, :reconcile)
       _ -> :ok
     end
@@ -103,25 +108,31 @@ defmodule SymphonyElixir.Orchestrator do
     :ok
   end
 
+  defp resolve_server(server) when is_pid(server), do: server
+  defp resolve_server(server) when is_atom(server), do: Process.whereis(server)
+
   @impl true
   def init(opts) do
     :ok = Board.subscribe(:tasks)
     :ok = Board.subscribe(:workflow)
     :ok = Board.subscribe(:health)
-    schedule_reconcile(0)
 
-    {:ok,
-     %State{
-       started_at: timestamp(),
-       dispatch_enabled: Keyword.get(opts, :dispatch_enabled),
-       recover_orphans: Keyword.get(opts, :recover_orphans, true),
-       task_filter: Keyword.get(opts, :task_filter),
-       agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
-       merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3),
-       merge_retry_ms: Keyword.get(opts, :merge_retry_ms, @reconcile_interval_ms),
-       rework_drafter: Keyword.get(opts, :rework_drafter),
-       github_outcome_recorder: Keyword.get(opts, :github_outcome_recorder)
-     }}
+    state = %State{
+      started_at: timestamp(),
+      dispatch_enabled: Keyword.get(opts, :dispatch_enabled),
+      recover_orphans: Keyword.get(opts, :recover_orphans, true),
+      task_filter: Keyword.get(opts, :task_filter),
+      agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
+      merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3),
+      merge_retry_ms: Keyword.get(opts, :merge_retry_ms, @reconcile_interval_ms),
+      monotonic_clock: Keyword.get(opts, :monotonic_clock, &System.monotonic_time/1),
+      reconcile_scheduler: Keyword.get(opts, :reconcile_scheduler),
+      rework_drafter: Keyword.get(opts, :rework_drafter),
+      github_outcome_recorder: Keyword.get(opts, :github_outcome_recorder)
+    }
+
+    schedule_periodic_reconcile(state, 0)
+    {:ok, state}
   end
 
   @impl true
@@ -165,19 +176,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def handle_info(:reconcile, state) do
-    schedule_reconcile(@reconcile_interval_ms)
-
-    state =
-      state
-      |> recover_orphan_runs()
-      |> reconcile_desired_stops()
-      |> reconcile_external_effects()
-      |> dispatch_candidates()
-      |> Map.put(:last_reconciled_at, timestamp())
-
-    {:noreply, state}
+  def handle_info(:scheduled_reconcile, state) do
+    schedule_periodic_reconcile(state, @reconcile_interval_ms)
+    {:noreply, reconcile(state)}
   end
+
+  def handle_info(:reconcile, state), do: {:noreply, reconcile(state)}
 
   def handle_info({:task_changed, task_id}, state) do
     previous = state
@@ -365,6 +369,15 @@ defmodule SymphonyElixir.Orchestrator do
          cleanup_running: cleanup_running,
          cleanup_completed: cleanup_completed
      }}
+  end
+
+  defp reconcile(state) do
+    state
+    |> recover_orphan_runs()
+    |> reconcile_desired_stops()
+    |> reconcile_external_effects()
+    |> dispatch_candidates()
+    |> Map.put(:last_reconciled_at, timestamp())
   end
 
   defp handle_runner_result(ref, result, state) do
@@ -639,15 +652,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_merge_candidates(state) do
     case MergeWorker.active() do
-      {:ok, task_id, pid} -> observe_existing_merge_worker(state, task_id, pid)
+      {:ok, task_id, pid, guard} -> observe_existing_merge_worker(state, task_id, pid, guard)
       :none -> do_dispatch_merge_candidate(state)
     end
   end
 
-  defp observe_existing_merge_worker(state, task_id, pid) do
+  defp observe_existing_merge_worker(state, task_id, pid, guard) do
+    bundle = Config.bundle!()
+    state = observe_merge_worker(state, task_id, pid, guard)
+
     case Board.task(task_id) do
-      {:ok, task} -> observe_merge_worker(state, task, pid, Config.bundle!())
-      {:error, :not_found} -> state
+      {:ok, task} ->
+        if merge_eligible?(task, bundle, state) and merge_guard(task, bundle) == guard,
+          do: state,
+          else: cancel_merge_worker(state, task_id, :inherited_worker_stale)
+
+      {:error, :not_found} ->
+        cancel_merge_worker(state, task_id, :task_missing)
     end
   end
 
@@ -674,10 +695,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp start_merge_worker(state, task, bundle) do
     case MergeWorker.ensure_started(task, bundle, state.merge_runner) do
-      {:ok, task_id, pid} ->
-        if task_id == task.id,
-          do: observe_merge_worker(state, task, pid, bundle),
-          else: observe_existing_merge_worker(state, task_id, pid)
+      {:ok, task_id, pid, guard} ->
+        observe_existing_merge_worker(state, task_id, pid, guard)
 
       :none ->
         state
@@ -688,22 +707,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp observe_merge_worker(state, task, pid, bundle) do
+  defp observe_merge_worker(state, task_id, pid, guard) do
     ref = Process.monitor(pid)
 
     runtime = %{
       pid: pid,
       ref: ref,
       started_at: timestamp(),
-      guard: merge_guard(task, bundle),
+      guard: guard,
       cancelling: false
     }
 
     %{
       state
-      | merging: Map.put(state.merging, task.id, runtime),
-        merge_refs: Map.put(state.merge_refs, ref, task.id),
-        merge_retry_after: Map.delete(state.merge_retry_after, task.id)
+      | merging: Map.put(state.merging, task_id, runtime),
+        merge_refs: Map.put(state.merge_refs, ref, task_id),
+        merge_retry_after: Map.delete(state.merge_retry_after, task_id)
     }
   end
 
@@ -773,7 +792,7 @@ defmodule SymphonyElixir.Orchestrator do
 
           retry = %{
             guard: runtime.guard,
-            retry_at_ms: System.monotonic_time(:millisecond) + delay,
+            retry_at_ms: monotonic_time(state, :millisecond) + delay,
             next_retry_at:
               now
               |> DateTime.add(delay, :millisecond)
@@ -797,9 +816,11 @@ defmodule SymphonyElixir.Orchestrator do
         true
 
       %{guard: guard, retry_at_ms: retry_at_ms} ->
-        guard != merge_guard(task, bundle) or System.monotonic_time(:millisecond) >= retry_at_ms
+        guard != merge_guard(task, bundle) or monotonic_time(state, :millisecond) >= retry_at_ms
     end
   end
+
+  defp monotonic_time(state, unit), do: state.monotonic_clock.(unit)
 
   defp clear_stale_merge_retry(state, task_id, bundle) do
     case {state.merge_retry_after[task_id], Board.task(task_id)} do
@@ -822,19 +843,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp merge_guard(task, bundle) do
-    canonical = %{
-      workflow_hash: bundle.hash,
-      column_id: task.column_id,
-      source: Map.take(task.source, ~w(head_sha base_sha clean)),
-      github: Map.take(task.github, ~w(number head_sha state draft)),
-      acceptance: ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
-      review_attestation: task.review_attestation
-    }
-
-    canonical
-    |> :erlang.term_to_binary([:deterministic])
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
+    MergeWorker.semantic_guard(task, bundle)
   end
 
   defp do_dispatch_candidates(state) do
@@ -1891,7 +1900,13 @@ defmodule SymphonyElixir.Orchestrator do
     :exit, _reason -> %{mutable: false, projection_error: :writer_unavailable}
   end
 
-  defp schedule_reconcile(delay), do: Process.send_after(self(), :reconcile, delay)
+  defp schedule_periodic_reconcile(%{reconcile_scheduler: scheduler}, delay) when is_function(scheduler, 2) do
+    scheduler.(self(), delay)
+  end
+
+  defp schedule_periodic_reconcile(_state, delay) do
+    Process.send_after(self(), :scheduled_reconcile, delay)
+  end
 
   defp schedule_telemetry_broadcast(state, run_id) do
     if MapSet.member?(state.telemetry_broadcasts, run_id) do

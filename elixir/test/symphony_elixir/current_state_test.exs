@@ -225,4 +225,18 @@ defmodule SymphonyElixir.CurrentStateTest do
     unavailable = %{task | dependencies: ["missing-dependency"], review_attestation: nil, merge_saga: nil}
     assert CurrentState.project(unavailable, run, %{}, preflights: [], job_manager: 123)["dependencies"] == []
   end
+
+  test "tolerates an unavailable Orchestrator without timing-dependent failure" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Unavailable Orchestrator")})
+    {:ok, %Task{} = task} = Board.task(created["id"])
+    run = %{"id" => "unavailable-orchestrator-run", "status" => "running"}
+
+    projection =
+      CurrentState.project(task, run, %{},
+        orchestrator_status: fn -> exit(:orchestrator_unavailable) end,
+        job_manager: :missing_current_state_jobs
+      )
+
+    refute Map.has_key?(projection, "preflight")
+  end
 end

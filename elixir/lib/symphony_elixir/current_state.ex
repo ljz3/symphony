@@ -141,7 +141,9 @@ defmodule SymphonyElixir.CurrentState do
 
   defp preflight_projection(task_id, opts) do
     opts
-    |> Keyword.get_lazy(:preflights, &current_preflights/0)
+    |> Keyword.get_lazy(:preflights, fn ->
+      current_preflights(Keyword.get(opts, :orchestrator_status, &Orchestrator.status/0))
+    end)
     |> Enum.find(&(value(&1, "task_id") == task_id))
     |> case do
       nil ->
@@ -156,8 +158,8 @@ defmodule SymphonyElixir.CurrentState do
     end
   end
 
-  defp current_preflights do
-    Orchestrator.status()[:preflights] || []
+  defp current_preflights(status_provider) do
+    status_provider.()[:preflights] || []
   catch
     :exit, _reason -> []
   end
