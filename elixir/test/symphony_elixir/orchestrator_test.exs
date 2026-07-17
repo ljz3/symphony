@@ -736,8 +736,8 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert {:noreply, state} = Orchestrator.handle_info(:scheduled_reconcile, state)
     assert_receive {:periodic_reconcile_scheduled, recipient, 1_000}
     assert recipient == self()
-    assert state.pending_immediate_reconcile == nil
-    assert :atomics.get(reconciliations, 1) == 1
+    assert state.pending_immediate_reconcile == token
+    assert :atomics.get(reconciliations, 1) == 0
 
     assert_receive {:run_immediate_reconcile, ^token}
 
@@ -784,49 +784,12 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert :atomics.get(reconciliations, 1) == 3
   end
 
-  @tag timeout: 15_000
-  test "thirty thousand public refreshes preserve status responsiveness and run one full reconcile" do
-    parent = self()
-    reconciliations = :atomics.new(1, [])
-    name = String.to_atom("orchestrator_refresh_burst_#{System.unique_integer([:positive])}")
+  test "periodic tick before thirty thousand refreshes shares one eventual reconciliation" do
+    assert_periodic_refresh_burst_coalesces(:periodic_first)
+  end
 
-    scheduler = fn recipient, delay ->
-      send(parent, {:burst_periodic_reconcile_scheduled, recipient, delay})
-      make_ref()
-    end
-
-    observer = fn ->
-      count = :atomics.add_get(reconciliations, 1, 1)
-      send(parent, {:burst_full_reconcile, count})
-    end
-
-    opts = [
-      name: name,
-      dispatch_enabled: false,
-      recover_orphans: false,
-      task_filter: fn _task -> false end,
-      reconcile_scheduler: scheduler,
-      reconcile_observer: observer
-    ]
-
-    orchestrator =
-      start_supervised!(
-        {Orchestrator, opts},
-        id: name
-      )
-
-    assert_receive {:burst_periodic_reconcile_scheduled, ^orchestrator, 0}
-    assert :ok = :sys.suspend(orchestrator)
-
-    Enum.each(1..30_000, fn _iteration ->
-      assert :ok = Orchestrator.refresh(orchestrator)
-    end)
-
-    assert :ok = :sys.resume(orchestrator)
-    assert %{online: true} = GenServer.call(orchestrator, :status)
-    assert_receive {:burst_full_reconcile, 1}, 5_000
-    assert %{online: true} = GenServer.call(orchestrator, :status)
-    assert :atomics.get(reconciliations, 1) == 1
+  test "periodic tick after thirty thousand refreshes shares one eventual reconciliation" do
+    assert_periodic_refresh_burst_coalesces(:refresh_first)
   end
 
   test "merge worker identity survives an Orchestrator-only restart and prevents duplicate effects" do
@@ -1014,6 +977,54 @@ defmodule SymphonyElixir.OrchestratorTest do
   defp message_count(expected) do
     {:messages, messages} = Process.info(self(), :messages)
     Enum.count(messages, &(&1 == expected))
+  end
+
+  defp assert_periodic_refresh_burst_coalesces(order) do
+    reconciliations = :atomics.new(1, [])
+    schedules = :atomics.new(1, [])
+    name = String.to_atom("orchestrator_refresh_burst_#{System.unique_integer([:positive])}")
+
+    scheduler = fn _recipient, _delay ->
+      :atomics.add_get(schedules, 1, 1)
+      make_ref()
+    end
+
+    observer = fn -> :atomics.add_get(reconciliations, 1, 1) end
+
+    opts = [
+      name: name,
+      dispatch_enabled: false,
+      recover_orphans: false,
+      task_filter: fn _task -> false end,
+      reconcile_scheduler: scheduler,
+      reconcile_observer: observer
+    ]
+
+    orchestrator = start_supervised!({Orchestrator, opts}, id: name)
+    assert :atomics.get(schedules, 1) == 1
+    assert :ok = :sys.suspend(orchestrator)
+
+    case order do
+      :periodic_first ->
+        send(orchestrator, :scheduled_reconcile)
+        send_refresh_burst(orchestrator)
+
+      :refresh_first ->
+        send_refresh_burst(orchestrator)
+        send(orchestrator, :scheduled_reconcile)
+    end
+
+    assert :ok = :sys.resume(orchestrator)
+    assert %{online: true} = GenServer.call(orchestrator, :status)
+    assert %{online: true} = GenServer.call(orchestrator, :status)
+    assert :atomics.get(reconciliations, 1) == 1
+    assert :atomics.get(schedules, 1) == 2
+  end
+
+  defp send_refresh_burst(orchestrator) do
+    Enum.each(1..30_000, fn _iteration ->
+      assert :ok = Orchestrator.refresh(orchestrator)
+    end)
   end
 
   defp cleanup_inherited_readiness(readiness) do
