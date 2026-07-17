@@ -219,7 +219,7 @@ defmodule SymphonyElixir.JobManager do
     active =
       state.records
       |> Map.values()
-      |> Enum.filter(&(&1["run_id"] == run_id and &1["status"] == "running"))
+      |> Enum.filter(&(delivered_to_run?(&1, run_id) and &1["status"] == "running"))
       |> Enum.max_by(&{&1["started_at"] || "", &1["job_id"]}, fn -> nil end)
 
     {:reply, active, state}
@@ -231,14 +231,22 @@ defmodule SymphonyElixir.JobManager do
   end
 
   def handle_call({:cancel_run, run_id}, _from, state) do
-    state.records
-    |> Enum.filter(fn {_job_id, record} -> record["run_id"] == run_id and record["status"] == "running" end)
-    |> Enum.each(fn {job_id, _record} ->
-      case state.workers[job_id] do
-        pid when is_pid(pid) -> SymphonyElixir.JobWorker.cancel(pid)
-        _ -> :ok
-      end
-    end)
+    state =
+      state.records
+      |> Enum.filter(fn {_job_id, record} ->
+        delivered_to_run?(record, run_id) and record["status"] == "running"
+      end)
+      |> Enum.reduce(state, fn {job_id, record}, acc ->
+        case acc.workers[job_id] do
+          pid when is_pid(pid) -> SymphonyElixir.JobWorker.cancel(pid)
+          _ -> :ok
+        end
+
+        %{
+          acc
+          | active_single_flight: delete_single_flight(acc.active_single_flight, record["single_flight_key"], job_id)
+        }
+      end)
 
     {:reply, :ok, state}
   end
@@ -330,8 +338,13 @@ defmodule SymphonyElixir.JobManager do
 
   defp attach_single(job_id, request, from, state) do
     record = Map.fetch!(state.records, job_id)
-    call_ids = Enum.uniq(record["call_ids"] ++ [request.call_id])
-    updated = Map.put(record, "call_ids", call_ids)
+    delivery = delivery(request.run_id, request.call_id)
+    deliveries = Enum.uniq(record_deliveries(record) ++ [delivery])
+
+    updated =
+      record
+      |> Map.put("deliveries", deliveries)
+      |> Map.put("call_ids", Enum.map(deliveries, & &1["call_id"]) |> Enum.uniq())
 
     case JobStore.persist(state.root, updated) do
       :ok ->
@@ -364,6 +377,7 @@ defmodule SymphonyElixir.JobManager do
       "task_branch" => request.task_branch,
       "run_id" => request.run_id,
       "call_ids" => [request.call_id],
+      "deliveries" => [delivery(request.run_id, request.call_id)],
       "single_flight_key" => request.single_flight_key,
       "started_at" => started_at,
       "finished_at" => nil,
@@ -480,7 +494,7 @@ defmodule SymphonyElixir.JobManager do
 
   defp successful_record(records, run_id, frozen_jobs, source_fingerprint) do
     with {:ok, fingerprints} <- frozen_job_fingerprints(frozen_jobs) do
-      run_records = records |> Map.values() |> Enum.filter(&(&1["run_id"] == run_id))
+      run_records = records |> Map.values() |> Enum.filter(&delivered_to_run?(&1, run_id))
       named = Enum.filter(run_records, &Map.has_key?(fingerprints, &1["job"]))
 
       defined =
@@ -492,7 +506,7 @@ defmodule SymphonyElixir.JobManager do
       successful = Enum.filter(exact, &(&1["status"] == "completed" and &1["exit_code"] == 0))
 
       cond do
-        successful != [] -> {:ok, successful_job_proof(successful)}
+        successful != [] -> {:ok, successful_job_proof(successful, run_id)}
         named == [] -> {:error, :conflict_validation_missing}
         defined == [] -> {:error, :conflict_validation_job_mismatch}
         exact == [] -> {:error, :conflict_validation_source_mismatch}
@@ -521,10 +535,11 @@ defmodule SymphonyElixir.JobManager do
     end
   end
 
-  defp successful_job_proof(records) do
+  defp successful_job_proof(records, run_id) do
     records
     |> Enum.max_by(&{&1["finished_at"] || "", &1["job_id"]})
     |> Map.take(~w(job_id job status exit_code run_id source_fingerprint job_definition_fingerprint started_at finished_at))
+    |> Map.put("run_id", run_id)
   end
 
   defp passthrough_arguments(job, arguments) when is_list(arguments) do
@@ -675,12 +690,32 @@ defmodule SymphonyElixir.JobManager do
   defp index_records(state, records) do
     Enum.reduce(records, state, fn record, acc ->
       calls =
-        Enum.reduce(record["call_ids"], acc.calls, fn call_id, call_acc ->
-          Map.put(call_acc, {record["run_id"], call_id}, record["job_id"])
+        Enum.reduce(record_deliveries(record), acc.calls, fn delivery, call_acc ->
+          Map.put(call_acc, {delivery["run_id"], delivery["call_id"]}, record["job_id"])
         end)
 
       %{acc | records: Map.put(acc.records, record["job_id"], record), calls: calls}
     end)
+  end
+
+  defp delivery(run_id, call_id), do: %{"run_id" => run_id, "call_id" => call_id}
+
+  defp record_deliveries(%{"deliveries" => deliveries}) when is_list(deliveries) and deliveries != [],
+    do: deliveries
+
+  defp record_deliveries(record) do
+    Enum.map(record["call_ids"], &delivery(record["run_id"], &1))
+  end
+
+  defp delivered_to_run?(record, run_id) do
+    Enum.any?(record_deliveries(record), &(&1["run_id"] == run_id))
+  end
+
+  defp delete_single_flight(single_flight, key, job_id) do
+    case single_flight[key] do
+      ^job_id -> Map.delete(single_flight, key)
+      _other -> single_flight
+    end
   end
 
   defp default_root do
@@ -749,14 +784,27 @@ defmodule SymphonyElixir.JobManager do
   end
 
   defp untracked_identity(path) do
-    with {:ok, stat} <- File.lstat(path) do
-      case stat.type do
-        :regular -> with {:ok, content} <- File.read(path), do: {:ok, "regular", content}
-        :symlink -> with {:ok, target} <- File.read_link(path), do: {:ok, "symlink", target}
-        type -> {:ok, Atom.to_string(type), <<>>}
-      end
+    case File.lstat(path) do
+      {:ok, stat} -> untracked_content(path, stat.type)
+      {:error, reason} -> {:error, reason}
     end
   end
+
+  defp untracked_content(path, :regular) do
+    case File.read(path) do
+      {:ok, content} -> {:ok, "regular", content}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp untracked_content(path, :symlink) do
+    case File.read_link(path) do
+      {:ok, target} -> {:ok, "symlink", target}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp untracked_content(_path, type), do: {:ok, Atom.to_string(type), <<>>}
 
   defp fingerprint_components(components) do
     components

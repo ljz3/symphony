@@ -72,6 +72,26 @@ defmodule SymphonyElixir.DeterministicMerge.WorkerTest do
     eventually(fn -> Worker.active() == :none end)
   end
 
+  test "escalates an explicit cancellation when a runner does not cooperate", %{bundle: bundle, task: task} do
+    parent = self()
+
+    runner = fn _task, _bundle, [] ->
+      send(parent, {:stubborn_runner_started, self()})
+
+      receive do
+        :never_sent -> {:ok, :unexpected}
+      end
+    end
+
+    assert {:ok, task_id, pid} = Worker.ensure_started(task, bundle, runner)
+    assert_receive {:stubborn_runner_started, ^pid}
+    ref = Process.monitor(pid)
+
+    assert :ok = Worker.cancel(pid, task_id)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 3_000
+    eventually(fn -> Worker.active() == :none end)
+  end
+
   defp task(id) do
     %Task{
       id: id,

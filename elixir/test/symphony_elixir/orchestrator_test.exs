@@ -587,10 +587,13 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert_receive {:merge_retry_attempt, 1, task_id, first_pid}, 2_000
     assert task_id == task.id
     %{ref: first_ref} = Map.fetch!(first_state.merging, task.id)
-    assert_receive {:DOWN, ^first_ref, :process, ^first_pid, :normal}, 2_000
+    assert_receive {:DOWN, ^first_ref, :process, ^first_pid, first_reason}, 2_000
 
     assert {:noreply, waiting_state} =
-             Orchestrator.handle_info({:DOWN, first_ref, :process, first_pid, :normal}, first_state)
+             Orchestrator.handle_info(
+               {:DOWN, first_ref, :process, first_pid, first_reason},
+               first_state
+             )
 
     waiting_state =
       Enum.reduce(1..5, waiting_state, fn _iteration, current ->

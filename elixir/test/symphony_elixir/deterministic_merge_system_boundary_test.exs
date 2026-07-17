@@ -85,6 +85,10 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
     #!/bin/sh
     set -eu
     printf '%s\n' "$@" > "$FAKE_GH_STATE/ssh_args"
+    token="$(printf '%s\n' "$@" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n 1 || true)"
+    if [ -n "$token" ]; then
+      printf '__SYMPHONY_MANAGED_COMMAND_%s__%s\n' "$token" "$$"
+    fi
     case "${FAKE_SSH_MODE:-success}" in
       success) printf '%s' "${FAKE_SSH_OUTPUT:-remote-output}" ;;
       failed) printf '%s' "${FAKE_SSH_OUTPUT:-remote-failed}"; exit 9 ;;

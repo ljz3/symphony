@@ -16,6 +16,7 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
   @registry SymphonyElixir.DeterministicMerge.WorkerRegistry
   @supervisor SymphonyElixir.DeterministicMerge.WorkerSupervisor
   @slot :active
+  @cancel_escalation_ms 2_000
 
   @type runner :: (Task.t(), Bundle.t(), keyword() -> term())
   @type active_worker :: {:ok, String.t(), pid()} | :none
@@ -49,6 +50,15 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
       {:error, {:already_started, _pid}} -> active()
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  @doc "Cancels an invalidated merge worker and escalates only after that explicit cancellation."
+  @spec cancel(pid(), String.t()) :: :ok
+  def cancel(pid, task_id) when is_pid(pid) and is_binary(task_id) do
+    send(pid, {:cancel_deterministic_merge, task_id})
+
+    spawn(fn -> force_cancel_if_running(pid) end)
+    :ok
   end
 
   @doc false
@@ -93,5 +103,20 @@ defmodule SymphonyElixir.DeterministicMerge.Worker do
 
   defp log_result(task_id, result) do
     Logger.warning("deterministic merge worker failed task_id=#{task_id} result=#{inspect(result)}")
+  end
+
+  defp force_cancel_if_running(pid) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      @cancel_escalation_ms ->
+        Process.demonitor(ref, [:flush])
+
+        if Process.alive?(pid) do
+          _ = DynamicSupervisor.terminate_child(@supervisor, pid)
+        end
+    end
   end
 end

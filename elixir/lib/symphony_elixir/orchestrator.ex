@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.DeterministicMerge.Worker, as: MergeWorker
   alias SymphonyElixir.GitHub
   alias SymphonyElixir.JobManager
+  alias SymphonyElixir.ReviewAttestation
   alias SymphonyElixir.SSH
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.{Bundle, Store}
@@ -38,6 +39,8 @@ defmodule SymphonyElixir.Orchestrator do
               refs: %{},
               merging: %{},
               merge_refs: %{},
+              merge_retry_after: %{},
+              merge_retry_ms: 1_000,
               preflights: %{},
               preflight_refs: %{},
               preflight_failures: %{},
@@ -115,6 +118,7 @@ defmodule SymphonyElixir.Orchestrator do
        task_filter: Keyword.get(opts, :task_filter),
        agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
        merge_runner: Keyword.get(opts, :merge_runner, &DeterministicMerge.run/3),
+       merge_retry_ms: Keyword.get(opts, :merge_retry_ms, @reconcile_interval_ms),
        rework_drafter: Keyword.get(opts, :rework_drafter),
        github_outcome_recorder: Keyword.get(opts, :github_outcome_recorder)
      }}
@@ -144,6 +148,10 @@ defmodule SymphonyElixir.Orchestrator do
        merging:
          state.merging
          |> Enum.map(fn {task_id, runtime} -> %{task_id: task_id, started_at: runtime.started_at} end)
+         |> Enum.sort_by(& &1.task_id),
+       merge_retries:
+         state.merge_retry_after
+         |> Enum.map(fn {task_id, retry} -> %{task_id: task_id, next_retry_at: retry.next_retry_at} end)
          |> Enum.sort_by(& &1.task_id),
        preflights: preflight_status(state),
        worker_health: worker_health_status(state),
@@ -176,6 +184,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
+      |> reconcile_task_merge(task_id)
       |> reconcile_task_preflight(task_id)
       |> maybe_request_stop(task_id)
       |> maybe_terminal_cleanup(task_id)
@@ -191,6 +200,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
+      |> cancel_all_merges(:workflow_changed)
+      |> Map.put(:merge_retry_after, %{})
       |> cancel_all_preflights()
       |> Map.put(:preflight_failures, %{})
       |> broadcast_preflight_change(previous)
@@ -413,11 +424,15 @@ defmodule SymphonyElixir.Orchestrator do
         handle_preflight_or_runner_down_without_merge(ref, reason, state)
 
       {task_id, merge_refs} ->
-        {_runtime, merging} = Map.pop(state.merging, task_id)
+        {runtime, merging} = Map.pop(state.merging, task_id)
         log_merge_exit(task_id, reason)
 
+        state =
+          %{state | merge_refs: merge_refs, merging: merging}
+          |> maybe_schedule_merge_retry(task_id, runtime)
+
         send(self(), :reconcile)
-        {:noreply, %{state | merge_refs: merge_refs, merging: merging}}
+        {:noreply, state}
     end
   end
 
@@ -474,34 +489,44 @@ defmodule SymphonyElixir.Orchestrator do
         "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
     )
 
-    if is_nil(gate) do
-      with {:ok, task} <- Board.task(preflight.task_id),
-           true <- current_preflight_snapshot?(task, bundle, preflight, state),
-           true <- worker_reservation_current?(preflight.worker_host, bundle, state),
-           true <- capacity_load(state) < bundle.agent.max_concurrent_agents do
-        case claim_and_start(task, preflight.worker_host, state, bundle) do
-          {:ok, next} -> next
-          {:error, _reason, next} -> next
-        end
-      else
-        _stale ->
-          Logger.info(
-            "preflight result discarded reason=stale_snapshot task_id=#{preflight.task_id} " <>
-              "task_identifier=#{preflight.identifier} task_revision=#{preflight.task_revision} " <>
-              "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
-          )
-
-          state
-      end
-    else
-      Logger.info(
-        "preflight result deferred reason=#{inspect(gate)} task_id=#{preflight.task_id} " <>
-          "task_identifier=#{preflight.identifier} task_revision=#{preflight.task_revision} " <>
-          "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
-      )
-
-      %{state | dispatch_gate: gate}
+    case gate do
+      nil -> claim_current_preflight(state, preflight, bundle)
+      reason -> defer_preflight_claim(state, preflight, reason)
     end
+  end
+
+  defp claim_current_preflight(state, preflight, bundle) do
+    with {:ok, task} <- Board.task(preflight.task_id),
+         true <- current_preflight_snapshot?(task, bundle, preflight, state),
+         true <- worker_reservation_current?(preflight.worker_host, bundle, state),
+         true <- capacity_load(state) < bundle.agent.max_concurrent_agents do
+      finish_preflight_claim(claim_and_start(task, preflight.worker_host, state, bundle))
+    else
+      _stale -> discard_stale_preflight_claim(state, preflight)
+    end
+  end
+
+  defp finish_preflight_claim({:ok, next}), do: next
+  defp finish_preflight_claim({:error, _reason, next}), do: next
+
+  defp discard_stale_preflight_claim(state, preflight) do
+    Logger.info(
+      "preflight result discarded reason=stale_snapshot task_id=#{preflight.task_id} " <>
+        "task_identifier=#{preflight.identifier} task_revision=#{preflight.task_revision} " <>
+        "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
+    )
+
+    state
+  end
+
+  defp defer_preflight_claim(state, preflight, reason) do
+    Logger.info(
+      "preflight result deferred reason=#{inspect(reason)} task_id=#{preflight.task_id} " <>
+        "task_identifier=#{preflight.identifier} task_revision=#{preflight.task_revision} " <>
+        "workflow_hash=#{preflight.workflow_hash} worker_host=#{worker_label(preflight.worker_host)}"
+    )
+
+    %{state | dispatch_gate: reason}
   end
 
   defp record_preflight_failure(state, preflight, reason) do
@@ -614,8 +639,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_merge_candidates(state) do
     case MergeWorker.active() do
-      {:ok, task_id, pid} -> observe_merge_worker(state, task_id, pid)
+      {:ok, task_id, pid} -> observe_existing_merge_worker(state, task_id, pid)
       :none -> do_dispatch_merge_candidate(state)
+    end
+  end
+
+  defp observe_existing_merge_worker(state, task_id, pid) do
+    case Board.task(task_id) do
+      {:ok, task} -> observe_merge_worker(state, task, pid, Config.bundle!())
+      {:error, :not_found} -> state
     end
   end
 
@@ -637,13 +669,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp merge_eligible?(task, bundle, state) do
     not Task.archived?(task) and is_nil(task.runtime_state) and is_nil(task.active_run_id) and
       match?(%{role: :merge}, Bundle.column(bundle, task.column_id)) and
-      selected_candidate?(task, state.task_filter)
+      selected_candidate?(task, state.task_filter) and merge_retry_ready?(task, bundle, state)
   end
 
   defp start_merge_worker(state, task, bundle) do
     case MergeWorker.ensure_started(task, bundle, state.merge_runner) do
       {:ok, task_id, pid} ->
-        observe_merge_worker(state, task_id, pid)
+        if task_id == task.id,
+          do: observe_merge_worker(state, task, pid, bundle),
+          else: observe_existing_merge_worker(state, task_id, pid)
 
       :none ->
         state
@@ -654,14 +688,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp observe_merge_worker(state, task_id, pid) do
+  defp observe_merge_worker(state, task, pid, bundle) do
     ref = Process.monitor(pid)
-    runtime = %{pid: pid, ref: ref, started_at: timestamp()}
+
+    runtime = %{
+      pid: pid,
+      ref: ref,
+      started_at: timestamp(),
+      guard: merge_guard(task, bundle),
+      cancelling: false
+    }
 
     %{
       state
-      | merging: Map.put(state.merging, task_id, runtime),
-        merge_refs: Map.put(state.merge_refs, ref, task_id)
+      | merging: Map.put(state.merging, task.id, runtime),
+        merge_refs: Map.put(state.merge_refs, ref, task.id),
+        merge_retry_after: Map.delete(state.merge_retry_after, task.id)
     }
   end
 
@@ -671,6 +713,128 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp log_merge_exit(task_id, reason) do
     Logger.warning("deterministic merge worker exited task_id=#{task_id} reason=#{inspect(reason)}")
+  end
+
+  defp reconcile_task_merge(state, task_id) do
+    bundle = Config.bundle!()
+
+    state = reconcile_merge_runtime(state, task_id, state.merging[task_id], bundle)
+
+    clear_stale_merge_retry(state, task_id, bundle)
+  end
+
+  defp reconcile_merge_runtime(state, _task_id, nil, _bundle), do: state
+  defp reconcile_merge_runtime(state, _task_id, %{cancelling: true}, _bundle), do: state
+
+  defp reconcile_merge_runtime(state, task_id, runtime, bundle) do
+    case Board.task(task_id) do
+      {:ok, task} ->
+        if merge_guard(task, bundle) == runtime.guard and merge_column?(task, bundle),
+          do: state,
+          else: cancel_merge_worker(state, task_id, :task_semantics_changed)
+
+      {:error, :not_found} ->
+        cancel_merge_worker(state, task_id, :task_missing)
+    end
+  end
+
+  defp cancel_all_merges(state, reason) do
+    Enum.reduce(Map.keys(state.merging), state, &cancel_merge_worker(&2, &1, reason))
+  end
+
+  defp cancel_merge_worker(state, task_id, reason) do
+    case state.merging[task_id] do
+      nil ->
+        state
+
+      %{cancelling: true} ->
+        state
+
+      runtime ->
+        :ok = MergeWorker.cancel(runtime.pid, task_id)
+
+        Logger.info("deterministic merge cancellation requested task_id=#{task_id} reason=#{reason}")
+
+        put_in(state.merging[task_id], %{runtime | cancelling: true})
+    end
+  end
+
+  defp maybe_schedule_merge_retry(state, _task_id, nil), do: state
+  defp maybe_schedule_merge_retry(state, _task_id, %{cancelling: true}), do: state
+
+  defp maybe_schedule_merge_retry(state, task_id, runtime) do
+    bundle = Config.bundle!()
+
+    case Board.task(task_id) do
+      {:ok, task} ->
+        if merge_column?(task, bundle) and merge_guard(task, bundle) == runtime.guard do
+          delay = state.merge_retry_ms
+          now = DateTime.utc_now()
+
+          retry = %{
+            guard: runtime.guard,
+            retry_at_ms: System.monotonic_time(:millisecond) + delay,
+            next_retry_at:
+              now
+              |> DateTime.add(delay, :millisecond)
+              |> DateTime.truncate(:microsecond)
+              |> DateTime.to_iso8601()
+          }
+
+          put_in(state.merge_retry_after[task_id], retry)
+        else
+          %{state | merge_retry_after: Map.delete(state.merge_retry_after, task_id)}
+        end
+
+      {:error, :not_found} ->
+        %{state | merge_retry_after: Map.delete(state.merge_retry_after, task_id)}
+    end
+  end
+
+  defp merge_retry_ready?(task, bundle, state) do
+    case state.merge_retry_after[task.id] do
+      nil ->
+        true
+
+      %{guard: guard, retry_at_ms: retry_at_ms} ->
+        guard != merge_guard(task, bundle) or System.monotonic_time(:millisecond) >= retry_at_ms
+    end
+  end
+
+  defp clear_stale_merge_retry(state, task_id, bundle) do
+    case {state.merge_retry_after[task_id], Board.task(task_id)} do
+      {nil, _task} ->
+        state
+
+      {%{guard: guard}, {:ok, task}} ->
+        if merge_column?(task, bundle) and merge_guard(task, bundle) == guard,
+          do: state,
+          else: %{state | merge_retry_after: Map.delete(state.merge_retry_after, task_id)}
+
+      {_retry, {:error, :not_found}} ->
+        %{state | merge_retry_after: Map.delete(state.merge_retry_after, task_id)}
+    end
+  end
+
+  defp merge_column?(task, bundle) do
+    match?(%{role: :merge}, Bundle.column(bundle, task.column_id)) and is_nil(task.active_run_id) and
+      is_nil(task.runtime_state)
+  end
+
+  defp merge_guard(task, bundle) do
+    canonical = %{
+      workflow_hash: bundle.hash,
+      column_id: task.column_id,
+      source: Map.take(task.source, ~w(head_sha base_sha clean)),
+      github: Map.take(task.github, ~w(number head_sha state draft)),
+      acceptance: ReviewAttestation.criteria_fingerprint(task.acceptance_criteria),
+      review_attestation: task.review_attestation
+    }
+
+    canonical
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp do_dispatch_candidates(state) do
@@ -688,8 +852,10 @@ defmodule SymphonyElixir.Orchestrator do
 
     candidates =
       Board.tasks()
-      |> Enum.filter(&(dispatch_eligible?(&1, bundle, state) and preflight_ready?(&1, bundle, state, now)))
-      |> Enum.filter(&selected_candidate?(&1, state.task_filter))
+      |> Enum.filter(
+        &(dispatch_eligible?(&1, bundle, state) and preflight_ready?(&1, bundle, state, now) and
+            selected_candidate?(&1, state.task_filter))
+      )
       |> Enum.sort_by(&{Task.priority_weight(&1.priority), &1.rank, &1.number})
 
     {state, _remaining_slots} =
@@ -773,23 +939,25 @@ defmodule SymphonyElixir.Orchestrator do
     worktree_result = Worktree.ensure(task, worker_host)
     :ok = stop_owned_task_guard(preparation_guard)
 
-    with {:ok, workspace_path} <- worktree_result do
-      send(recipient, {:preflight_phase, task.id, probe_id, :running, workspace_path})
+    case worktree_result do
+      {:ok, workspace_path} ->
+        send(recipient, {:preflight_phase, task.id, probe_id, :running, workspace_path})
 
-      case Worktree.run_preflight(
-             task,
-             workspace_path,
-             config.command,
-             bundle.hash,
-             worker_host,
-             owner: recipient,
-             cancellation_ref: probe_id
-           ) do
-        {:ok, output} -> {:ok, workspace_path, output}
-        {:error, reason} -> {:error, workspace_path, reason}
-      end
-    else
-      {:error, reason} -> {:error, nil, {:worktree_prepare_failed, reason}}
+        case Worktree.run_preflight(
+               task,
+               workspace_path,
+               config.command,
+               bundle.hash,
+               worker_host,
+               owner: recipient,
+               cancellation_ref: probe_id
+             ) do
+          {:ok, output} -> {:ok, workspace_path, output}
+          {:error, reason} -> {:error, workspace_path, reason}
+        end
+
+      {:error, reason} ->
+        {:error, nil, {:worktree_prepare_failed, reason}}
     end
   end
 
@@ -1766,8 +1934,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp format_datetime(datetime), do: datetime |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
 
   @impl true
-  def terminate(_reason, state) do
-    _state = state |> cancel_all_preflights() |> cancel_all_worker_health()
+  def terminate(reason, state) do
+    state = state |> cancel_all_preflights() |> cancel_all_worker_health()
+    _state = if shutdown_reason?(reason), do: cancel_all_merges(state, :shutdown), else: state
     :ok
   end
+
+  defp shutdown_reason?(:shutdown), do: true
+  defp shutdown_reason?({:shutdown, _reason}), do: true
+  defp shutdown_reason?(_reason), do: false
 end
