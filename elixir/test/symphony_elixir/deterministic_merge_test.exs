@@ -5,6 +5,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
 
   alias SymphonyElixir.Board.Commands
   alias SymphonyElixir.{Config, DeterministicMerge, ReviewAttestation, Task}
+  alias SymphonyElixir.DeterministicMerge.SystemBoundary
 
   @head String.duplicate("a", 40)
   @target String.duplicate("b", 40)
@@ -208,6 +209,27 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       reset(candidate)
       scenario(values)
       assert {:ok, :pending} = run(candidate, bundle)
+      assert current_task().column_id == "merging"
+      assert count_call(:guarded_squash) == 0
+    end)
+  end
+
+  test "post-marker OpenSSH 255 readiness remains merge-pending", %{task: task, bundle: bundle} do
+    diagnostic = "Connection reset after remote command start.\n"
+
+    with_fake_post_marker_ssh(diagnostic, fn ->
+      readiness =
+        SystemBoundary.call(:readiness, task, %{
+          worktree: "/remote/worktree",
+          worker_host: "worker.example",
+          readiness_command: "./scripts/readiness"
+        })
+
+      transport = {:ssh_transport_failed, 255, diagnostic}
+      assert {:error, {:transient, ^transport}} = readiness
+
+      scenario(%{readiness: readiness})
+      assert {:ok, :pending} = run(task, bundle)
       assert current_task().column_id == "merging"
       assert count_call(:guarded_squash) == 0
     end)
@@ -974,6 +996,33 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     File.write!(
       executable,
       "#!/bin/sh\nprintf '%s' #{shell_escape(diagnostic)} >&2\nexit #{status}\n"
+    )
+
+    File.chmod!(executable, 0o755)
+    System.put_env("PATH", root <> ":" <> original_path)
+
+    try do
+      callback.()
+    after
+      System.put_env("PATH", original_path)
+    end
+  end
+
+  defp with_fake_post_marker_ssh(diagnostic, callback) do
+    root = Path.join(System.tmp_dir!(), "merge-fake-post-marker-ssh-#{Ecto.UUID.generate()}")
+    executable = Path.join(root, "ssh")
+    original_path = System.get_env("PATH")
+    File.mkdir_p!(root)
+
+    File.write!(
+      executable,
+      """
+      #!/bin/sh
+      token="$(printf '%s\n' "$@" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n 1)"
+      printf '__SYMPHONY_MANAGED_COMMAND_%s__%s\n' "$token" "$$"
+      printf '%s' #{shell_escape(diagnostic)} >&2
+      exit 255
+      """
     )
 
     File.chmod!(executable, 0o755)

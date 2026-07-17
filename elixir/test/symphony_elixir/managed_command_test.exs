@@ -85,6 +85,21 @@ defmodule SymphonyElixir.ManagedCommandTest do
 
     assert_receive {:managed_command_result, ^transport_ref, {:error, {:ssh_transport_failed, 255, "Permission denied (publickey).\n"}}}
 
+    post_marker =
+      worker_state(
+        port: :post_marker_transport_port,
+        worker_host: "builder",
+        pgid: 42,
+        output: ["Connection reset after remote command start.\n"]
+      )
+
+    post_marker_ref = post_marker.ref
+
+    assert {:stop, :normal, _state} =
+             Worker.handle_info({:post_marker_transport_port, {:exit_status, 255}}, post_marker)
+
+    assert_receive {:managed_command_result, ^post_marker_ref, {:error, {:ssh_transport_failed, 255, "Connection reset after remote command start.\n"}}}
+
     missing = worker_state(port: :missing_port, worker_host: "builder", control_buffer: "unexpected")
     missing_ref = missing.ref
     assert {:stop, :normal, _state} = Worker.handle_info({:missing_port, {:exit_status, 0}}, missing)

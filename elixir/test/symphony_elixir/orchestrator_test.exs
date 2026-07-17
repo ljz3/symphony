@@ -695,18 +695,22 @@ defmodule SymphonyElixir.OrchestratorTest do
 
   test "immediate reconciliation triggers do not create periodic timer chains" do
     parent = self()
+    reconciliations = :atomics.new(1, [])
 
     scheduler = fn recipient, delay ->
       send(parent, {:periodic_reconcile_scheduled, recipient, delay})
       make_ref()
     end
 
+    observer = fn -> :atomics.add_get(reconciliations, 1, 1) end
+
     assert {:ok, state} =
              Orchestrator.init(
                dispatch_enabled: false,
                recover_orphans: false,
                task_filter: fn _task -> false end,
-               reconcile_scheduler: scheduler
+               reconcile_scheduler: scheduler,
+               reconcile_observer: observer
              )
 
     assert_receive {:periodic_reconcile_scheduled, recipient, 0}
@@ -718,41 +722,97 @@ defmodule SymphonyElixir.OrchestratorTest do
         github_health_checked_at: System.monotonic_time(:millisecond)
     }
 
+    Enum.each(1..3, fn _iteration -> assert :ok = Orchestrator.refresh(self()) end)
+    assert message_count(:request_reconcile) == 3
+
+    state = Enum.reduce(1..3, state, fn _iteration, current -> handle_queued_refresh(current) end)
+    token = state.pending_immediate_reconcile
+    assert is_reference(token)
+    assert message_count({:run_immediate_reconcile, token}) == 1
+
     assert {:noreply, state} = Orchestrator.handle_info(:scheduled_reconcile, state)
     assert_receive {:periodic_reconcile_scheduled, recipient, 1_000}
     assert recipient == self()
-    refute_receive {:periodic_reconcile_scheduled, _recipient, _delay}
+    assert state.pending_immediate_reconcile == nil
+    assert :atomics.get(reconciliations, 1) == 1
 
-    state =
-      Enum.reduce(1..3, state, fn _iteration, current ->
-        assert :ok = Orchestrator.refresh(self())
-        assert_receive :reconcile
-        assert {:noreply, next} = Orchestrator.handle_info(:reconcile, current)
-        next
-      end)
+    assert_receive {:run_immediate_reconcile, ^token}
+
+    assert {:noreply, state} =
+             Orchestrator.handle_info({:run_immediate_reconcile, token}, state)
+
+    assert :atomics.get(reconciliations, 1) == 1
 
     state =
       Enum.reduce(1..3, state, fn iteration, current ->
         assert {:noreply, next} =
                  Orchestrator.handle_info({:task_changed, "missing-reconcile-task-#{iteration}"}, current)
 
-        assert_receive :reconcile
-        assert {:noreply, reconciled} = Orchestrator.handle_info(:reconcile, next)
-        reconciled
+        next
       end)
+
+    task_token = state.pending_immediate_reconcile
+    assert is_reference(task_token)
+    assert message_count({:run_immediate_reconcile, task_token}) == 1
+    assert_receive {:run_immediate_reconcile, ^task_token}
+
+    assert {:noreply, state} =
+             Orchestrator.handle_info({:run_immediate_reconcile, task_token}, state)
+
+    assert :atomics.get(reconciliations, 1) == 2
 
     state =
       Enum.reduce(1..3, state, fn iteration, current ->
         assert {:noreply, next} =
                  Orchestrator.handle_info({:workflow_activated, "new-workflow-hash-#{iteration}"}, current)
 
-        assert_receive :reconcile
-        assert {:noreply, reconciled} = Orchestrator.handle_info(:reconcile, next)
-        reconciled
+        next
       end)
 
-    assert %State{} = state
-    refute_receive {:periodic_reconcile_scheduled, _recipient, _delay}
+    workflow_token = state.pending_immediate_reconcile
+    assert is_reference(workflow_token)
+    assert message_count({:run_immediate_reconcile, workflow_token}) == 1
+    assert_receive {:run_immediate_reconcile, ^workflow_token}
+
+    assert {:noreply, state} =
+             Orchestrator.handle_info({:run_immediate_reconcile, workflow_token}, state)
+
+    assert state.pending_immediate_reconcile == nil
+    assert :atomics.get(reconciliations, 1) == 3
+  end
+
+  @tag timeout: 15_000
+  test "thirty thousand public refreshes preserve status responsiveness and run one full reconcile" do
+    parent = self()
+    reconciliations = :atomics.new(1, [])
+    name = String.to_atom("orchestrator_refresh_burst_#{System.unique_integer([:positive])}")
+
+    scheduler = fn recipient, delay ->
+      send(parent, {:burst_periodic_reconcile_scheduled, recipient, delay})
+      make_ref()
+    end
+
+    observer = fn ->
+      count = :atomics.add_get(reconciliations, 1, 1)
+      send(parent, {:burst_full_reconcile, count})
+    end
+
+    orchestrator =
+      start_supervised!(
+        {Orchestrator, name: name, dispatch_enabled: false, recover_orphans: false, task_filter: fn _task -> false end, reconcile_scheduler: scheduler, reconcile_observer: observer},
+        id: name
+      )
+
+    assert_receive {:burst_periodic_reconcile_scheduled, ^orchestrator, 0}
+
+    Enum.each(1..30_000, fn _iteration ->
+      assert :ok = Orchestrator.refresh(orchestrator)
+    end)
+
+    assert %{online: true} = GenServer.call(orchestrator, :status)
+    assert_receive {:burst_full_reconcile, 1}, 5_000
+    assert %{online: true} = GenServer.call(orchestrator, :status)
+    assert :atomics.get(reconciliations, 1) == 1
   end
 
   test "merge worker identity survives an Orchestrator-only restart and prevents duplicate effects" do
@@ -929,6 +989,17 @@ defmodule SymphonyElixir.OrchestratorTest do
       github_health: %{available: true, authenticated: true, error: nil},
       github_health_checked_at: System.monotonic_time(:millisecond)
     )
+  end
+
+  defp handle_queued_refresh(state) do
+    assert_receive :request_reconcile
+    assert {:noreply, next} = Orchestrator.handle_info(:request_reconcile, state)
+    next
+  end
+
+  defp message_count(expected) do
+    {:messages, messages} = Process.info(self(), :messages)
+    Enum.count(messages, &(&1 == expected))
   end
 
   defp cleanup_inherited_readiness(readiness) do
