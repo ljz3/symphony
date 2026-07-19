@@ -210,7 +210,14 @@ defmodule SymphonyElixir.Worktree do
       with :ok <- validate_marker(task, worktree, bundle),
            {:ok, branch} <- current_branch(worktree, nil),
            true <- branch == task.branch,
-           :ok <- validate_common_repository(worktree, bundle.source.root) do
+           :ok <- validate_common_repository(worktree, bundle.source.root),
+           {:ok, _output} <-
+             git(bundle.source.root, [
+               "fetch",
+               "--prune",
+               bundle.source.remote,
+               bundle.source.default_branch
+             ]) do
         {:ok, %{created: false}}
       else
         false -> {:error, {:worktree_branch_collision, worktree, task.branch}}

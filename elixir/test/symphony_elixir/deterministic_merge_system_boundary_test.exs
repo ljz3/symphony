@@ -136,6 +136,39 @@ defmodule SymphonyElixir.DeterministicMergeSystemBoundaryTest do
     refute File.exists?(marker)
   end
 
+  test "a readiness command supplied by the target is available only after the model-free target update" do
+    worktree = temporary_directory("target-readiness-worktree")
+    initialize_repository(worktree)
+    File.write!(Path.join(worktree, "base.txt"), "base\n")
+    commit!(worktree, "base")
+    feature_head = git!(worktree, ["rev-parse", "HEAD"])
+    git!(worktree, ["checkout", "-b", "feature"])
+    git!(worktree, ["checkout", "main"])
+
+    readiness = Path.join(worktree, "target-readiness.sh")
+    File.write!(readiness, "#!/bin/sh\nset -eu\nprintf target-ready\n")
+    File.chmod!(readiness, 0o755)
+    commit!(worktree, "supply readiness from target")
+    target_head = git!(worktree, ["rev-parse", "HEAD"])
+    git!(worktree, ["checkout", "feature"])
+
+    task = task_fixture(feature_head)
+
+    context = %{
+      worktree: worktree,
+      worker_host: nil,
+      target_head: target_head,
+      readiness_command: "./target-readiness.sh"
+    }
+
+    refute File.exists?(readiness)
+    assert {:ok, false} = SystemBoundary.call(:target_ancestor, task, context)
+    assert {:ok, updated_head} = SystemBoundary.call(:merge_target, task, context)
+    refute updated_head == feature_head
+    assert File.exists?(readiness)
+    assert {:ok, "target-ready"} = SystemBoundary.call(:readiness, task, context)
+  end
+
   test "guarded squash sends the reviewed head as a literal gh argument", %{fake_gh_root: fake_root} do
     {worktree, head} = linear_repository()
     merge_sha = String.duplicate("d", 40)
