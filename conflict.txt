@@ -1,1 +1,1 @@
-task version
+resolved version
