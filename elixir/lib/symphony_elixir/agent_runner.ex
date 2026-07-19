@@ -22,10 +22,14 @@ defmodule SymphonyElixir.AgentRunner do
          worker_host <- run["worker_host"],
          {:ok, worktree} <- Worktree.ensure(task, worker_host),
          :ok <- Worktree.run_hook(:before_run, task, worktree, worker_host),
-         :ok <- ensure_workpad(task, run, opts) do
-      result = run_session(task, run, worktree, worker_host, recipient, opts)
+         :ok <- reconcile_source(task.id, run["id"], worktree, worker_host),
+         {:ok, current_task} <- Board.task(task.id),
+         {:ok, current_run} <- Board.run(run["id"]),
+         :ok <- validate_scope(current_task, current_run),
+         :ok <- ensure_workpad(current_task, current_run, opts) do
+      result = run_session(current_task, current_run, worktree, worker_host, recipient, opts)
 
-      case Worktree.run_hook(:after_run, task, worktree, worker_host) do
+      case Worktree.run_hook(:after_run, current_task, worktree, worker_host) do
         :ok -> result
         {:error, reason} -> {:error, reason}
       end

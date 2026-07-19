@@ -80,7 +80,7 @@ defmodule SymphonyElixir.DeterministicMerge do
 
   defp route_open_snapshot(task, bundle, context, boundary, opts) do
     case review_gate(task, context) do
-      :ready -> run_project_readiness(task, bundle, context, boundary, opts)
+      :ready -> fetch_target(task, bundle, context, boundary, opts)
       {:review, reason} -> require_review(task, reason, opts)
     end
   end
@@ -105,11 +105,20 @@ defmodule SymphonyElixir.DeterministicMerge do
   end
 
   defp run_project_readiness(task, bundle, context, boundary, opts) do
-    case boundary.(:readiness, task, context) do
-      {:ok, _evidence} -> revalidate_after_readiness(task, bundle, context, boundary, opts)
-      {:error, {:readiness_failed, _status, _output} = reason} -> require_review(task, inspect(reason), opts)
-      {:error, {:invariant, _reason} = reason} -> block(task, {:readiness_process_failed, reason}, opts)
-      {:error, _reason} -> {:ok, :pending}
+    readiness_context = Map.put(context, :readiness_target_head, context.target_head)
+
+    case boundary.(:readiness, task, readiness_context) do
+      {:ok, _evidence} ->
+        revalidate_after_readiness(task, bundle, readiness_context, boundary, opts)
+
+      {:error, {:readiness_failed, _status, _output} = reason} ->
+        require_review(task, inspect(reason), opts)
+
+      {:error, {:invariant, _reason} = reason} ->
+        block(task, {:readiness_process_failed, reason}, opts)
+
+      {:error, _reason} ->
+        {:ok, :pending}
     end
   end
 
@@ -136,8 +145,17 @@ defmodule SymphonyElixir.DeterministicMerge do
     case snapshot_state(snapshot) do
       :open ->
         case review_gate(task, context) do
-          :ready -> fetch_target(task, bundle, context, boundary, opts)
-          {:review, reason} -> require_review(task, reason, opts)
+          :ready ->
+            fetch_target(
+              task,
+              bundle,
+              Map.put(context, :readiness_completed, true),
+              boundary,
+              opts
+            )
+
+          {:review, reason} ->
+            require_review(task, reason, opts)
         end
 
       :merged ->
@@ -167,11 +185,23 @@ defmodule SymphonyElixir.DeterministicMerge do
 
   defp compare_target(task, bundle, context, boundary, opts) do
     case boundary.(:target_ancestor, task, context) do
-      {:ok, true} -> begin_squash(task, bundle, context, boundary, opts)
+      {:ok, true} -> route_current_target(task, bundle, context, boundary, opts)
       {:ok, false} -> begin_clean_update(task, bundle, context, boundary, opts)
       {:error, {:transient, _reason}} -> {:ok, :pending}
       {:error, reason} -> block(task, {:target_comparison_failed, reason}, opts)
     end
+  end
+
+  defp route_current_target(task, bundle, %{readiness_completed: true} = context, boundary, opts) do
+    if context.target_head == context.readiness_target_head do
+      begin_squash(task, bundle, context, boundary, opts)
+    else
+      require_review(task, "target branch changed during readiness; exact-head review required", opts)
+    end
+  end
+
+  defp route_current_target(task, bundle, context, boundary, opts) do
+    run_project_readiness(task, bundle, context, boundary, opts)
   end
 
   defp begin_clean_update(task, bundle, context, boundary, opts) do

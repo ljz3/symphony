@@ -341,7 +341,11 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 
 - Require a GitHub source remote and working `gh` authentication before new dispatch.
 - Create the task branch/worktree from the latest remote default branch on first dispatch.
-- Reconcile worktree HEAD during runs and after turns/tool calls.
+- Before an initial workpad is created or any Codex process starts, refresh the configured remote
+  default-branch ref for a reused local worktree, reconcile the actual worktree HEAD, base SHA, and
+  cleanliness into canonical task state, then reload the task and run used for workpad and prompt
+  rendering. Reconciliation failure starts no Codex session and fails the claimed run explicitly.
+  Continue reconciling worktree HEAD during runs and after turns/tool calls.
 - After the first meaningful committed diff from the remote default branch, push the branch and create a draft PR with a deterministic task-derived draft body. Documentation, product-specification, configuration, and tooling-only committed diffs qualify; a zero-diff branch does not.
 - Put a hidden creator-run marker in each newly created PR and retain that association on the run. An existing PR without the marker is pre-existing and has no creator run.
 - Store branch, base/head SHAs, PR number/URL, and merge SHA as canonical board events.
@@ -363,16 +367,21 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
   all require `draft: false`. A draft PR or valid failed/pending check payload returns to review;
   provider transport, authentication, or process failure leaves the task merge-pending for
   reconciliation.
+- After the initial exact review/provider gate, fetch the current remote default branch and compare it
+  with the reviewed task head before project readiness. If the task branch is behind, commit and push
+  a normal merge of the target into the task branch, then invalidate the attestation and require
+  exact-head review again. Verify and route a real conflict before readiness as well. Never rebase or
+  rewrite history.
 - Run the configured merge-readiness command to natural process exit without an elapsed-time,
-  inactivity, or output deadline. Fetch the current remote default branch and compare it with the
-  reviewed task head. If the task branch is behind, commit and push a normal merge of the target into
-  the task branch, then invalidate the attestation and require exact-head review again. Never rebase
-  or rewrite history.
-- After readiness exits, reload the canonical task and re-observe the clean local source plus the
-  provider PR identity, head, approval, threads, checks, and fingerprints before continuing. Repeat
-  that observation immediately before either clean-update push or guarded squash; any attested
-  criteria/evidence, linked PR identity, local source, or provider-state change returns to review or
-  blocks on an unsafe invariant.
+  inactivity, or output deadline only after a freshly reviewed head contains the fetched target.
+  After readiness exits, reload the canonical task, re-observe the clean local source and provider PR
+  identity/head/approval/threads/checks/fingerprints, fetch the target again, and compare it again.
+  Target movement synchronizes through the normal clean-update/conflict path and returns to exact-head
+  review; even a changed target already contained by the task head invalidates the attestation instead
+  of squashing under readiness evidence for another target. Repeat the source/provider observation
+  immediately before either clean-update push or guarded squash; any attested criteria/evidence,
+  linked PR identity, local source, or provider-state change returns to review or blocks on an unsafe
+  invariant.
 - Before the external clean-update push and guarded squash merge, record a canonical checkpoint.
   Recovery observes both local Git and the actual remote PR head and resumes the same effect rather
   than repeating a completed one; an already-updated remote head invalidates review without another

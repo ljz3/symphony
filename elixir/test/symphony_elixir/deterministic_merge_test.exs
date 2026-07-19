@@ -11,6 +11,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   @target String.duplicate("b", 40)
   @updated String.duplicate("c", 40)
   @merge String.duplicate("d", 40)
+  @moved_target String.duplicate("e", 40)
 
   setup do
     task = merge_task()
@@ -40,6 +41,9 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert get_in(completed.github, ["merged", "merge_reachable"]) == true
     assert count_call(:guarded_squash) == 1
     assert count_call(:merge_target) == 0
+    assert count_call(:readiness) == 1
+    assert first_call_index(:fetch_target) < first_call_index(:readiness)
+    assert first_call_index(:target_ancestor) < first_call_index(:readiness)
   end
 
   test "clean target update pushes once, invalidates review, and returns to automated review", %{
@@ -57,6 +61,84 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert count_call(:merge_target) == 1
     assert count_call(:push_head) == 1
     assert count_call(:guarded_squash) == 0
+    assert count_call(:readiness) == 0
+    assert first_call_index(:target_ancestor) < first_call_index(:merge_target)
+  end
+
+  test "a target-provided readiness command runs only after the updated head receives a fresh review", %{
+    task: task,
+    bundle: bundle
+  } do
+    scenario(%{target_ancestor: false, merge_target: {:ok, @updated}})
+
+    assert {:ok, :review_required} = run(task, bundle)
+    assert count_call(:readiness) == 0
+
+    updated = current_task()
+
+    reviewed = %{
+      updated
+      | column_id: "merging",
+        revision: updated.revision + 1,
+        merge_saga: nil,
+        review_attestation:
+          task.review_attestation
+          |> Map.put("reviewed_head_sha", @updated)
+    }
+
+    reset(reviewed)
+
+    scenario(%{
+      source_head: @updated,
+      snapshot: %{head_sha: @updated, source_head_sha: @updated},
+      readiness: fn ->
+        assert current_task().review_attestation["reviewed_head_sha"] == @updated
+        {:ok, "target-provided readiness command available"}
+      end
+    })
+
+    assert {:ok, :completed} = run(reviewed, bundle)
+    assert count_call(:readiness) == 1
+    assert first_call_index(:fetch_target) < first_call_index(:readiness)
+  end
+
+  test "target movement during readiness synchronizes and requires another exact-head review", %{
+    task: task,
+    bundle: bundle
+  } do
+    scenario(%{
+      readiness: fn ->
+        scenario(%{
+          fetch_target: @moved_target,
+          target_ancestor: false,
+          merge_target: {:ok, @updated}
+        })
+
+        {:ok, "ready against original target"}
+      end
+    })
+
+    assert {:ok, :review_required} = run(task, bundle)
+    assert current_task().source["head_sha"] == @updated
+    assert count_call(:fetch_target) == 2
+    assert count_call(:target_ancestor) == 2
+    assert count_call(:readiness) == 1
+    assert count_call(:merge_target) == 1
+    assert count_call(:guarded_squash) == 0
+
+    reset(task)
+
+    scenario(%{
+      readiness: fn ->
+        scenario(%{fetch_target: @moved_target, target_ancestor: true})
+        {:ok, "ready against original target"}
+      end
+    })
+
+    assert {:ok, :review_required} = run(task, bundle)
+    assert count_call(:readiness) == 1
+    assert count_call(:merge_target) == 0
+    assert count_call(:guarded_squash) == 0
   end
 
   test "only a verified git conflict reaches conflict dispatch and the same head pair then blocks", %{
@@ -70,6 +152,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert conflicted.column_id == "merge_conflict"
     assert get_in(conflicted.merge_saga, ["last_conflict", "conflicted_paths"]) == ["a.swift", "z.swift"]
     assert is_nil(conflicted.review_attestation)
+    assert count_call(:readiness) == 0
 
     repeated = %{
       conflicted
@@ -481,15 +564,15 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     end
 
     cases = [
-      {third_snapshot({:error, {:transient, :snapshot_busy}}), {:ok, :pending}, "merging"},
-      {third_snapshot({:error, :pull_request_not_linked}), {:ok, :review_required}, "automated_review"},
-      {third_snapshot({:error, :worktree_not_clean}), {:ok, :blocked}, "blocked"},
-      {third_snapshot(fresh_updated.(%{head_sha: @updated})), {:ok, :review_required}, "automated_review"},
-      {third_snapshot(fresh_updated.(%{draft: true})), {:ok, :review_required}, "automated_review"},
-      {third_snapshot(fresh_updated.(%{head_sha: @merge})), {:ok, :review_required}, "automated_review"},
-      {third_snapshot(fresh_updated.(%{head_sha: "invalid"})), {:ok, :blocked}, "blocked"},
-      {third_snapshot(fresh_updated.(%{state: "CLOSED"})), {:ok, :blocked}, "blocked"},
-      {third_snapshot(fresh_updated.(%{number: 8})), {:ok, :review_required}, "automated_review"}
+      {second_snapshot({:error, {:transient, :snapshot_busy}}), {:ok, :pending}, "merging"},
+      {second_snapshot({:error, :pull_request_not_linked}), {:ok, :review_required}, "automated_review"},
+      {second_snapshot({:error, :worktree_not_clean}), {:ok, :blocked}, "blocked"},
+      {second_snapshot(fresh_updated.(%{head_sha: @updated})), {:ok, :review_required}, "automated_review"},
+      {second_snapshot(fresh_updated.(%{draft: true})), {:ok, :review_required}, "automated_review"},
+      {second_snapshot(fresh_updated.(%{head_sha: @merge})), {:ok, :review_required}, "automated_review"},
+      {second_snapshot(fresh_updated.(%{head_sha: "invalid"})), {:ok, :blocked}, "blocked"},
+      {second_snapshot(fresh_updated.(%{state: "CLOSED"})), {:ok, :blocked}, "blocked"},
+      {second_snapshot(fresh_updated.(%{number: 8})), {:ok, :review_required}, "automated_review"}
     ]
 
     Enum.each(cases, fn {review_snapshot, expected, column} ->
@@ -543,7 +626,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     task_loader = fn ->
       current = current_task()
 
-      if count_call(:target_ancestor) == 1,
+      if count_call(:target_ancestor) == 2,
         do: {:ok, %{current | column_id: "automated_review", review_attestation: nil}},
         else: {:ok, current}
     end
@@ -949,6 +1032,11 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   end
 
   defp count_call(operation), do: Enum.count(Process.get(:merge_fake_calls, []), &(&1 == operation))
+
+  defp first_call_index(operation) do
+    Enum.find_index(Process.get(:merge_fake_calls, []), &(&1 == operation))
+  end
+
   defp scenario(values), do: Process.put(:merge_scenario, values)
 
   defp change_after_readiness(values) do
@@ -961,6 +1049,14 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   defp third_snapshot(result) do
     fn ->
       if count_call(:review_snapshot) == 3,
+        do: result,
+        else: {:ok, snapshot(%{})}
+    end
+  end
+
+  defp second_snapshot(result) do
+    fn ->
+      if count_call(:review_snapshot) == 2,
         do: result,
         else: {:ok, snapshot(%{})}
     end

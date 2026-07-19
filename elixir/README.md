@@ -264,8 +264,13 @@ dispatch preflight is configured, it creates or reuses the managed worktree and 
 there while the task remains queued and no run exists. A successful command is usable only if a
 fresh read confirms the same task revision, eligibility, workflow hash, and worker reservation;
 otherwise Symphony discards it and probes current state again. Symphony then atomically records the
-run, runs configured hooks, validates the exact model against Codex's complete catalog, renders the
-stage prompt/workpad, and starts app-server in that worktree. The prompt order is fixed:
+run, runs configured hooks, and validates the exact model against Codex's complete catalog. Before
+rendering an initial workpad or starting app-server, Symphony refreshes the configured remote
+default-branch ref for a reused local worktree and reconciles the actual branch HEAD, base SHA, and
+cleanliness into canonical state. It then reloads the task and run, validates their scope, renders
+the stage prompt/workpad from that current state, and starts app-server in the worktree. A
+reconciliation failure starts no Codex process and explicitly fails the claimed run. The prompt
+order is fixed:
 
 1. Symphony's runner safety contract
 2. workflow base prompt
@@ -362,21 +367,23 @@ and sends merge-pending work back to review.
 
 The orchestrator runs at most one deterministic merge worker separately from normal AgentRunner
 capacity; no model or run is claimed for Merging. The worker revalidates the exact reviewed state,
-runs the configured readiness command to natural exit without a deadline, fetches the remote default
-branch, and then either:
+fetches and compares the remote default branch, and then either:
 
-- performs a guarded `gh pr merge --squash --match-head-commit <reviewed-head>` when the task branch
-  contains the current target;
 - commits and pushes a normal target-branch merge, invalidates the attestation, and requires review
   of the new exact head; or
 - verifies a real Git conflict, collects the complete sorted unmerged-path set, aborts the probe,
   and records the conflict before dispatching the Merge Conflict agent.
 
-After readiness exits, and again immediately before a clean-update push or guarded squash, the
-worker reloads canonical task state and re-observes the clean local source and provider PR state,
-including `draft: false`. The initial, post-readiness, clean-update, and guarded-squash gates all
-require the PR to remain non-draft; a draft flip returns the task to Automated Review without a
-push or squash.
+Only when the exact reviewed head already contains the fetched target does the worker run the
+configured readiness command to natural exit without a deadline. After readiness exits it reloads
+canonical task state, re-observes the clean local source and provider PR state (including
+`draft: false`), fetches the target again, and compares it again. An advanced target uses the same
+model-free update or verified-conflict path and returns to Automated Review; a changed target already
+contained by the task branch still invalidates the attestation instead of reusing readiness evidence
+for a different target. A still-current target proceeds to guarded
+`gh pr merge --squash --match-head-commit <reviewed-head>`. The initial, post-readiness,
+clean-update, and guarded-squash gates all require the PR to remain non-draft; a draft flip returns
+the task to Automated Review without a push or squash.
 
 External effects have canonical checkpoints before the clean-update push and guarded squash, so a
 restart inspects local Git plus the actual remote PR head and resumes instead of repeating them; an
