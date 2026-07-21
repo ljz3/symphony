@@ -593,6 +593,29 @@ defmodule SymphonyElixir.BoardTest do
                )
     end
 
+    test "rejects a plain human MoveTask from Human Review to Rework" do
+      {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback bypass")})
+      human_review = BoardFactory.advance_to_human_review(created)
+
+      assert {:error, :feedback_required} =
+               Board.execute(%Commands.MoveTask{task_id: human_review["id"], column_id: "rework"},
+                 actor: :human,
+                 expected_revision: human_review["revision"],
+                 idempotency_key: BoardFactory.unique("bypass")
+               )
+
+      # System force moves remain available as a recovery escape hatch.
+      assert {:ok, %{"task" => forced}} =
+               Board.execute(%Commands.MoveTask{task_id: human_review["id"], column_id: "rework", force: true},
+                 actor: :system,
+                 expected_revision: human_review["revision"],
+                 idempotency_key: BoardFactory.unique("force-bypass")
+               )
+
+      assert forced["column_id"] == "rework"
+      assert forced["metadata"]["human_feedback_pending"] == nil
+    end
+
     test "pending feedback survives failed and blocked rework and is consumed by a successful one" do
       {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback lifecycle")})
       human_review = BoardFactory.advance_to_human_review(created)

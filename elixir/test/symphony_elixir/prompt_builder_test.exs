@@ -314,7 +314,15 @@ defmodule SymphonyElixir.PromptBuilderTest do
   test "rework prompt renders cleanly without pending human feedback" do
     {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("No feedback rework")})
     human_review = BoardFactory.advance_to_human_review(created)
-    {rework, _result} = BoardFactory.move(human_review, "rework")
+
+    # Rework can legitimately lack human feedback (agent-routed or
+    # system-forced moves); the prompt must render safely regardless.
+    assert {:ok, %{"task" => rework}} =
+             Board.execute(%Commands.MoveTask{task_id: human_review["id"], column_id: "rework", force: true},
+               actor: :system,
+               expected_revision: human_review["revision"],
+               idempotency_key: BoardFactory.unique("force-rework")
+             )
 
     assert {:ok, %{"task" => claimed, "run" => run}} = claim_task(rework)
 

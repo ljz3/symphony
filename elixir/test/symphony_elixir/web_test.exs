@@ -287,6 +287,21 @@ defmodule SymphonyElixirWebTest do
     assert after_drop.column_id == "human_review"
   end
 
+  test "a forged transition event to Rework is rejected without feedback" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Forged rework")})
+    human_review = BoardFactory.advance_to_human_review(created)
+
+    {:ok, view, _html} = live(build_conn(), "/tasks/#{human_review["identifier"]}")
+
+    render_hook(view, "transition", %{"column_id" => "rework"})
+
+    {:ok, unchanged} = Board.task(human_review["id"])
+    assert unchanged.column_id == "human_review"
+    assert unchanged.metadata["human_feedback_pending"] == nil
+    assert has_element?(view, "span.state-human_review")
+    assert has_element?(view, ~s(form[phx-submit="submit_feedback"]))
+  end
+
   test "HTTP startup rejects non-loopback bind addresses" do
     assert {:error, {:non_loopback_http_host, "0.0.0.0"}} =
              HttpServer.start_link(host: "0.0.0.0", port: 0)

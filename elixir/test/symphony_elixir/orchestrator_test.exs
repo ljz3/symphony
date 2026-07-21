@@ -1139,8 +1139,19 @@ defmodule SymphonyElixir.OrchestratorTest do
 
   defp canonical_rework_task(label) do
     human_review = canonical_human_review_task(label)
-    {rework, _result} = BoardFactory.move(human_review, "rework")
-    Task.from_map(rework)
+    Task.from_map(submit_canonical_feedback(human_review))
+  end
+
+  defp submit_canonical_feedback(human_review) do
+    assert {:ok, %{"task" => rework}} =
+             Board.execute(
+               %Commands.SubmitFeedback{task_id: human_review["id"], feedback: "Address the review findings"},
+               actor: %{type: :human, identity: "board-ui"},
+               expected_revision: human_review["revision"],
+               idempotency_key: BoardFactory.unique("canonical-feedback")
+             )
+
+    rework
   end
 
   defp canonical_human_review_task(label) do
@@ -1228,8 +1239,7 @@ defmodule SymphonyElixir.OrchestratorTest do
              )
 
     human_review = record_ready_and_move_to_human(review, review_run)
-    {rework, _result} = BoardFactory.move(human_review, "rework")
-    Task.from_map(rework)
+    Task.from_map(submit_canonical_feedback(human_review))
   end
 
   defp record_ready_and_move_to_human(task, run) do

@@ -432,6 +432,9 @@ defmodule SymphonyElixirWeb.TaskLive do
     end
   end
 
+  defp format_error(:feedback_required),
+    do: "Review feedback is required before Rework — use the feedback box below."
+
   defp format_error(reason), do: "Board command rejected: #{inspect(reason)}"
   defp schedule_runtime_tick, do: Process.send_after(self(), :metrics_tick, @runtime_tick_ms)
 end

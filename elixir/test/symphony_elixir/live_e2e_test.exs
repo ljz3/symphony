@@ -63,7 +63,13 @@ defmodule SymphonyElixir.LiveE2ETest do
     assert comment_count(fixture.gh_state) == 1
     refute File.exists?(Path.join(fixture.gh_state, "draft"))
 
-    {rework_pending, _result} = BoardFactory.move(Task.to_map(first_human_review), "rework")
+    assert {:ok, %{"task" => rework_pending}} =
+             Board.execute(
+               %Commands.SubmitFeedback{task_id: first_human_review.id, feedback: "Address the live review findings"},
+               actor: %{type: :human, identity: "board-ui"},
+               expected_revision: first_human_review.revision,
+               idempotency_key: BoardFactory.unique("live-feedback")
+             )
 
     eventually(fn ->
       File.regular?(Path.join(fixture.gh_state, "draft")) and

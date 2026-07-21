@@ -409,8 +409,9 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 - Include a hidden per-run stats marker and record successful publication as an idempotent canonical run event with destination, publication ID, and timestamp. GitHub failures stay in external-effect reconciliation and never retry or alter the agent run.
 - Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, project canonical `draft: false`, then complete the board transition through a resumable saga.
 - Human Review → Rework converts the PR back to draft and projects canonical `draft: true`. The board
-  UI routes this edge exclusively through the required-feedback `SubmitFeedback` command, which
-  commits the atomic feedback-and-transition event before any external effect; the durable
+  accepts this human edge only through the required-feedback `SubmitFeedback` command — a plain human
+  `MoveTask` on it is rejected — which commits the atomic feedback-and-transition event before any
+  external effect; the durable
   rework-draft saga then performs the draft conversion and gates dispatch until it is recorded. After
   rework returns to Automated Review, a still-draft PR routes through Human Review again. The
   configured human edge from Human Review to Automated Review starts a fresh review of the ready PR;

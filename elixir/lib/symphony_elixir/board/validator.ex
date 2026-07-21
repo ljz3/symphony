@@ -555,7 +555,8 @@ defmodule SymphonyElixir.Board.Validator do
   end
 
   defp move_task(task, target, command, actor, bundle) do
-    with :ok <- check_transition(task, target, command.force, actor, bundle) do
+    with :ok <- feedback_move_allowed(task, target, actor),
+         :ok <- check_transition(task, target, command.force, actor, bundle) do
       cond do
         active?(task) and actor.type == :human and not command.force ->
           task = bump(task, %{desired_column_id: target.id, runtime_state: "stopping"})
@@ -574,6 +575,14 @@ defmodule SymphonyElixir.Board.Validator do
       end
     end
   end
+
+  # The Human Review → Rework human edge requires feedback: humans must use
+  # SubmitFeedback. A plain MoveTask on that edge is rejected regardless of
+  # client-side UI guards; system moves retain the recovery escape hatch.
+  defp feedback_move_allowed(%{column_id: @human_review_column_id}, %{id: @rework_column_id}, %{type: :human}),
+    do: {:error, :feedback_required}
+
+  defp feedback_move_allowed(_task, _target, _actor), do: :ok
 
   defp check_transition(task, target, force, actor, bundle) do
     with false <- Task.archived?(task),
