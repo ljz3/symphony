@@ -27,7 +27,7 @@ defmodule SymphonyElixir.DynamicToolTest do
     assert context["task"]["id"] == claimed["id"]
 
     assert Map.keys(context) |> Enum.sort() ==
-             ~w(allowed_transitions criteria dependencies github run source task)
+             ~w(allowed_transitions criteria dependencies github human_feedback run source task)
 
     refute context_json =~ "frozen_bundle"
     refute context_json =~ "evidence_history"

@@ -16,8 +16,7 @@ defmodule SymphonyElixir.Board.WorkflowReloadPolicy do
   @spec incompatible_tasks([Task.t()], Bundle.t()) :: [Task.t()]
   def incompatible_tasks(tasks, current) when is_list(tasks) do
     tasks
-    |> Enum.reject(&runtime_active?/1)
-    |> Enum.reject(fn task -> protected_column?(task, current) end)
+    |> Enum.reject(fn task -> runtime_active?(task) or protected_column?(task, current) end)
     |> Enum.filter(fn task -> incompatible_selections?(task, current) end)
   end
 

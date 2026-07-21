@@ -141,8 +141,14 @@ With Human Review, Rework, Merge Conflict, Blocked, and Cancelled branches.
 - `Automated Review`: separately prompted review stage. A draft or otherwise non-ready PR routes to
   Human Review without recording a structured verdict.
 - `Human Review`: pause; entering publishes workpads and marks the draft PR ready. A human may return
-  the ready PR to Automated Review for the fresh review required before a pass.
-- `Rework`: separately prompted rework stage, returning to Automated Review.
+  the ready PR to Automated Review for the fresh review required before a pass, or submit required
+  review feedback that atomically records a canonical `human_feedback_submitted` event and moves the
+  task to Rework.
+- `Rework`: separately prompted rework stage, returning to Automated Review. The stage prompt renders
+  exactly the human feedback pending for the current review cycle. Submissions accumulate in task
+  metadata until a rework run finishes outside Blocked, which consumes them; failed, blocked, or
+  stopped rework retains them. The full submission history stays canonical in
+  `human_feedback_submitted` events.
 - `Merge Conflict`: separately prompted repair stage entered only after the system verifies and records
   a real Git conflict; it returns only to Automated Review or Blocked.
 - `Merging`: system-owned deterministic merge column when a merge policy is configured.
@@ -402,7 +408,10 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 - After termination, append the creator run's compact status/model/effort/runtime/turn/token block to the PR body. Append every other run's block to the existing comment identified by its workpad publication marker, reconciling comments posted before final stats exist. Never create a stats-only comment, never copy a creator run into a workpad comment, and never expose Codex thread IDs or pricing estimates.
 - Include a hidden per-run stats marker and record successful publication as an idempotent canonical run event with destination, publication ID, and timestamp. GitHub failures stay in external-effect reconciliation and never retry or alter the agent run.
 - Entering the unique `mark_pr_ready` column requires a clean worktree, pushed matching PR head, completed/evidenced criteria, no requested-changes review, no unresolved review threads, and green required checks; the GitHub CLI's exact no-required-checks diagnostic is an empty green set, while listed failed/pending checks, malformed output, and genuine CLI failures remain blocking. Publish workpads, mark ready, project canonical `draft: false`, then complete the board transition through a resumable saga.
-- Human Review → Rework converts the PR back to draft and projects canonical `draft: true`. After
+- Human Review → Rework converts the PR back to draft and projects canonical `draft: true`. The board
+  UI routes this edge exclusively through the required-feedback `SubmitFeedback` command, which
+  commits the atomic feedback-and-transition event before any external effect; the durable
+  rework-draft saga then performs the draft conversion and gates dispatch until it is recorded. After
   rework returns to Automated Review, a still-draft PR routes through Human Review again. The
   configured human edge from Human Review to Automated Review starts a fresh review of the ready PR;
   readiness alone cannot reuse or create a passing attestation.

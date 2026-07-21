@@ -300,6 +300,10 @@ defmodule SymphonyElixirWeb.BoardLive do
      }}
   end
 
+  defp move_or_reorder(%{column_id: "human_review"}, %{"column_id" => "rework"}) do
+    {:error, :review_feedback_required}
+  end
+
   defp move_or_reorder(task, %{"column_id" => column_id}) when is_binary(column_id) do
     {:ok, %Commands.MoveTask{task_id: task.id, column_id: column_id}}
   end
@@ -344,6 +348,9 @@ defmodule SymphonyElixirWeb.BoardLive do
       _ -> {:error, :invalid_revision}
     end
   end
+
+  defp format_error(:review_feedback_required),
+    do: "Review feedback is required before Rework — open the task and use the feedback box."
 
   defp format_error(reason), do: "Board command rejected: #{inspect(reason)}"
 

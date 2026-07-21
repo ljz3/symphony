@@ -327,6 +327,68 @@ defmodule SymphonyElixir.OrchestratorTest do
     assert get_in(claimed.github, ["rework_draft", "completed"]) == true
   end
 
+  test "feedback-submitted rework stays gated until the draft saga reconciles" do
+    parent = self()
+    human_review = canonical_human_review_task("Feedback gate")
+
+    assert {:ok, %{"task" => rework}} =
+             Board.execute(
+               %Commands.SubmitFeedback{task_id: human_review["id"], feedback: "Address the review note"},
+               actor: %{type: :human, identity: "board-ui"},
+               expected_revision: human_review["revision"],
+               idempotency_key: BoardFactory.unique("feedback-gate")
+             )
+
+    pending_id = rework["id"]
+    runs_before = Board.runs(pending_id)
+
+    on_exit(fn -> cleanup_test_task(pending_id) end)
+
+    recorder = fn task, kind, attrs ->
+      if task.id == pending_id do
+        send(parent, {:feedback_recorded, task.id})
+        record_github_outcome(task, kind, attrs)
+      else
+        {:error, :not_targeted}
+      end
+    end
+
+    # Dispatch is gated while the draft conversion keeps failing: the feedback
+    # event is already canonical and no run starts.
+    failing_state =
+      rework_dispatch_state(parent,
+        task_filter: &(&1.id == pending_id),
+        rework_drafter: fn _task -> {:error, :provider_unavailable} end,
+        github_outcome_recorder: recorder
+      )
+
+    assert {:noreply, _next} = Orchestrator.handle_info(:reconcile, failing_state)
+    refute_receive {:agent_runner_called, ^pending_id, _run_id}
+    assert Board.runs(pending_id) == runs_before
+
+    # Once the saga reconciles, the task dispatches with the feedback pending.
+    state =
+      rework_dispatch_state(parent,
+        task_filter: &(&1.id == pending_id),
+        rework_drafter: fn task ->
+          if task.id == pending_id, do: send(parent, {:feedback_drafted, task.id})
+          :ok
+        end,
+        github_outcome_recorder: recorder
+      )
+
+    assert {:noreply, _next} = Orchestrator.handle_info(:reconcile, state)
+    assert_receive {:feedback_drafted, ^pending_id}
+    assert_receive {:feedback_recorded, ^pending_id}
+    assert_receive {:agent_runner_called, ^pending_id, run_id}
+
+    assert {:ok, claimed} = Board.task(pending_id)
+    assert claimed.active_run_id == run_id
+    assert claimed.github["draft"] == true
+    assert get_in(claimed.github, ["rework_draft", "completed"]) == true
+    assert [%{"text" => "Address the review note"}] = claimed.metadata["human_feedback_pending"]
+  end
+
   test "successful reconciliation claims the bumped revision in each ready and rework cycle" do
     parent = self()
     first_rework = canonical_rework_task("Two cycles")
@@ -1076,6 +1138,12 @@ defmodule SymphonyElixir.OrchestratorTest do
   end
 
   defp canonical_rework_task(label) do
+    human_review = canonical_human_review_task(label)
+    {rework, _result} = BoardFactory.move(human_review, "rework")
+    Task.from_map(rework)
+  end
+
+  defp canonical_human_review_task(label) do
     {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique(label)})
     {todo, _result} = BoardFactory.move(created, "todo")
 
@@ -1139,9 +1207,7 @@ defmodule SymphonyElixir.OrchestratorTest do
                idempotency_key: BoardFactory.unique("rework-review-claim")
              )
 
-    human_review = record_ready_and_move_to_human(review, review_run)
-    {rework, _result} = BoardFactory.move(human_review, "rework")
-    Task.from_map(rework)
+    record_ready_and_move_to_human(review, review_run)
   end
 
   defp complete_rework_and_ready_again(task, rework_run_id) do

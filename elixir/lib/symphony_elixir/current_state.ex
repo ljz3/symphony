@@ -34,11 +34,17 @@ defmodule SymphonyElixir.CurrentState do
       "criteria" => Enum.map(task.acceptance_criteria, &criterion_projection/1),
       "dependencies" => dependency_projections(task.dependencies, workflow),
       "allowed_transitions" => allowed_transition_projections(task.column_id, workflow),
+      "human_feedback" => human_feedback_projection(task.metadata["human_feedback_pending"]),
       "preflight" => preflight_projection(task.id, opts),
       "job" => job_projection(run, opts)
     }
     |> reject_nil_values()
   end
+
+  defp human_feedback_projection(entries) when is_list(entries),
+    do: Enum.map(entries, &take_present(&1, ~w(text at actor)))
+
+  defp human_feedback_projection(_entries), do: []
 
   defp task_projection(task) do
     task

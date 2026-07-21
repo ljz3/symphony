@@ -174,6 +174,119 @@ defmodule SymphonyElixirWebTest do
     end)
   end
 
+  test "human review task page renders the feedback form without a Rework bypass button" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback form")})
+    human_review = BoardFactory.advance_to_human_review(created)
+
+    {:ok, view, _html} = live(build_conn(), "/tasks/#{human_review["identifier"]}")
+
+    assert has_element?(view, ~s(form[phx-submit="submit_feedback"]))
+    assert has_element?(view, ~s(button[phx-value-column_id="automated_review"]))
+    assert has_element?(view, ~s(button[phx-value-column_id="cancelled"]))
+    refute has_element?(view, ~s(button[phx-value-column_id="rework"]))
+
+    {backlog, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("No feedback form")})
+    {:ok, backlog_view, _html} = live(build_conn(), "/tasks/#{backlog["identifier"]}")
+    refute has_element?(backlog_view, ~s(form[phx-submit="submit_feedback"]))
+  end
+
+  test "submitting review feedback moves to Rework and multiline history renders on return" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback submit")})
+    human_review = BoardFactory.advance_to_human_review(created)
+
+    {:ok, view, _html} = live(build_conn(), "/tasks/#{human_review["identifier"]}")
+
+    view
+    |> form(~s(form[phx-submit="submit_feedback"]), %{feedback: "line one\nline two"})
+    |> render_submit()
+
+    assert has_element?(view, "span.state-rework")
+    refute has_element?(view, ~s(form[phx-submit="submit_feedback"]))
+
+    {:ok, rework} = Board.task(human_review["id"])
+    assert rework.column_id == "rework"
+    assert [%{"text" => "line one\nline two"}] = rework.metadata["human_feedback_pending"]
+
+    # Complete the rework and return through a second review cycle.
+    {:ok, %{"task" => claimed, "run" => run}} =
+      Board.execute(%Commands.ClaimRun{task_id: rework.id},
+        actor: :system,
+        expected_revision: rework.revision,
+        idempotency_key: BoardFactory.unique("web-feedback-claim")
+      )
+
+    {:ok, %{"task" => reviewed}} =
+      Board.execute(%Commands.MoveTask{task_id: claimed["id"], column_id: "automated_review"},
+        actor: %{type: :agent, identity: run["id"]},
+        expected_revision: claimed["revision"],
+        idempotency_key: BoardFactory.unique("web-feedback-review")
+      )
+
+    {:ok, %{"task" => finished}} =
+      Board.execute(
+        %Commands.RunFinished{task_id: reviewed["id"], run_id: run["id"], outcome: %{}, stats: nil},
+        actor: :system,
+        expected_revision: reviewed["revision"],
+        idempotency_key: BoardFactory.unique("web-feedback-finish")
+      )
+
+    {:ok, %{"task" => second_claim, "run" => second_run}} =
+      Board.execute(%Commands.ClaimRun{task_id: finished["id"]},
+        actor: :system,
+        expected_revision: finished["revision"],
+        idempotency_key: BoardFactory.unique("web-feedback-claim-two")
+      )
+
+    {:ok, %{"task" => second_review}} =
+      Board.execute(%Commands.MoveTask{task_id: second_claim["id"], column_id: "human_review"},
+        actor: %{type: :agent, identity: second_run["id"]},
+        expected_revision: second_claim["revision"],
+        idempotency_key: BoardFactory.unique("web-feedback-human-review")
+      )
+
+    {:ok, %{"task" => returned}} =
+      Board.execute(
+        %Commands.RunFinished{task_id: second_review["id"], run_id: second_run["id"], outcome: %{}, stats: nil},
+        actor: :system,
+        expected_revision: second_review["revision"],
+        idempotency_key: BoardFactory.unique("web-feedback-finish-two")
+      )
+
+    {:ok, returned_view, _html} = live(build_conn(), "/tasks/#{returned["identifier"]}")
+
+    assert has_element?(returned_view, ~s(form[phx-submit="submit_feedback"]))
+    assert has_element?(returned_view, ".feedback-entry pre")
+    assert render(returned_view) =~ "line one\nline two"
+  end
+
+  test "blank feedback and the board drop guard keep the task in Human Review" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback guard")})
+    human_review = BoardFactory.advance_to_human_review(created)
+
+    {:ok, detail, _html} = live(build_conn(), "/tasks/#{human_review["identifier"]}")
+
+    detail
+    |> form(~s(form[phx-submit="submit_feedback"]), %{feedback: "   "})
+    |> render_submit()
+
+    assert has_element?(detail, "span.state-human_review")
+
+    {:ok, still_review} = Board.task(human_review["id"])
+    assert still_review.column_id == "human_review"
+    assert still_review.metadata["human_feedback_pending"] == nil
+
+    {:ok, board, _html} = live(build_conn(), "/")
+
+    render_hook(board, "move_task", %{
+      "task_id" => human_review["id"],
+      "expected_revision" => still_review.revision,
+      "column_id" => "rework"
+    })
+
+    {:ok, after_drop} = Board.task(human_review["id"])
+    assert after_drop.column_id == "human_review"
+  end
+
   test "HTTP startup rejects non-loopback bind addresses" do
     assert {:error, {:non_loopback_http_host, "0.0.0.0"}} =
              HttpServer.start_link(host: "0.0.0.0", port: 0)

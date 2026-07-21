@@ -26,6 +26,13 @@ defmodule SymphonyElixir.Board.Commands do
           }
   end
 
+  defmodule SubmitFeedback do
+    @moduledoc "Record required human review feedback and atomically transition the task to Rework."
+    defstruct [:task_id, :feedback]
+
+    @type t :: %__MODULE__{task_id: String.t(), feedback: String.t()}
+  end
+
   defmodule ReorderTask do
     @moduledoc "Assign a task a sparse rank within its current column."
     defstruct [:task_id, :before_task_id, :after_task_id]
@@ -234,6 +241,7 @@ defmodule SymphonyElixir.Board.Commands do
           CreateTask.t()
           | UpdateTask.t()
           | MoveTask.t()
+          | SubmitFeedback.t()
           | ReorderTask.t()
           | ArchiveTask.t()
           | CompleteAcceptance.t()

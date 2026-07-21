@@ -68,7 +68,7 @@ defmodule SymphonyElixir.CurrentStateTest do
     encoded = Jason.encode!(projection)
 
     assert Map.keys(projection) |> Enum.sort() ==
-             ~w(allowed_transitions criteria dependencies github run source task)
+             ~w(allowed_transitions criteria dependencies github human_feedback run source task)
 
     assert Map.keys(projection["task"]) |> Enum.sort() ==
              ~w(branch brief column_id id identifier priority revision title type)
@@ -238,5 +238,29 @@ defmodule SymphonyElixir.CurrentStateTest do
       )
 
     refute Map.has_key?(projection, "preflight")
+  end
+
+  test "projects pending human feedback and defaults to an empty list" do
+    {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Human feedback")})
+    {:ok, %Task{} = task} = Board.task(created["id"])
+    run = %{"id" => "human-feedback-run", "stage_id" => "rework", "status" => "running"}
+
+    entry = %{
+      "text" => "Tighten the parser",
+      "at" => "2026-01-01T00:00:00Z",
+      "actor" => "board-ui",
+      "raw" => "must-not-leak"
+    }
+
+    with_feedback = %Task{task | metadata: %{"human_feedback_pending" => [entry]}}
+
+    assert CurrentState.project(with_feedback, run, Config.bundle!())["human_feedback"] == [
+             %{"text" => "Tighten the parser", "at" => "2026-01-01T00:00:00Z", "actor" => "board-ui"}
+           ]
+
+    assert CurrentState.project(task, run, Config.bundle!())["human_feedback"] == []
+
+    garbage = %Task{task | metadata: %{"human_feedback_pending" => "not-a-list"}}
+    assert CurrentState.project(garbage, run, Config.bundle!())["human_feedback"] == []
   end
 end
