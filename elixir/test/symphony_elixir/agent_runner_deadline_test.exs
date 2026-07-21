@@ -33,6 +33,7 @@ defmodule SymphonyElixir.AgentRunnerDeadlineTest do
     System.put_env("PATH", fake_bin <> ":" <> original_path)
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       System.put_env("PATH", original_path)

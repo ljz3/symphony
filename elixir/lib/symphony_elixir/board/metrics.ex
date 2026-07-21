@@ -130,6 +130,7 @@ defmodule SymphonyElixir.Board.Metrics do
       "task_title" => task && task.title,
       "status" => run["status"],
       "stage_id" => run["stage_id"],
+      "backend" => run["backend"] || "codex",
       "model" => run["model"],
       "effort" => run["effort"],
       "worker_host" => run["worker_host"],
@@ -199,14 +200,23 @@ defmodule SymphonyElixir.Board.Metrics do
 
   defp model_summaries(metrics, completed_task_ids) do
     metrics
-    |> Enum.group_by(&dimension_value(&1["model"]))
-    |> Enum.map(fn {model, model_metrics} ->
+    |> Enum.group_by(&{dimension_value(&1["backend"]), dimension_value(&1["model"])})
+    |> Enum.map(fn {{backend, model}, model_metrics} ->
       model_metrics
       |> group_summary(completed_task_ids)
+      |> Map.put("backend", backend)
       |> Map.put("model", model)
       |> Map.put("stages", stage_summaries(model_metrics, completed_task_ids))
     end)
-    |> sorted_dimension_summaries("model")
+    |> Enum.sort_by(fn summary ->
+      backend = summary["backend"]
+      model = summary["model"]
+      total = get_in(summary, ["token_usage", "total_tokens"])
+      backend_rank = if is_binary(backend) and backend != "", do: 0, else: 1
+      model_rank = if is_binary(model) and model != "", do: 0, else: 1
+      known_token_rank = if is_integer(total), do: 0, else: 1
+      {backend_rank, backend || "", model_rank, known_token_rank, -(total || 0), model || ""}
+    end)
   end
 
   defp stage_summaries(metrics, completed_task_ids) do

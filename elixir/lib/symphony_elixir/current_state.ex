@@ -11,7 +11,7 @@ defmodule SymphonyElixir.CurrentState do
   alias SymphonyElixir.Workflow.Bundle
 
   @task_fields ~w(id identifier title type priority brief branch column_id revision)
-  @run_fields ~w(id stage_id status model effort worker_host claimed_at started_at updated_at)
+  @run_fields ~w(id stage_id status backend model effort worker_host claimed_at started_at updated_at)
   @source_fields ~w(head_sha base_sha clean)
   @github_fields ~w(number url state draft head_sha)
   @preflight_fields ~w(status phase fingerprint reason started_at last_activity_at completed_at next_retry_at)

@@ -18,19 +18,24 @@ defmodule SymphonyElixir.Codex.Catalog do
   def status do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) -> GenServer.call(pid, :status)
-      _ -> %{available: false, loading: false, models: [], error: :not_started}
+      _ -> %{available: false, configured: true, loading: false, models: [], error: :not_started}
     end
   end
 
-  @spec pairs(AgentStage.t()) :: [{String.t(), String.t()}]
+  @spec pairs(AgentStage.t()) :: [AgentStage.model_option()]
   def pairs(%AgentStage{} = stage) do
+    codex_options =
+      stage
+      |> AgentStage.pairs()
+      |> Enum.filter(fn {backend, _model, _effort} -> backend == "codex" end)
+
     case status() do
       %{available: true, models: models} ->
         available = MapSet.new(models, & &1["model"])
-        stage |> AgentStage.pairs() |> Enum.filter(fn {model, _effort} -> MapSet.member?(available, model) end)
+        Enum.filter(codex_options, fn {_backend, model, _effort} -> MapSet.member?(available, model) end)
 
       _ ->
-        AgentStage.pairs(stage)
+        codex_options
     end
   end
 
@@ -43,7 +48,7 @@ defmodule SymphonyElixir.Codex.Catalog do
   @impl true
   def init(_opts) do
     send(self(), :refresh)
-    {:ok, %{available: false, loading: false, models: [], error: nil, checked_at: nil, task_ref: nil}}
+    {:ok, %{available: false, configured: true, loading: false, models: [], error: nil, checked_at: nil, task_ref: nil}}
   end
 
   @impl true
@@ -69,10 +74,39 @@ defmodule SymphonyElixir.Codex.Catalog do
     next =
       case result do
         {:ok, models} ->
-          %{state | available: true, loading: false, models: models, error: nil, checked_at: checked_at, task_ref: nil}
+          %{
+            state
+            | available: true,
+              configured: true,
+              loading: false,
+              models: models,
+              error: nil,
+              checked_at: checked_at,
+              task_ref: nil
+          }
+
+        :disabled ->
+          %{
+            state
+            | available: false,
+              configured: false,
+              loading: false,
+              models: [],
+              error: nil,
+              checked_at: checked_at,
+              task_ref: nil
+          }
 
         {:error, reason} ->
-          %{state | available: false, loading: false, error: reason, checked_at: checked_at, task_ref: nil}
+          %{
+            state
+            | available: false,
+              configured: true,
+              loading: false,
+              error: reason,
+              checked_at: checked_at,
+              task_ref: nil
+          }
       end
 
     Phoenix.PubSub.broadcast(SymphonyElixir.PubSub, "board:health", :board_health_changed)
@@ -88,14 +122,24 @@ defmodule SymphonyElixir.Codex.Catalog do
 
   def handle_info({:DOWN, _reference, :process, _pid, _reason}, state), do: {:noreply, state}
 
+  # No codex command is spawned when the codex backend is not configured:
+  # the catalog simply reports itself disabled, without error noise.
   defp load_catalog do
     if Application.get_env(:symphony_elixir, :catalog_enabled, true) do
-      with {:ok, bundle} <- Workflow.current() do
+      with {:ok, bundle} <- Workflow.current(),
+           :ok <- require_codex_backend(bundle) do
         workspace = Path.join(Paths.runtime_root(bundle.project.id), "catalog")
         AppServer.catalog(workspace)
+      else
+        :disabled -> :disabled
+        {:error, reason} -> {:error, reason}
       end
     else
-      {:error, :catalog_disabled}
+      :disabled
     end
+  end
+
+  defp require_codex_backend(bundle) do
+    if Map.has_key?(bundle.backends, "codex"), do: :ok, else: :disabled
   end
 end

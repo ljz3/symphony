@@ -64,6 +64,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
              :source,
              :board,
              :agent,
+             :backends,
              :codex,
              :hooks,
              :jobs,
@@ -81,7 +82,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
     :source,
     :board,
     :agent,
-    :codex,
+    :backends,
     :hooks,
     :jobs,
     :dispatch,
@@ -97,8 +98,9 @@ defmodule SymphonyElixir.Workflow.Bundle do
     :hash,
     :loaded_at
   ]
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [:codex]
 
+  @type backend_config :: %{required(atom()) => String.t() | boolean() | nil}
   @type transition_map :: %{optional(String.t()) => [String.t()]}
   @type t :: %__MODULE__{
           path: Path.t(),
@@ -106,7 +108,8 @@ defmodule SymphonyElixir.Workflow.Bundle do
           source: map(),
           board: map(),
           agent: map(),
-          codex: map(),
+          backends: %{required(String.t()) => backend_config()},
+          codex: backend_config() | nil,
           hooks: map(),
           jobs: %{optional(String.t()) => Job.t()},
           dispatch: %{preflight: map() | nil},
@@ -123,7 +126,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
           loaded_at: String.t()
         }
 
-  @root_keys ~w(project source board agent codex prompts stages columns transitions hooks jobs dispatch merge)
+  @root_keys ~w(project source board agent backends codex prompts stages columns transitions hooks jobs dispatch merge)
   @roles %{
     "dispatch" => :dispatch,
     "merge" => :merge,
@@ -140,12 +143,12 @@ defmodule SymphonyElixir.Workflow.Bundle do
          {:ok, source} <- parse_source(config["source"] || %{}, path),
          {:ok, board} <- parse_board(config["board"] || %{}),
          {:ok, agent} <- parse_agent(config["agent"] || %{}),
-         {:ok, codex} <- parse_codex(config["codex"] || %{}),
+         {:ok, backends} <- parse_backends(config),
          {:ok, hooks} <- parse_hooks(config["hooks"] || %{}),
          {:ok, jobs} <- parse_jobs(config["jobs"]),
          {:ok, dispatch} <- parse_dispatch(config["dispatch"]),
          {:ok, prompts} <- parse_prompts(config["prompts"], path),
-         {:ok, stages} <- parse_stages(config["stages"], path),
+         {:ok, stages} <- parse_stages(config["stages"], path, backends),
          {:ok, columns} <- parse_columns(config["columns"], stages),
          {:ok, merge} <- parse_merge(config["merge"]),
          {:ok, human_transitions, agent_transitions} <-
@@ -161,7 +164,8 @@ defmodule SymphonyElixir.Workflow.Bundle do
          source: source,
          board: board,
          agent: agent,
-         codex: codex,
+         backends: backends,
+         codex: backends["codex"],
          hooks: hooks,
          jobs: jobs,
          dispatch: dispatch,
@@ -246,35 +250,146 @@ defmodule SymphonyElixir.Workflow.Bundle do
   end
 
   defp parse_agent(agent) do
-    keys = ~w(max_concurrent_agents ssh_hosts max_concurrent_agents_per_host)
+    keys = ~w(max_concurrent_agents ssh_hosts max_concurrent_agents_per_host local_worker)
 
     with :ok <- reject_execution_limits(agent, ~w(max_turns_per_run), "agent"),
          :ok <- validate_known_keys(agent, keys, "agent"),
          {:ok, concurrency} <- positive_integer(agent, "max_concurrent_agents", 4),
          {:ok, hosts} <- string_list(agent, "ssh_hosts", []),
-         {:ok, host_capacity} <- nullable_positive_integer(agent, "max_concurrent_agents_per_host") do
+         {:ok, host_capacity} <- nullable_positive_integer(agent, "max_concurrent_agents_per_host"),
+         {:ok, local_worker} <- boolean(agent, "local_worker", false) do
       {:ok,
        %{
          max_concurrent_agents: concurrency,
          ssh_hosts: hosts,
-         max_concurrent_agents_per_host: host_capacity
+         max_concurrent_agents_per_host: host_capacity,
+         local_worker: local_worker
        }}
     end
   end
 
-  defp parse_codex(codex) do
-    keys = ~w(command approval_policy sandbox network_access)
+  defp parse_backends(config) do
+    declared = config["backends"]
+    legacy = config["codex"]
 
+    with :ok <- validate_backends_section(declared),
+         :ok <- reject_duplicate_codex(declared, legacy),
+         {:ok, backends} <- parse_declared_backends(declared || %{}),
+         {:ok, backends} <- merge_legacy_codex(backends, legacy) do
+      ensure_backend_present(backends, declared, legacy)
+    end
+  end
+
+  defp validate_backends_section(nil), do: :ok
+  defp validate_backends_section(%{}), do: :ok
+  defp validate_backends_section(_declared), do: {:error, :invalid_backends}
+
+  defp reject_duplicate_codex(declared, legacy) do
+    if is_map(declared) and Map.has_key?(declared, "codex") and not is_nil(legacy) do
+      {:error, {:duplicate_backend_definition, "codex"}}
+    else
+      :ok
+    end
+  end
+
+  defp parse_declared_backends(declared) do
+    declared
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce_while({:ok, %{}}, fn {name, backend_config}, {:ok, acc} ->
+      case parse_backend(name, backend_config) do
+        {:ok, backend} -> {:cont, {:ok, Map.put(acc, name, backend)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp parse_backend(name, %{} = backend_config) do
+    with :ok <- valid_id(name, "backend"),
+         {:ok, protocol} <- required_string(backend_config, "protocol", "backends.#{name}.protocol"),
+         :ok <- validate_backend_protocol(name, protocol) do
+      parse_backend_config(name, protocol, backend_config)
+    end
+  end
+
+  defp parse_backend(name, _config), do: {:error, {:invalid_backend, name}}
+
+  defp validate_backend_protocol(_name, "app_server"), do: :ok
+  defp validate_backend_protocol(_name, "acp"), do: :ok
+  defp validate_backend_protocol(name, protocol), do: {:error, {:unknown_backend_protocol, name, protocol}}
+
+  defp parse_backend_config("codex", "app_server", backend_config) do
+    codex_backend_config(backend_config, "backends.codex", ~w(protocol command approval_policy sandbox network_access))
+  end
+
+  defp parse_backend_config(name, "app_server", _backend_config) do
+    {:error, {:app_server_protocol_requires_codex_name, name}}
+  end
+
+  defp parse_backend_config(name, "acp", backend_config) do
+    context = "backends.#{name}"
+    keys = ~w(protocol command permission_mode allow_unsandboxed)
+
+    with :ok <- validate_known_keys(backend_config, keys, context),
+         {:ok, command} <- required_string(backend_config, "command", "#{context}.command"),
+         {:ok, permission_mode} <- optional_string(backend_config, "permission_mode", "auto"),
+         :ok <- require_unsandboxed_acknowledgement(name, backend_config) do
+      {:ok, %{protocol: "acp", command: command, permission_mode: permission_mode}}
+    end
+  end
+
+  defp require_unsandboxed_acknowledgement(name, backend_config) do
+    if backend_config["allow_unsandboxed"] == true do
+      :ok
+    else
+      {:error, {:acp_unsandboxed_not_acknowledged, name}}
+    end
+  end
+
+  defp merge_legacy_codex(backends, nil), do: {:ok, backends}
+
+  defp merge_legacy_codex(backends, %{} = legacy) do
+    with {:ok, codex} <- codex_backend_config(legacy, "codex", ~w(command approval_policy sandbox network_access)) do
+      {:ok, Map.put(backends, "codex", codex)}
+    end
+  end
+
+  defp merge_legacy_codex(_backends, _legacy), do: {:error, :invalid_codex_config}
+
+  defp ensure_backend_present(backends, declared, legacy) do
+    cond do
+      map_size(backends) > 0 ->
+        {:ok, backends}
+
+      is_nil(declared) and is_nil(legacy) ->
+        {:ok, %{"codex" => default_codex_backend()}}
+
+      true ->
+        {:error, :missing_backends}
+    end
+  end
+
+  defp default_codex_backend do
+    %{
+      protocol: "app_server",
+      command: "codex app-server",
+      approval_policy: "never",
+      thread_sandbox: "workspace-write",
+      network_access: false
+    }
+  end
+
+  defp codex_backend_config(config, context, allowed_keys) do
     with :ok <-
-           reject_execution_limits(codex, ~w(turn_timeout_ms read_timeout_ms stall_timeout_ms), "codex"),
-         :ok <- validate_known_keys(codex, keys, "codex"),
-         {:ok, command} <- optional_string(codex, "command", "codex app-server"),
-         {:ok, sandbox} <- optional_string(codex, "sandbox", "workspace-write"),
-         {:ok, network_access} <- boolean(codex, "network_access", false) do
+           reject_execution_limits(config, ~w(turn_timeout_ms read_timeout_ms stall_timeout_ms), context),
+         :ok <- validate_known_keys(config, allowed_keys, context),
+         {:ok, command} <- optional_string(config, "command", "codex app-server"),
+         {:ok, sandbox} <- optional_string(config, "sandbox", "workspace-write"),
+         {:ok, network_access} <- boolean(config, "network_access", false) do
       {:ok,
        %{
+         protocol: "app_server",
          command: command,
-         approval_policy: codex["approval_policy"] || "never",
+         approval_policy: config["approval_policy"] || "never",
          thread_sandbox: sandbox,
          network_access: network_access
        }}
@@ -406,27 +521,27 @@ defmodule SymphonyElixir.Workflow.Bundle do
 
   defp parse_prompts(_prompts, _workflow_path), do: {:error, :missing_prompts}
 
-  defp parse_stages(%{} = stages, workflow_path) when map_size(stages) > 0 do
+  defp parse_stages(%{} = stages, workflow_path, backends) when map_size(stages) > 0 do
     stages
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.reduce_while({:ok, %{}}, fn {id, config}, {:ok, acc} ->
-      case parse_stage(id, config, workflow_path) do
+      case parse_stage(id, config, workflow_path, backends) do
         {:ok, stage} -> {:cont, {:ok, Map.put(acc, id, stage)}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  defp parse_stages(_stages, _workflow_path), do: {:error, :missing_stages}
+  defp parse_stages(_stages, _workflow_path, _backends), do: {:error, :missing_stages}
 
-  defp parse_stage(id, %{} = config, workflow_path) do
+  defp parse_stage(id, %{} = config, workflow_path, backends) do
     with :ok <- valid_id(id, "stage"),
-         :ok <- validate_known_keys(config, ~w(prompt workpad allowed_model_efforts), "stages.#{id}"),
+         :ok <- validate_known_keys(config, ~w(prompt workpad allowed_model_efforts allowed_models), "stages.#{id}"),
          {:ok, prompt_path} <- referenced_path(config, "prompt", workflow_path),
          {:ok, workpad_path} <- referenced_path(config, "workpad", workflow_path),
          {:ok, prompt} <- read_template(prompt_path),
          {:ok, workpad} <- read_template(workpad_path),
-         {:ok, allowed} <- parse_allowed_model_efforts(config["allowed_model_efforts"], id) do
+         {:ok, allowed} <- parse_stage_policy(config, id, backends) do
       {:ok,
        %AgentStage{
          id: id,
@@ -434,12 +549,109 @@ defmodule SymphonyElixir.Workflow.Bundle do
          prompt: prompt,
          workpad_template_path: workpad_path,
          workpad_template: workpad,
-         allowed_model_efforts: allowed
+         allowed: allowed
        }}
     end
   end
 
-  defp parse_stage(id, _config, _workflow_path), do: {:error, {:invalid_stage, id}}
+  defp parse_stage(id, _config, _workflow_path, _backends), do: {:error, {:invalid_stage, id}}
+
+  defp parse_stage_policy(config, stage_id, backends) do
+    legacy = config["allowed_model_efforts"]
+    structured = config["allowed_models"]
+
+    cond do
+      not is_nil(legacy) and not is_nil(structured) ->
+        {:error, {:conflicting_model_policy_keys, stage_id}}
+
+      not is_nil(structured) ->
+        parse_allowed_models(structured, stage_id, backends)
+
+      true ->
+        parse_legacy_allowed_model_efforts(legacy, stage_id, backends)
+    end
+  end
+
+  # Legacy flat `model => [efforts]` policy; always binds to the codex backend.
+  defp parse_legacy_allowed_model_efforts(nil, stage_id, _backends), do: {:error, {:missing_model_policy, stage_id}}
+
+  defp parse_legacy_allowed_model_efforts(allowed, stage_id, backends) do
+    if Map.has_key?(backends, "codex") do
+      case parse_allowed_model_efforts(allowed, stage_id) do
+        {:ok, legacy_map} ->
+          {:ok, for({model, efforts} <- legacy_map, effort <- efforts, do: {"codex", model, effort})}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, {:legacy_model_policy_requires_codex, stage_id}}
+    end
+  end
+
+  defp parse_allowed_models(models, stage_id, backends) when is_list(models) and models != [] do
+    models
+    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, acc} ->
+      case parse_allowed_model_entry(entry, stage_id, backends) do
+        {:ok, triples} -> {:cont, {:ok, acc ++ triples}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, triples} ->
+        triples
+        |> Enum.frequencies()
+        |> Enum.find(fn {_triple, count} -> count > 1 end)
+        |> case do
+          nil -> {:ok, triples}
+          {{backend, model, effort}, _count} -> {:error, {:duplicate_model_effort, stage_id, backend, model, effort}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp parse_allowed_models(_models, stage_id, _backends), do: {:error, {:missing_model_policy, stage_id}}
+
+  defp parse_allowed_model_entry(%{} = entry, stage_id, backends) do
+    context = "stages.#{stage_id}.allowed_models"
+
+    with :ok <- validate_known_keys(entry, ~w(backend model efforts), context),
+         {:ok, backend} <- required_string(entry, "backend", "#{context}.backend"),
+         :ok <- require_known_backend(backend, stage_id, backends),
+         {:ok, model} <- required_string(entry, "model", "#{context}.model"),
+         {:ok, efforts} <- allowed_entry_efforts(entry, stage_id, backend, model) do
+      {:ok, Enum.map(efforts, &{backend, model, &1})}
+    end
+  end
+
+  defp parse_allowed_model_entry(_entry, stage_id, _backends), do: {:error, {:invalid_model_policy_entry, stage_id}}
+
+  defp require_known_backend(backend, stage_id, backends) do
+    if Map.has_key?(backends, backend) do
+      :ok
+    else
+      {:error, {:unknown_backend_in_stage_policy, stage_id, backend}}
+    end
+  end
+
+  defp allowed_entry_efforts(entry, stage_id, backend, model) do
+    case Map.get(entry, "efforts") do
+      nil ->
+        {:ok, [nil]}
+
+      efforts when is_list(efforts) and efforts != [] ->
+        if Enum.all?(efforts, &nonblank?/1) do
+          {:ok, efforts}
+        else
+          {:error, {:invalid_efforts, stage_id, backend, model}}
+        end
+
+      _efforts ->
+        {:error, {:invalid_efforts, stage_id, backend, model}}
+    end
+  end
 
   defp parse_allowed_model_efforts(%{} = allowed, stage_id) when map_size(allowed) > 0 do
     Enum.reduce_while(allowed, {:ok, %{}}, fn {model, efforts}, {:ok, acc} ->
@@ -739,6 +951,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
       "id" => "run-id",
       "stage_id" => "implementation",
       "status" => "running",
+      "backend" => "codex",
       "model" => "model",
       "effort" => "high",
       "claimed_at" => "2000-01-01T00:00:00Z",

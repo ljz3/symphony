@@ -14,8 +14,6 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
-  @type codex_selection :: %{model: String.t(), effort: String.t()}
-
   @spec bundle() :: {:ok, Bundle.t()} | {:error, term()}
   def bundle, do: Workflow.current()
 
@@ -51,33 +49,15 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  @spec validate_codex_selection(String.t(), codex_selection()) :: :ok | {:error, term()}
-  def validate_codex_selection(stage_id, %{model: model, effort: effort}) do
-    with {:ok, stage} <- stage(stage_id) do
-      if AgentStage.permits?(stage, model, effort) do
-        :ok
-      else
-        {:error, {:model_effort_not_permitted, stage_id, model, effort}}
-      end
-    end
-  end
+  @spec backends() :: %{required(String.t()) => map()}
+  def backends, do: bundle!().backends
 
-  @doc false
-  @spec validate_codex_selection(codex_selection()) :: :ok | {:error, term()}
-  def validate_codex_selection(%{model: model, effort: effort}) do
-    if Enum.any?(bundle!().stages, fn {_id, stage} -> AgentStage.permits?(stage, model, effort) end) do
-      :ok
-    else
-      {:error, {:model_effort_not_permitted, model, effort}}
+  @spec backend!(String.t()) :: map()
+  def backend!(name) when is_binary(name) do
+    case Map.fetch(bundle!().backends, name) do
+      {:ok, backend} -> backend
+      :error -> raise ArgumentError, "unknown agent backend: #{name}"
     end
-  end
-
-  @doc false
-  @spec allowed_codex_model_efforts() :: %{optional(String.t()) => [String.t()]}
-  def allowed_codex_model_efforts do
-    Enum.reduce(bundle!().stages, %{}, fn {_id, stage}, acc ->
-      Map.merge(acc, stage.allowed_model_efforts, fn _model, left, right -> Enum.uniq(left ++ right) end)
-    end)
   end
 
   @doc false

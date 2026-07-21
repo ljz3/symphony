@@ -37,8 +37,10 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.Board.Lease,
       SymphonyElixir.Board.Writer,
       SymphonyElixir.MCP.Transport,
+      SymphonyElixir.MCP.RunTransport,
       SymphonyElixir.Board.Sync,
       SymphonyElixir.Codex.Catalog,
+      SymphonyElixir.Backend.KimiACP.Catalog,
       SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer
     ]

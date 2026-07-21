@@ -4,14 +4,16 @@ This directory contains the Elixir/OTP reference implementation of the Git-backe
 service described in [`../SPEC.md`](../SPEC.md).
 
 > [!WARNING]
-> This is prototype software for trusted environments. It runs Codex unattended according to the
-> checked-in project policy and is presented as-is.
+> This is prototype software for trusted environments. It runs coding agents (Codex by default, or
+> Kimi via ACP) unattended according to the checked-in project policy and is presented as-is.
 
 ## What it does
 
 Symphony is the task authority for one project. It serves an editable loopback-only Kanban board,
 commits every domain action to an append-only Git history, projects current state into SQLite, and
-dispatches eligible cards to stage-specific Codex runs. Each task keeps a persistent source
+dispatches eligible cards to stage-specific agent runs. Agent backends are pluggable: Codex
+(`codex app-server`) and Kimi (`kimi acp`, the Agent Client Protocol) are supported, each with
+per-stage backend/model/effort selection. Each task keeps a persistent source
 worktree and branch. A service-owned `gh` process manages pull-request effects and readiness checks.
 
 The checked-in workflow provides:
@@ -39,6 +41,7 @@ Agent failures block immediately, and no retry queue exists.
 - Git with a source remote whose default branch is discoverable
 - [GitHub CLI](https://cli.github.com/) authenticated for that source remote
 - Codex with app-server support and the models permitted by `WORKFLOW.yml`
+- Optional: Kimi CLI (`kimi`) authenticated with `kimi login`, when an ACP backend is configured
 
 Verify the tools and install dependencies:
 
@@ -175,8 +178,8 @@ The LiveView routes are:
 A task requires a title, immutable Feature/Bug Fix/Chore type, Markdown brief, and at least one
 acceptance criterion. Symphony allocates an irreversible `<PROJECT-KEY>-<number>` identifier and
 derives `feature/ID`, `fix/ID`, or `chore/ID`. Priorities are Urgent, High, Normal, and Low. Optional
-dependencies must be acyclic, and every reachable stage with multiple allowed model/effort pairs
-requires an explicit selection.
+dependencies must be acyclic, and every reachable stage with multiple allowed backend/model/effort
+combinations requires an explicit selection.
 
 Task execution contracts cannot be edited while starting, running, or stopping. Agent-completed
 criteria require evidence. Humans may reopen criteria, and editing criterion text preserves prior
@@ -200,16 +203,57 @@ The document defines:
 
 - immutable `project.id` and uppercase `project.key`
 - source Git remote and optional board-history remote
-- agent concurrency and optional SSH worker hosts/capacity
-- Codex command and approval/sandbox/network policy
+- agent concurrency, optional SSH worker hosts/capacity, and an optional `local_worker` flag that
+  adds a local worker pool alongside SSH hosts (with no SSH hosts, local execution is always
+  enabled; without the flag, SSH hosts keep their remote-only behavior)
+- named agent backends and the Codex command and approval/sandbox/network policy
 - optional named blocking jobs with executable, fixed arguments, passthrough policy, and environment
 - optional pre-claim dispatch preflight with a retry delay after explicit failure
 - optional deterministic squash-merge policy and its review/conflict columns
 - shared base/context prompts
-- named stages with their prompt, workpad template, and allowed model/effort map
+- named stages with their prompt, workpad template, and allowed `(backend, model, effort?)` policy
 - ordered `dispatch`, `merge`, `pause`, `blocked`, or `terminal` columns
 - human and agent transition edges
 - worktree lifecycle hooks
+
+### Agent backends
+
+The `backends:` section declares every agent CLI a stage may select. Two protocols exist:
+`app_server` (the Codex app-server JSON-RPC protocol, reserved for the backend named `codex`) and
+`acp` (the Agent Client Protocol, validated against Kimi CLI). The legacy top-level `codex:` section
+remains a shorthand for `backends.codex`; defining both is an error, and the checked-in
+[`WORKFLOW.yml`](WORKFLOW.yml) intentionally stays on that legacy form.
+
+```yaml
+backends:
+  codex:
+    protocol: app_server
+    command: codex --config shell_environment_policy.inherit=all app-server
+    approval_policy: never
+    sandbox: workspace-write
+    network_access: true
+  kimi:
+    protocol: acp
+    command: kimi acp
+    permission_mode: auto        # optional, default auto
+    allow_unsandboxed: true      # required for ACP backends
+
+stages:
+  implementation:
+    prompt: workflow/prompts/implementation.md
+    workpad: workflow/workpads/implementation.md
+    allowed_models:
+      - {backend: codex, model: gpt-5.5, efforts: [xhigh]}
+      - {backend: kimi, model: kimi-code/k3, efforts: [max]}
+      - {backend: kimi, model: kimi-for-coding}   # no efforts: selection without a thinking level
+```
+
+Every stage policy entry expands to `(backend, model, effort?)` triples; the backend must exist.
+The legacy flat `allowed_model_efforts` map always means the codex backend and is a migration error
+when no codex backend is configured. `allow_unsandboxed: true` is a required acknowledgement — see
+the security posture under [Agent execution and GitHub](#agent-execution-and-github). ACP backends
+are local-only: they are never scheduled to SSH workers, and a task whose ACP backend has no local
+worker moves to Blocked with a stable reason instead of queuing silently.
 
 The checked-in [`WORKFLOW.yml`](WORKFLOW.yml) is the baseline workflow. Optional jobs, preflight, and
 deterministic merge configuration use these strict shapes:
@@ -245,7 +289,7 @@ merge policy requires exactly one `role: merge` column without a stage; its revi
 targets must be different dispatch columns. Template and executable paths are resolved relative to
 the workflow/source worktree as specified by their consumers.
 
-Managed Codex turns, app-server responses, worktree hooks, jobs, preflight, and merge readiness do
+Managed agent turns (Codex or ACP), app-server responses, worktree hooks, jobs, preflight, and merge readiness do
 not have elapsed-time, inactivity, or output-size limits. The workflow loader rejects former
 `max_turns_per_run`, Codex timeout, hook timeout, job timeout/output-cap, preflight timeout, and merge
 timeout/output-cap keys with an explicit migration error. Retry/reconciliation intervals and forced
@@ -255,7 +299,9 @@ deadlines.
 Invalid initial configuration leaves the board available in read-only diagnostic mode. An invalid
 reload keeps the last valid bundle. Valid reloads wait until no agent is starting, running, or
 stopping; active runs retain their frozen templates and model policy. A project ID cannot change,
-and a column referenced by a live task cannot be removed.
+and a column referenced by a live task cannot be removed. Workflow reloads never move tasks already
+in Backlog, Todo, Blocked, Done, or Cancelled; only incompatible, non-running tasks outside those
+protected columns may be routed to Blocked.
 
 ## Agent execution and GitHub
 
@@ -264,12 +310,13 @@ dispatch preflight is configured, it creates or reuses the managed worktree and 
 there while the task remains queued and no run exists. A successful command is usable only if a
 fresh read confirms the same task revision, eligibility, workflow hash, and worker reservation;
 otherwise Symphony discards it and probes current state again. Symphony then atomically records the
-run, runs configured hooks, and validates the exact model against Codex's complete catalog. Before
-rendering an initial workpad or starting app-server, Symphony refreshes the configured remote
+run, runs configured hooks, and validates the exact model against the backend's live catalog. Before
+rendering an initial workpad or starting the agent session, Symphony refreshes the configured remote
 default-branch ref for a reused local worktree and reconciles the actual branch HEAD, base SHA, and
 cleanliness into canonical state. It then reloads the task and run, validates their scope, renders
-the stage prompt/workpad from that current state, and starts app-server in the worktree. A
-reconciliation failure starts no Codex process and explicitly fails the claimed run. The prompt
+the stage prompt/workpad from that current state, and starts the selected backend session in the
+worktree. A
+reconciliation failure starts no agent process and explicitly fails the claimed run. The prompt
 order is fixed:
 
 1. Symphony's runner safety contract
@@ -298,16 +345,42 @@ transport error that retains the diagnostic; every other exit status remains a n
 result. Deterministic merge treats that transport error as pending at readiness, target comparison,
 reachability, and existing-worktree reconciliation boundaries. These commands have no added timeout.
 
-Symphony applies the configured Codex sandbox mode to each turn. In `workspace-write` mode, a local
+Symphony applies the configured Codex sandbox mode to each Codex turn. In `workspace-write` mode, a local
 run can write the managed task worktree and the source repository's shared Git metadata while the
 source checkout's working tree remains read-only. This lets task worktrees stage and commit without
 giving an agent write access to source files outside its managed worktree. `read-only` and
 `danger-full-access` are passed through as their corresponding app-server turn policies.
 
-The agent can use only the task/run-scoped `symphony_*` tools advertised by the service. It must
+### ACP (Kimi) sessions
+
+An ACP session speaks the Agent Client Protocol over stdio. Symphony negotiates protocol version 1,
+requires the agent's HTTP MCP capability, and authenticates with the documented `login` method when
+the agent advertises it (run `kimi login` first). It then applies the selected model first, consumes
+the complete returned session configuration state, validates and applies the thinking effort only
+when the selected model supports it, and applies the configured permission mode. stdout carries only
+JSON-RPC; stderr is captured in a per-run log file. A stopped run is cancelled with
+`session/cancel` before its process is terminated. Permission prompts are answered deterministically
+(first `allow_once`, else first `allow_always`, else cancelled); question elicitation is cancelled
+rather than answered. ACP sessions are local-only, and there is no ACP resume in v1: a transport
+failure fails the run and moves the task to Blocked, matching the no-retry-queue rule. ACP runs
+record `stats.token_usage` as `null`.
+
+**Security posture.** ACP backends have no sandbox concept and v1 adopts the trusted-local-process
+model: `allow_unsandboxed: true` means the user accepts that the ACP agent runs with the same
+OS-user authority as Symphony itself. The session working directory (the task worktree) is not
+confinement, and the permission mode only auto-handles permission prompts. The run-scoped MCP token
+and per-scope registration prevent accidental cross-run routing through the configured endpoint but
+are not a security boundary against a malicious same-user process — such a process could potentially
+reach the loopback `/mcp` endpoint or read runtime files. Running untrusted agents requires future
+OS/container isolation plus protection of the global MCP endpoint and runtime secrets.
+
+The agent can use only the task/run-scoped `symphony_*` tools advertised by the service — delivered
+as app-server dynamic tools for Codex, and as a per-`{run_id, invocation}` isolated, token-authenticated
+HTTP MCP scope (`/mcp/runs/:run_id/:invocation`) for ACP backends, with identical execution semantics
+on both channels. It must
 complete a permitted transition before the invocation ends. A transition into another dispatch
 stage schedules a new run with that stage's frozen prompt and workpad. Mutating tool calls combine
-the run ID with the app-server call ID for idempotency, so call IDs may restart in a later run without
+the run ID with a namespaced call ID for idempotency, so call IDs may restart in a later run without
 replaying a prior run's result. Successful mutations return only the event type, task revision/current
 column, and run status when present rather than echoing identities, runtime state, or canonical task
 and run payloads.
@@ -429,10 +502,10 @@ A GitHub outage gates new dispatch. An active run may reach a safe local commit 
 session while publication retries; it is not placed on an agent retry queue.
 
 Every run finalized as completed, stopped, or failed records durable statistics in its canonical
-Git event. `stats` contains elapsed milliseconds, the count of unique Codex turns, and the latest
+Git event. `stats` contains elapsed milliseconds, the count of unique agent session turns, and the latest
 authoritative cumulative input, cached-input, output, and total token counts. Runtime begins at
-`started_at`, or at `claimed_at` when Codex never starts. If Codex never reports an authoritative
-cumulative total, `token_usage` is `null` rather than a synthetic zero.
+`started_at`, or at `claimed_at` when the agent never starts. If the backend never reports an authoritative
+cumulative total (always the case for ACP backends in v1), `token_usage` is `null` rather than a synthetic zero.
 
 While a run is live, SQLite retains only its token high-water mark and unique turn IDs so a runner
 crash or orphan recovery does not lose accounting. Finalization copies that summary into the Git
@@ -447,9 +520,9 @@ a subset of input and is not added again. Aggregates are marked `complete`, `par
 `unavailable`: a partial UI total is prefixed with `≥`, unavailable usage is shown as `—`, and an
 authoritative zero remains `0`.
 
-The stats snapshot groups the same effective runs by exact model and then by stage, combining effort
-levels. Each model and stage aggregate reports distinct tasks, distinct all-time and active Codex
-thread IDs, active and total runs, turns, agent time, and token usage. The `/stats` HTML view also
+The stats snapshot groups the same effective runs by backend and exact model and then by stage, combining effort
+levels. Each model and stage aggregate reports distinct tasks, distinct all-time and active agent
+session IDs, active and total runs, turns, agent time, and token usage. The `/stats` HTML view also
 renders the same accounting separately for each observed effort beneath its stage row. Completed-task
 counts represent distinct current or archived Done tasks with a run that has a canonical start time
 or an effective session ID in the group. One completed task can therefore appear under several models,
@@ -538,7 +611,7 @@ migration signal and does not discover or import Linear state.
 
 ## Project layout
 
-- `lib/symphony_elixir/` — domain, event history, projection, orchestration, worktrees, Codex, GitHub
+- `lib/symphony_elixir/` — domain, event history, projection, orchestration, worktrees, agent backends (Codex, ACP/Kimi), GitHub
 - `lib/symphony_elixir_web/` — loopback LiveView board, MCP dispatch, and generic HTTP fallback
 - `workflow/prompts/` and `workflow/workpads/` — strict standard templates
 - `test/` — unit, integration, UI/MCP, Git, fake-`gh`, and opt-in live coverage

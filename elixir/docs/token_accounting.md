@@ -2,6 +2,11 @@
 
 This document explains how Codex reports token usage through the app-server protocol and how Symphony should account for it.
 
+> ACP (Kimi) backends do not report codex-equivalent usage: their runs record `stats.token_usage`
+> as `null`. The ACP `usage_update` notification describes session context occupancy (`used`/`size`)
+> plus optional cost — not billed-token totals — and must not be mapped onto this accounting without
+> a dedicated design. See the final section.
+
 It is based on the current Codex source in `codex-rs`, especially:
 
 - `app-server/README.md`
@@ -355,3 +360,11 @@ does not publish Codex thread IDs or pricing estimates.
 - Do not double-count turn-completed usage after live updates
 - Persist terminal usage as `null` when no authoritative snapshot arrived
 - Route creator stats to the PR body and other stats only to an existing published-workpad comment
+
+## ACP (Kimi) Runs
+
+ACP backends have no codex-equivalent usage stream. An ACP `usage_update` session notification
+reports current session context occupancy (`used`/`size` token counts) and optionally a monetary
+cost; it is not a cumulative billed-token total and must not feed the high-water-mark accounting
+above. In v1, Symphony ignores `usage_update` for accounting and finalizes every ACP run with
+`stats.token_usage` as `null`, the same shape used when Codex supplies no authoritative total.

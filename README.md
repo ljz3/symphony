@@ -1,11 +1,12 @@
 # Symphony
 
 Symphony turns project work into isolated, autonomous implementation runs. The reference service
-owns a local Kanban board, records every task action in Git, runs stage-specific Codex agents in
+owns a local Kanban board, records every task action in Git, runs stage-specific agents through
+pluggable backends (Codex app-server or Kimi ACP) in
 persistent source worktrees, and coordinates pull requests through GitHub.
 
 > [!WARNING]
-> Symphony is an engineering preview for trusted environments. It can run Codex unattended with
+> Symphony is an engineering preview for trusted environments. It can run coding agents unattended with
 > the permissions configured for a project; inspect the workflow and source repository before
 > starting it.
 
@@ -17,7 +18,7 @@ Symphony separates durable task authority from rebuildable runtime state:
 - SQLite is the replaceable local board/workpad projection; private versioned sidecars outside the
   runtime database are authoritative for non-canonical local workpad history and publication state.
 - Phoenix LiveView serves the loopback-only Kanban board, task editor, and live project statistics.
-- The same loopback listener exposes exactly three guarded MCP task tools for Codex: creation,
+- The same loopback listener exposes exactly three guarded MCP task tools: creation,
   exact task lookup, and current-task listing by workflow state.
 - One persistent Git worktree and immutable branch belong to each task.
 - A service-owned `gh` client creates draft pull requests, publishes workpads, captures exact-head
@@ -25,7 +26,7 @@ Symphony separates durable task authority from rebuildable runtime state:
   guarded squash merges without a model.
   Publish-only transitions are accepted only after their workpad marker and local publication
   manifest are durable.
-- Completed, stopped, and failed Codex runs retain canonical runtime/turn/token statistics; the PR
+- Completed, stopped, and failed agent runs retain canonical runtime/turn/token statistics; the PR
   body or the run's published workpad comment exposes the same compact summary without extra comments.
 - The board and statistics view combine those durable summaries with active SQLite telemetry to show
   all-time project/task usage, exact-model, stage, and effort breakdowns, live agent time, safe
@@ -65,7 +66,8 @@ local board history mean “start a fresh embedded board,” not “migrate exte
 ## Reference implementation
 
 The current implementation is under [`elixir/`](elixir/). It requires Elixir 1.19/OTP 28, Git, an
-authenticated GitHub CLI, and Codex app-server.
+authenticated GitHub CLI, and Codex app-server. Kimi CLI is optional and used only when an ACP
+backend is configured.
 
 To implement a compatible service in another language, use the root specification:
 

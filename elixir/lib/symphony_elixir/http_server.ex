@@ -64,6 +64,27 @@ defmodule SymphonyElixir.HttpServer do
     :exit, _reason -> nil
   end
 
+  @spec await_bound_port(timeout()) :: {:ok, non_neg_integer()} | {:error, :timeout}
+  def await_bound_port(timeout_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_bound_port(deadline)
+  end
+
+  defp do_await_bound_port(deadline) do
+    case bound_port() do
+      port when is_integer(port) ->
+        {:ok, port}
+
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(50)
+          do_await_bound_port(deadline)
+        end
+    end
+  end
+
   defp parse_host({_, _, _, _} = ip), do: {:ok, ip}
   defp parse_host({_, _, _, _, _, _, _, _} = ip), do: {:ok, ip}
 

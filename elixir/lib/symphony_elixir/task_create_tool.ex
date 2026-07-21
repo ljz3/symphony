@@ -29,7 +29,13 @@ defmodule SymphonyElixir.TaskCreateTool do
       "items" => %{"type" => "string", "minLength" => 1}
     },
     "dependencies" => %{"type" => "array", "items" => %{"type" => "string"}},
-    "stage_selections" => %{"type" => "object", "additionalProperties" => %{"type" => "object"}}
+    "stage_selections" => %{
+      "type" => "object",
+      "description" =>
+        "Per-stage agent selection: stage_id mapped to an object with required model and optional effort " <>
+          "and backend fields. backend defaults to the codex backend; effort is omitted for selections without a thinking level.",
+      "additionalProperties" => %{"type" => "object"}
+    }
   }
 
   @project_property %{

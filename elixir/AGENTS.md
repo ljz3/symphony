@@ -19,6 +19,12 @@ event history, SQLite projection, persistent task worktrees, and stage-specific 
   - If behavior changes materially, update the spec in the same change where practical.
 - Prefer config access through `SymphonyElixir.Config`; machine-local roots belong in
   `SymphonyElixir.Paths`, CLI flags, or environment variables.
+- Agent backends are pluggable behind `SymphonyElixir.AgentBackend`; adapters live under
+  `lib/symphony_elixir/backend/` (currently `CodexAppServer` and `KimiACP`; generic ACP agents are
+  out of scope). ACP backends are local-only and unsandboxed by design: every ACP backend requires
+  `allow_unsandboxed: true` in WORKFLOW.yml, must never run remotely, and its run-scoped tools go
+  through the per-run isolated MCP bridge (`SymphonyElixir.MCP.RunBridge`) rather than codex
+  dynamic tools.
 - Git event history is authoritative. Commit the event before projecting it to SQLite, and preserve
   CAS, replay, checkpoint, idempotency, divergence, and handoff semantics.
 - Workspace safety is critical:

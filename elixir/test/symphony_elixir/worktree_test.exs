@@ -8,6 +8,7 @@ defmodule SymphonyElixir.WorktreeTest do
     source = BoardFactory.workflow_source()
     :ok = Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
     assert {:ok, %{source: %{root: root}}} = Workflow.current()
     assert root == source.root
 
@@ -209,6 +210,7 @@ defmodule SymphonyElixir.WorktreeTest do
 
     File.write!(source.workflow, workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     task = task_fixture(BoardFactory.unique("SYM-LONG-HOOK"))
     assert {:ok, path} = Worktree.ensure(task)

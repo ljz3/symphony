@@ -6,8 +6,9 @@ defmodule SymphonyElixirWeb.TaskLive do
   alias SymphonyElixir.AgentStage
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.Codex.Catalog
   alias SymphonyElixir.GitHub
+  alias SymphonyElixir.ModelCatalog
+  alias SymphonyElixir.StageSelection
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow
   alias SymphonyElixir.Worktree
@@ -39,14 +40,19 @@ defmodule SymphonyElixirWeb.TaskLive do
   @impl true
   def handle_event("update_task", %{"task" => params}, socket) do
     task = socket.assigns.task
-    attrs = update_attrs(params, task, socket.assigns.bundle)
 
-    command_result(
-      socket,
-      %Commands.UpdateTask{task_id: task.id, attrs: attrs},
-      task.revision,
-      "Updated #{task.identifier}"
-    )
+    case update_attrs(params, task, socket.assigns.bundle) do
+      {:ok, attrs} ->
+        command_result(
+          socket,
+          %Commands.UpdateTask{task_id: task.id, attrs: attrs},
+          task.revision,
+          "Updated #{task.identifier}"
+        )
+
+      :error ->
+        {:noreply, put_flash(socket, :error, "Invalid backend / model / effort selection.")}
+    end
   end
 
   def handle_event("transition", %{"column_id" => column_id}, socket) do
@@ -148,9 +154,9 @@ defmodule SymphonyElixirWeb.TaskLive do
               </label>
 
               <div :for={stage <- @multi_pair_stages} class="model-selection">
-                <label>{stage.id} model / effort
+                <label>{stage.id} backend / model / effort
                   <select name={"task[stage_selections][#{stage.id}]"} disabled={contract_frozen?(@task)}>
-                    <option :for={{model, effort} <- Catalog.pairs(stage)} value={model <> "\u001f" <> effort} selected={selected_pair?(@task, stage.id, model, effort)}>{model} · {effort}</option>
+                    <option :for={option <- ModelCatalog.pairs(stage)} value={StageSelection.encode(option)} selected={selected_pair?(@task, stage.id, option)}>{StageSelection.label(option)}</option>
                   </select>
                 </label>
               </div>
@@ -182,7 +188,7 @@ defmodule SymphonyElixirWeb.TaskLive do
             </div>
             <p :if={@runs == []} class="empty">No runs yet.</p>
             <article :for={run <- @runs} class="run-card">
-              <div class="run-heading"><strong>{run["stage_id"]}</strong><span>{run["status"]}</span><code>{run["model"]} · {run["effort"]}</code></div>
+              <div class="run-heading"><strong>{run["stage_id"]}</strong><span>{run["status"]}</span><code>{StageSelection.label({run["backend"] || "codex", run["model"], run["effort"]})}</code></div>
               <div class="run-stat-grid">
                 <div><span>Elapsed</span><strong class="numeric">{Telemetry.format_duration(run_duration(run, @metrics_generated_at, @now))}</strong></div>
                 <div><span>Turns</span><strong class="numeric">{run["effective_stats"]["turn_count"]}</strong></div>
@@ -310,30 +316,37 @@ defmodule SymphonyElixirWeb.TaskLive do
       |> Map.get("new_criteria", "")
       |> String.split(~r/\R/, trim: true)
 
-    %{
-      title: params["title"] || task.title,
-      priority: params["priority"] || Atom.to_string(task.priority),
-      brief: params["brief"] || task.brief,
-      acceptance_criteria: existing ++ additions,
-      dependencies: params["dependencies"] || [],
-      stage_selections: merge_stage_selections(task.stage_selections, params["stage_selections"] || %{}, bundle)
-    }
+    with {:ok, selections} <- merge_stage_selections(task.stage_selections, params["stage_selections"] || %{}, bundle) do
+      {:ok,
+       %{
+         title: params["title"] || task.title,
+         priority: params["priority"] || Atom.to_string(task.priority),
+         brief: params["brief"] || task.brief,
+         acceptance_criteria: existing ++ additions,
+         dependencies: params["dependencies"] || [],
+         stage_selections: selections
+       }}
+    end
   end
 
   defp merge_stage_selections(current, selections, bundle) do
-    merged =
-      Enum.reduce(selections, current, fn {stage_id, pair}, acc ->
-        [model, effort] = String.split(pair, "\u001f", parts: 2)
-        Map.put(acc, stage_id, %{"model" => model, "effort" => effort})
-      end)
-
-    add_singleton_selections(merged, bundle)
+    selections
+    |> Enum.reduce_while({:ok, current}, fn {stage_id, encoded}, {:ok, acc} ->
+      case StageSelection.decode(encoded) do
+        {:ok, option} -> {:cont, {:ok, Map.put(acc, stage_id, StageSelection.to_map(option))}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, merged} -> {:ok, add_singleton_selections(merged, bundle)}
+      :error -> :error
+    end
   end
 
   defp add_singleton_selections(selections, bundle) do
     Enum.reduce(bundle.stages, selections, fn {stage_id, stage}, acc ->
       case AgentStage.singleton_pair(stage) do
-        {:ok, {model, effort}} -> Map.put_new(acc, stage_id, %{"model" => model, "effort" => effort})
+        {:ok, option} -> Map.put_new(acc, stage_id, StageSelection.to_map(option))
         :multiple -> acc
       end
     end)
@@ -364,7 +377,11 @@ defmodule SymphonyElixirWeb.TaskLive do
   end
 
   defp workpads(workpads, run_id), do: Map.get(workpads, run_id, [])
-  defp selected_pair?(task, stage_id, model, effort), do: task.stage_selections[stage_id] == %{"model" => model, "effort" => effort}
+
+  defp selected_pair?(task, stage_id, {backend, model, effort}) do
+    task.stage_selections[stage_id] == %{"backend" => backend, "model" => model, "effort" => effort}
+  end
+
   defp contract_frozen?(task), do: task.runtime_state in ["starting", "running", "stopping"] or Task.archived?(task)
   defp column_name(_bundle, nil), do: "Unknown"
 

@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.BoardFactory do
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
+  alias SymphonyElixir.Workflow
 
   def unique(prefix), do: "#{prefix}-#{System.unique_integer([:positive, :monotonic])}-#{Ecto.UUID.generate()}"
 
@@ -72,6 +73,29 @@ defmodule SymphonyElixir.BoardFactory do
     case System.cmd("git", ["-C", root | args], stderr_to_stdout: true) do
       {output, 0} -> output
       {output, status} -> raise "git failed (#{status}): #{output}"
+    end
+  end
+
+  @doc """
+  Wait until the workflow store has activated the latest valid bundle.
+
+  `Workflow.Store.force_reload/0` defers activation while the board is busy,
+  so a test that proceeds to claim/dispatch immediately after a reload can
+  otherwise observe the previous bundle.
+  """
+  def await_activation(attempts \\ 200) do
+    status = Workflow.Store.status()
+
+    cond do
+      status[:valid] == true and status[:pending] == false ->
+        :ok
+
+      attempts <= 0 ->
+        raise "workflow activation timed out"
+
+      true ->
+        Process.sleep(20)
+        await_activation(attempts - 1)
     end
   end
 end

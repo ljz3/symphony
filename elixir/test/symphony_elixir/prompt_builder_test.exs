@@ -33,7 +33,7 @@ defmodule SymphonyElixir.PromptBuilderTest do
     assert workpad =~ "Implementation workpad"
     assert workpad =~ task.identifier
     continuation = PromptBuilder.continuation_prompt(2)
-    assert continuation =~ "same run and Codex session"
+    assert continuation =~ "same run and agent session"
     refute continuation =~ "turn 2 of"
     refute continuation =~ "maximum"
     assert PromptBuilder.runner_contract() =~ "task worktree"
@@ -65,7 +65,7 @@ defmodule SymphonyElixir.PromptBuilderTest do
       |> Map.put("workpad_template", sentinel)
       |> Map.put("prompt_path", sentinel)
       |> Map.put("workpad_template_path", sentinel)
-      |> Map.put("allowed_model_efforts", %{sentinel => ["high"]})
+      |> Map.put("allowed", [[sentinel, "model", "high"]])
 
     safe_run =
       run
@@ -78,7 +78,7 @@ defmodule SymphonyElixir.PromptBuilderTest do
     assert prompt =~ "id=implementation"
     refute prompt =~ sentinel
 
-    for field <- ~w(prompt prompt_path workpad_template workpad_template_path allowed_model_efforts) do
+    for field <- ~w(prompt prompt_path workpad_template workpad_template_path allowed) do
       forbidden_run = put_in(run, ["frozen_bundle", "context_prompt"], "{{ stage.#{field} }}")
 
       assert_raise RuntimeError, ~r/context prompt render failed/, fn ->

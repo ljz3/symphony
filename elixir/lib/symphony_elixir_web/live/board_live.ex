@@ -6,8 +6,9 @@ defmodule SymphonyElixirWeb.BoardLive do
   alias SymphonyElixir.AgentStage
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.Codex.Catalog
+  alias SymphonyElixir.ModelCatalog
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.StageSelection
   alias SymphonyElixir.Workflow
   alias SymphonyElixirWeb.TelemetryComponents, as: Telemetry
 
@@ -33,21 +34,25 @@ defmodule SymphonyElixirWeb.BoardLive do
 
   @impl true
   def handle_event("create_task", %{"task" => params}, socket) do
-    attrs = create_attrs(params, socket.assigns.bundle)
+    case create_attrs(params, socket.assigns.bundle) do
+      {:ok, attrs} ->
+        case Board.execute(%Commands.CreateTask{attrs: attrs},
+               actor: %{type: :human, identity: "board-ui"},
+               expected_revision: 0,
+               idempotency_key: "ui-create:#{Ecto.UUID.generate()}"
+             ) do
+          {:ok, %{"task" => task}} ->
+            {:noreply,
+             socket
+             |> put_flash(:info, "Created #{task["identifier"]}")
+             |> push_navigate(to: "/tasks/#{task["identifier"]}")}
 
-    case Board.execute(%Commands.CreateTask{attrs: attrs},
-           actor: %{type: :human, identity: "board-ui"},
-           expected_revision: 0,
-           idempotency_key: "ui-create:#{Ecto.UUID.generate()}"
-         ) do
-      {:ok, %{"task" => task}} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, "Created #{task["identifier"]}")
-         |> push_navigate(to: "/tasks/#{task["identifier"]}")}
+          {:error, reason} ->
+            {:noreply, put_flash(socket, :error, format_error(reason))}
+        end
 
-      {:error, reason} ->
-        {:noreply, put_flash(socket, :error, format_error(reason))}
+      :error ->
+        {:noreply, put_flash(socket, :error, "Invalid backend / model / effort selection.")}
     end
   end
 
@@ -91,7 +96,7 @@ defmodule SymphonyElixirWeb.BoardLive do
         <.health_chip label="Lease" value={if(@health.lease.owned, do: "owned", else: "diagnostic")} />
         <.health_chip label="History" value={to_string(@health.board_sync.state)} />
         <.health_chip label="GitHub" value={github_health(@orchestrator)} />
-        <.health_chip label="Codex catalog" value={catalog_health(@catalog)} />
+        <.health_chip :for={{backend, status} <- Enum.sort(@catalog)} label={"#{backend} catalog"} value={catalog_health(status)} />
         <.health_chip label="Workers" value={worker_health(@orchestrator)} />
         <.health_chip label="Dispatch" value={dispatch_health(@orchestrator)} />
       </section>
@@ -134,9 +139,9 @@ defmodule SymphonyElixirWeb.BoardLive do
           <label>Acceptance checklist <span>one item per line</span><textarea name="task[acceptance_criteria]" rows="5" required></textarea></label>
           <label>Dependencies<select name="task[dependencies][]" multiple><option :for={task <- @tasks} value={task.id}>{task.identifier} · {task.title}</option></select></label>
           <div :for={stage <- @multi_pair_stages} class="model-selection">
-            <label>{stage.id} model / effort
+            <label>{stage.id} backend / model / effort
               <select name={"task[stage_selections][#{stage.id}]"} required>
-                <option :for={{model, effort} <- Catalog.pairs(stage)} value={model <> "\u001f" <> effort}>{model} · {effort}</option>
+                <option :for={option <- ModelCatalog.pairs(stage)} value={StageSelection.encode(option)}>{StageSelection.label(option)}</option>
               </select>
             </label>
           </div>
@@ -224,7 +229,7 @@ defmodule SymphonyElixirWeb.BoardLive do
         |> assign(:task_metrics, task_metrics)
         |> assign(:health, Board.health())
         |> assign(:orchestrator, Orchestrator.status())
-        |> assign(:catalog, Catalog.status())
+        |> assign(:catalog, ModelCatalog.status())
         |> assign(:initial_column, Workflow.Bundle.initial_column(bundle))
         |> assign(:blocked_column, Workflow.Bundle.blocked_column(bundle))
         |> assign(:multi_pair_stages, Enum.filter(Map.values(bundle.stages), &(length(AgentStage.pairs(&1)) > 1)))
@@ -238,7 +243,7 @@ defmodule SymphonyElixirWeb.BoardLive do
         |> assign(:task_metrics, task_metrics)
         |> assign(:health, Board.health())
         |> assign(:orchestrator, Orchestrator.status())
-        |> assign(:catalog, Catalog.status())
+        |> assign(:catalog, ModelCatalog.status())
         |> assign(:initial_column, nil)
         |> assign(:blocked_column, nil)
         |> assign(:multi_pair_stages, [])
@@ -249,31 +254,38 @@ defmodule SymphonyElixirWeb.BoardLive do
     criteria = params["acceptance_criteria"] |> to_string() |> String.split(~r/\R/, trim: true)
     dependencies = params["dependencies"] || []
 
-    %{
-      title: params["title"],
-      type: params["type"],
-      priority: params["priority"] || "Normal",
-      brief: params["brief"],
-      acceptance_criteria: criteria,
-      dependencies: dependencies,
-      stage_selections: parse_stage_selections(params["stage_selections"] || %{}, bundle)
-    }
+    with {:ok, selections} <- parse_stage_selections(params["stage_selections"] || %{}, bundle) do
+      {:ok,
+       %{
+         title: params["title"],
+         type: params["type"],
+         priority: params["priority"] || "Normal",
+         brief: params["brief"],
+         acceptance_criteria: criteria,
+         dependencies: dependencies,
+         stage_selections: selections
+       }}
+    end
   end
 
   defp parse_stage_selections(selections, bundle) do
-    selected =
-      Map.new(selections, fn {stage_id, pair} ->
-        [model, effort] = String.split(pair, "\u001f", parts: 2)
-        {stage_id, %{"model" => model, "effort" => effort}}
-      end)
-
-    add_singleton_selections(selected, bundle)
+    selections
+    |> Enum.reduce_while({:ok, %{}}, fn {stage_id, encoded}, {:ok, acc} ->
+      case StageSelection.decode(encoded) do
+        {:ok, option} -> {:cont, {:ok, Map.put(acc, stage_id, StageSelection.to_map(option))}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, selected} -> {:ok, add_singleton_selections(selected, bundle)}
+      :error -> :error
+    end
   end
 
   defp add_singleton_selections(selected, bundle) do
     Enum.reduce(bundle.stages, selected, fn {stage_id, stage}, acc ->
       case AgentStage.singleton_pair(stage) do
-        {:ok, {model, effort}} -> Map.put_new(acc, stage_id, %{"model" => model, "effort" => effort})
+        {:ok, option} -> Map.put_new(acc, stage_id, StageSelection.to_map(option))
         :multiple -> acc
       end
     end)
@@ -309,8 +321,9 @@ defmodule SymphonyElixirWeb.BoardLive do
 
   defp github_health(%{github: %{available: true}}), do: "ready"
   defp github_health(_status), do: "unavailable"
-  defp catalog_health(%{available: true}), do: "ready"
-  defp catalog_health(%{loading: true}), do: "loading"
+  defp catalog_health(%{state: :available}), do: "ready"
+  defp catalog_health(%{state: :loading}), do: "loading"
+  defp catalog_health(%{state: :disabled}), do: "disabled"
   defp catalog_health(_status), do: "policy fallback"
   defp worker_health(%{dispatch_gate: :no_eligible_worker}), do: "unavailable"
   defp worker_health(_status), do: "ready"

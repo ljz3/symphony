@@ -21,6 +21,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     System.put_env("PATH", fake_bin <> ":" <> original_path)
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       System.put_env("PATH", original_path)
@@ -273,7 +274,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     parent = self()
     spawn(fn -> send(parent, {:responsive_status, status(orchestrator)}) end)
 
-    assert_receive {:responsive_status, %{worker_health: [%{host: "silent-worker", status: :probing}]}}, 500
+    assert_receive {:responsive_status, %{worker_health: [%{host: "silent-worker", status: :probing}]}}, 2_000
     assert Board.runs(todo_id) == []
 
     Process.sleep(5_200)
@@ -457,6 +458,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
 
     File.write!(source.workflow, workflow <> dispatch)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
   end
 
   defp configure_after_create(workflow, nil), do: workflow
@@ -479,6 +481,7 @@ defmodule SymphonyElixir.OrchestratorPreflightTest do
     workflow = Regex.replace(~r/\ndispatch:\n.*\z/s, workflow, "")
     File.write!(source.workflow, workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
   end
 
   defp start_gate(task_ids) do

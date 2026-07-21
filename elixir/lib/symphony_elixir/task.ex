@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Task do
           required(:evidence) => [map()],
           required(:evidence_history) => [map()]
         }
-  @type selection :: %{required(String.t()) => %{required(String.t()) => String.t()}}
+  @type selection :: %{optional(String.t()) => %{optional(String.t()) => String.t() | nil}}
   @type t :: %__MODULE__{
           id: String.t(),
           identifier: String.t(),
@@ -131,7 +131,7 @@ defmodule SymphonyElixir.Task do
       brief: attrs["brief"],
       acceptance_criteria: attrs["acceptance_criteria"] || [],
       dependencies: attrs["dependencies"] || [],
-      stage_selections: attrs["stage_selections"] || %{},
+      stage_selections: normalize_selections(attrs["stage_selections"] || %{}),
       column_id: attrs["column_id"],
       rank: attrs["rank"],
       revision: attrs["revision"],
@@ -156,6 +156,20 @@ defmodule SymphonyElixir.Task do
     |> Map.from_struct()
     |> stringify_keys()
   end
+
+  # Selections committed before the multi-backend change carry no "backend"
+  # key; they always mean the codex backend.
+  defp normalize_selections(selections) when is_map(selections) do
+    Map.new(selections, fn
+      {stage_id, selection} when is_map(selection) ->
+        {stage_id, Map.put_new(selection, "backend", "codex")}
+
+      other ->
+        other
+    end)
+  end
+
+  defp normalize_selections(selections), do: selections
 
   defp atom_value(value) when is_atom(value), do: value
   defp atom_value(value) when is_binary(value), do: String.to_existing_atom(value)

@@ -9,15 +9,17 @@ defmodule SymphonyElixir.Orchestrator do
   use GenServer
   require Logger
 
+  alias SymphonyElixir.AgentBackend
   alias SymphonyElixir.AgentRunner
   alias SymphonyElixir.Board
-  alias SymphonyElixir.Board.{Commands, Lease, Projection, Sync, Writer}
-  alias SymphonyElixir.Codex.{Activity, AppServer, RunStats}
+  alias SymphonyElixir.Board.{Commands, Lease, Sync, Writer}
+  alias SymphonyElixir.Codex.Activity
   alias SymphonyElixir.Config
   alias SymphonyElixir.DeterministicMerge
   alias SymphonyElixir.DeterministicMerge.Worker, as: MergeWorker
   alias SymphonyElixir.GitHub
   alias SymphonyElixir.JobManager
+  alias SymphonyElixir.MCP.RunBridge
   alias SymphonyElixir.SSH
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow.{Bundle, Store}
@@ -151,7 +153,7 @@ defmodule SymphonyElixir.Orchestrator do
           run_id: runtime.run_id,
           worker_host: runtime.worker_host,
           workspace_path: runtime.workspace_path,
-          session_id: runtime.session && runtime.session.thread_id,
+          session_id: runtime.session && AgentBackend.session_id(runtime.backend, runtime.session),
           last_activity: runtime.last_activity,
           last_activity_at: runtime.last_activity_at,
           stopping: runtime.stopping
@@ -340,7 +342,7 @@ defmodule SymphonyElixir.Orchestrator do
     case state.running[task_id] do
       %{run_id: ^run_id, session: session} = runtime ->
         :ok = JobManager.cancel_run(run_id)
-        if session, do: AppServer.stop_session(session)
+        if session, do: AgentBackend.terminate_session(runtime.backend, session)
         timer = Process.send_after(self(), {:kill_runner, task_id, run_id}, @forced_stop_ms)
         runtime = %{runtime | interrupt_timer: nil, kill_timer: timer}
         {:noreply, put_in(state.running[task_id], runtime)}
@@ -608,6 +610,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp worker_reservation_current?(nil, %{agent: %{ssh_hosts: []}}, _state), do: true
+
+  defp worker_reservation_current?(nil, bundle, state) do
+    capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
+    bundle.agent.local_worker == true and worker_load(state, nil) < capacity
+  end
 
   defp worker_reservation_current?(host, bundle, state) when is_binary(host) do
     capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
@@ -908,10 +915,65 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_candidate(task, {state, remaining}, bundle) do
-    case select_worker(state, bundle) do
-      {:ok, worker_host} -> dispatch_with_worker(task, worker_host, state, remaining, bundle)
-      {:error, reason} -> {:halt, {%{state | dispatch_gate: reason}, remaining}}
+    backend = candidate_backend(task, bundle)
+
+    if backend_worker_eligible?(backend, bundle) do
+      case select_worker(state, bundle, backend) do
+        {:ok, worker_host} -> dispatch_with_worker(task, worker_host, state, remaining, bundle)
+        {:error, reason} -> {:halt, {%{state | dispatch_gate: reason}, remaining}}
+      end
+    else
+      {:cont, {block_backend_ineligible_candidate(task, backend, state), remaining}}
     end
+  end
+
+  # The task's selected backend has no worker pool at all (e.g. an ACP backend
+  # without a local worker). Blocking is deterministic and visible; the task
+  # must not silently queue forever.
+  defp block_backend_ineligible_candidate(task, backend, state) do
+    command = %Commands.BlockTask{
+      task_id: task.id,
+      reason: "No eligible worker for agent backend #{backend}: the backend is local-only and no local worker is enabled"
+    }
+
+    case Board.execute(command,
+           actor: %{type: :system, identity: "orchestrator"},
+           expected_revision: task.revision,
+           idempotency_key: "no-eligible-backend-worker:#{task.id}:#{task.revision}"
+         ) do
+      {:ok, _result} ->
+        state
+
+      {:error, reason} ->
+        Logger.warning("backend-ineligible block failed task_id=#{task.id} backend=#{backend} reason=#{inspect(reason)}")
+
+        state
+    end
+  end
+
+  defp candidate_backend(task, bundle) do
+    case Bundle.column(bundle, task.column_id) do
+      %{stage_id: stage_id} when is_binary(stage_id) ->
+        task.stage_selections[stage_id]["backend"] || "codex"
+
+      _ ->
+        "codex"
+    end
+  end
+
+  defp backend_worker_eligible?(backend, bundle) do
+    backend_protocol(bundle, backend) != "acp" or local_worker_enabled?(bundle)
+  end
+
+  defp backend_protocol(bundle, backend) do
+    case Map.get(bundle.backends, backend) do
+      %{protocol: protocol} -> protocol
+      _ -> "app_server"
+    end
+  end
+
+  defp local_worker_enabled?(bundle) do
+    bundle.agent.ssh_hosts == [] or bundle.agent.local_worker == true
   end
 
   defp dispatch_with_worker(task, worker_host, state, remaining, bundle) do
@@ -1059,6 +1121,7 @@ defmodule SymphonyElixir.Orchestrator do
           pid: async.pid,
           ref: async.ref,
           run_id: run["id"],
+          backend: run["backend"] || "codex",
           worker_host: worker_host,
           workspace_path: nil,
           session: nil,
@@ -1216,21 +1279,35 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp select_worker(_state, %{agent: %{ssh_hosts: []}}), do: {:ok, nil}
+  defp select_worker(_state, %{agent: %{ssh_hosts: []}}, _backend), do: {:ok, nil}
 
-  defp select_worker(state, bundle) do
+  defp select_worker(state, bundle, backend) do
     capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
 
-    bundle.agent.ssh_hosts
-    |> Enum.filter(fn host -> worker_healthy?(state, host) and worker_load(state, host) < capacity end)
-    |> choose_worker(state)
+    candidates = remote_candidates(state, bundle, backend, capacity) ++ local_candidates(state, bundle, capacity)
+
+    case candidates do
+      [] -> {:error, :no_eligible_worker}
+      _ -> {:ok, Enum.min_by(candidates, &{worker_load(state, &1), candidate_sort_key(&1)})}
+    end
   end
 
-  defp choose_worker([], _state), do: {:error, :no_eligible_worker}
-
-  defp choose_worker(hosts, state) do
-    {:ok, Enum.min_by(hosts, &worker_load(state, &1))}
+  defp remote_candidates(state, bundle, backend, capacity) do
+    if backend_protocol(bundle, backend) == "app_server" do
+      Enum.filter(bundle.agent.ssh_hosts, fn host ->
+        worker_healthy?(state, host) and worker_load(state, host) < capacity
+      end)
+    else
+      []
+    end
   end
+
+  defp local_candidates(state, bundle, capacity) do
+    if bundle.agent.local_worker == true and worker_load(state, nil) < capacity, do: [nil], else: []
+  end
+
+  defp candidate_sort_key(nil), do: {1}
+  defp candidate_sort_key(host), do: {0, host}
 
   defp reconcile_worker_health(state, bundle) do
     previous = state
@@ -1463,6 +1540,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp finish_stopped_run(task, run_id, reason) do
+    :ok = RunBridge.unregister_run(run_id)
+
     Board.execute(
       %Commands.RunFinished{
         task_id: task.id,
@@ -1477,6 +1556,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp fail_run(task_id, run_id, reason) do
+    :ok = RunBridge.unregister_run(run_id)
+
     with {:ok, task} <- Board.task(task_id),
          true <- task.active_run_id == run_id do
       Board.execute(
@@ -1495,7 +1576,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp run_stats(run_id), do: RunStats.summary(Projection.run_telemetry(run_id))
+  defp run_stats(run_id) do
+    backend =
+      case Board.run(run_id) do
+        {:ok, run} -> run["backend"] || "codex"
+        {:error, _reason} -> "codex"
+      end
+
+    AgentBackend.stats(backend, run_id)
+  end
 
   defp reconcile_external_effects(state) do
     tasks = Board.tasks()
@@ -1788,6 +1877,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp active_worker_reservation_current?(nil, %{agent: %{ssh_hosts: []}}, _state), do: true
 
+  defp active_worker_reservation_current?(nil, bundle, state) do
+    capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
+    bundle.agent.local_worker == true and worker_load(state, nil) <= capacity
+  end
+
   defp active_worker_reservation_current?(host, bundle, state) when is_binary(host) do
     capacity = bundle.agent.max_concurrent_agents_per_host || bundle.agent.max_concurrent_agents
     host in bundle.agent.ssh_hosts and worker_load(state, host) <= capacity
@@ -1795,7 +1889,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp active_worker_reservation_current?(_host, _bundle, _state), do: false
 
-  defp configured_worker?(nil, %{agent: %{ssh_hosts: []}}), do: true
+  defp configured_worker?(nil, bundle), do: local_worker_enabled?(bundle)
   defp configured_worker?(host, bundle) when is_binary(host), do: host in bundle.agent.ssh_hosts
   defp configured_worker?(_host, _bundle), do: false
 

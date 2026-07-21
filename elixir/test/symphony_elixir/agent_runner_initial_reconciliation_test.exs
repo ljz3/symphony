@@ -186,6 +186,7 @@ defmodule SymphonyElixir.AgentRunnerInitialReconciliationTest do
 
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
   end
 
   defp configure_before_run(workflow, nil), do: workflow

@@ -131,6 +131,14 @@ defmodule SymphonyElixir.Codex.Activity do
   defp method_summary("item/started", payload), do: item_summary("started", payload)
   defp method_summary("item/completed", payload), do: item_summary("completed", payload)
 
+  # KimiACP normalized session/update kinds (payload params is the ACP update map).
+  defp method_summary("kimi/agent_message_chunk", _payload), do: "agent response streaming"
+  defp method_summary("kimi/plan", _payload), do: "plan updated"
+  defp method_summary("kimi/usage_update", _payload), do: "context usage updated"
+  defp method_summary("kimi/config_option_update", _payload), do: "session configuration updated"
+  defp method_summary("kimi/tool_call", payload), do: kimi_tool_summary("tool call", payload)
+  defp method_summary("kimi/tool_call_update", payload), do: kimi_tool_summary("tool call update", payload)
+
   defp method_summary(<<"codex/event/", suffix::binary>>, _payload) do
     Map.get(@codex_event_summaries, suffix, "Codex activity")
   end
@@ -146,6 +154,17 @@ defmodule SymphonyElixir.Codex.Activity do
 
     label = if is_binary(type), do: Map.get(@item_labels, type), else: nil
     "#{label || "item"} #{state}"
+  end
+
+  defp kimi_tool_summary(fallback, payload) do
+    title = path(payload, [:params, "title"])
+    status = path(payload, [:params, "status"])
+
+    case {title, status} do
+      {title, status} when is_binary(title) and is_binary(status) -> "tool #{status}: #{title}"
+      {title, _} when is_binary(title) -> "#{fallback}: #{title}"
+      _ -> fallback
+    end
   end
 
   defp fallback_summary(event) when is_atom(event) or is_binary(event), do: "Codex activity"

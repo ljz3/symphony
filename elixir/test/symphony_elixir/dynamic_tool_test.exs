@@ -206,6 +206,7 @@ defmodule SymphonyElixir.DynamicToolTest do
 
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original_workflow)
@@ -544,6 +545,7 @@ defmodule SymphonyElixir.DynamicToolTest do
     source = publish_only_workflow_source()
     :ok = Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original)

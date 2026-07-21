@@ -3,9 +3,19 @@ defmodule SymphonyElixir.Board do
   Public command/query boundary for Symphony's local Git-backed Kanban board.
   """
 
-  alias SymphonyElixir.AgentStage
-  alias SymphonyElixir.Board.{Commands, History, Lease, Metrics, Projection, Sync, WorkpadStore, Writer}
-  alias SymphonyElixir.Codex.Catalog
+  alias SymphonyElixir.Board.{
+    Commands,
+    History,
+    Lease,
+    Metrics,
+    Projection,
+    Sync,
+    WorkpadStore,
+    WorkflowReloadPolicy,
+    Writer
+  }
+
+  alias SymphonyElixir.ModelCatalog
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow
@@ -114,7 +124,7 @@ defmodule SymphonyElixir.Board do
       github: orchestrator[:github] || %{available: false, error: :not_checked},
       preflights: orchestrator[:preflights] || [],
       publication_errors: orchestrator[:publication_errors] || %{},
-      codex_catalog: safe_status(Catalog, :status, %{available: false, error: :unavailable}),
+      model_catalogs: safe_status(ModelCatalog, :status, %{}),
       workers: orchestrator
     }
   end
@@ -226,37 +236,24 @@ defmodule SymphonyElixir.Board do
   end
 
   defp incompatible_paused_tasks(_previous, current) do
-    blocked_id = Bundle.blocked_column(current).id
-
     tasks()
-    |> Enum.reject(&(&1.runtime_state in ["starting", "running", "stopping"]))
-    |> Enum.each(&maybe_block_incompatible_task(&1, current, blocked_id))
+    |> WorkflowReloadPolicy.incompatible_tasks(current)
+    |> Enum.each(&block_incompatible_task(&1, current))
   rescue
     _error -> :ok
   end
 
-  defp maybe_block_incompatible_task(task, current, blocked_id) do
-    if incompatible_selections?(task, current) and task.column_id != blocked_id do
-      command = %Commands.BlockTask{
-        task_id: task.id,
-        reason: "Workflow model policy changed; explicit reselection required"
-      }
+  defp block_incompatible_task(task, current) do
+    command = %Commands.BlockTask{
+      task_id: task.id,
+      reason: "Workflow model policy changed; explicit reselection required"
+    }
 
-      execute(command,
-        actor: %{type: :system, identity: "workflow-reload"},
-        expected_revision: task.revision,
-        idempotency_key: "workflow-policy:#{current.hash}:#{task.id}"
-      )
-    end
-  end
-
-  defp incompatible_selections?(task, current) do
-    Enum.any?(task.stage_selections, fn {stage_id, selection} ->
-      case current.stages[stage_id] do
-        nil -> true
-        stage -> not AgentStage.permits?(stage, selection["model"], selection["effort"])
-      end
-    end)
+    execute(command,
+      actor: %{type: :system, identity: "workflow-reload"},
+      expected_revision: task.revision,
+      idempotency_key: "workflow-policy:#{current.hash}:#{task.id}"
+    )
   end
 
   defp safe_writer_state do

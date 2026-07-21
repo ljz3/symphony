@@ -57,7 +57,7 @@ Project:
 - Task state, criteria/evidence, dependencies, stage model selections, projected event history, runs, branch/PR metadata, sync state, and idempotency records.
 - Keep run workpads non-canonical and private, but make versioned JSON sidecars under `workpads/` authoritative over their SQLite projection. Record v2 stores a nullable initial-template SHA-256; every non-null value is exactly 64 lowercase hexadecimal characters. Ordinary writes preserve it, while legacy v1 records remain readable and conservatively meaningful. Publication manifests remain v1. Write each owner-only record with write-sync-rename before updating SQLite. After GitHub acknowledges a marker comment, atomically write an owner-only publication manifest before marking projection rows published. Publication identity is the task ID plus sorted run/invocation/content hashes and excludes timestamps.
 - On startup, export legacy SQLite-only workpads, validate every existing sidecar without overwriting it, rehydrate SQLite from the sidecars, and derive publication state only from manifests whose stored hashes match current records. A malformed sidecar aborts startup and reports its exact path.
-- Keep live run telemetry in an internally migrated SQLite table: the latest accepted cumulative token high-water mark and unique Codex turn IDs. On terminal finalization, copy the summary into the canonical run event and remove the transient row. Replay must reconstruct final stats without requiring telemetry.
+- Keep live run telemetry in an internally migrated SQLite table: the latest accepted cumulative token high-water mark and unique agent session turn IDs. On terminal finalization, copy the summary into the canonical run event and remove the transient row. Replay must reconstruct final stats without requiring telemetry.
 - Classify database health as healthy, confirmed corrupt, or indeterminate. Leave healthy databases untouched. An open, permission, NIF, or health-check execution failure is indeterminate and aborts startup without changing the database, WAL, or SHM files. For confirmed corruption, build and validate a checkpoint-derived or empty replacement first, retain the original database family under `runtime/recovery/`, and roll back installation failures. Never delete quarantines automatically; replay canonical events after startup.
 - Hold one process-level project lease. A second instance may expose diagnostics but cannot mutate or dispatch. Identify the owning machine independently of its mutable hostname so a dead local owner can be reclaimed without treating a remote owner as stale.
 
@@ -72,12 +72,21 @@ Keep only genuine project choices:
 - Required immutable `project.id` and uppercase `project.key`.
 - Optional source remote override, defaulting to `origin`; derive source Git root and remote default branch.
 - Optional board-history remote.
-- Codex command and project-wide sandbox/approval/network policy.
-- Agent concurrency and shared base/context prompt paths.
+- Named agent backends (`backends:`): each with a protocol (`app_server` or `acp`) and command. The
+  `app_server` protocol is reserved for the backend named `codex` and also carries the project-wide
+  sandbox/approval/network policy; the legacy top-level `codex:` section remains an alias for
+  `backends.codex` (defining both is an error). ACP backends carry an optional permission mode
+  (default `auto`) and require `allow_unsandboxed: true` as an explicit trusted-local-process
+  acknowledgement (see the security posture below).
+- Agent concurrency, SSH workers, and an optional `local_worker` flag that adds local capacity
+  alongside configured SSH hosts (with no SSH hosts, local execution is always enabled; without the
+  flag, SSH hosts keep their remote-only behavior), plus shared base/context prompt paths.
 - Optional named blocking jobs with an executable, literal fixed argument vector, required/optional/forbidden passthrough policy, and string environment map. `$SYMPHONY_JOB_ID` is the only reserved argument token.
 - Optional pre-claim dispatch preflight command and retry delay after explicit failure.
 - Optional deterministic squash-merge readiness command plus review and conflict dispatch-column IDs.
-- Named stages with prompt, workpad template, and stage-specific allowed model/effort map.
+- Named stages with prompt, workpad template, and a stage-specific allowed `(backend, model, effort?)`
+  policy. The legacy flat `allowed_model_efforts` map always means the codex backend and is a
+  migration error when no codex backend is configured.
 - Ordered columns and workflow-specific flags.
 - Human/agent transition edges.
 - Project-specific worktree hooks.
@@ -95,7 +104,7 @@ Load the YAML and every referenced template as one strict bundle. Parse all temp
 - Defer valid bundle activation until no agent is starting/running/stopping.
 - Freeze the complete stage bundle for each run.
 - Reject removal of column IDs still referenced by live tasks.
-- Activate model-policy changes, but move incompatible paused tasks to Blocked for explicit reselection.
+- Activate model-policy changes, but move only incompatible, non-running tasks outside the protected columns to Blocked for explicit reselection. Workflow reloads MUST leave tasks in `Backlog`, `Todo`, `Blocked`, `Done`, and `Cancelled` unchanged.
 - Prompt/template edits apply only to future runs.
 
 ### Prompt composition
@@ -159,16 +168,19 @@ Task creation always starts in the configured initial column and requires:
 - Required Markdown brief.
 - Nonempty ordered acceptance checklist.
 - Optional acyclic dependencies.
-- Model/effort choices for every reachable multi-pair agent stage.
+- Backend/model/effort choices (effort optional) for every reachable multi-pair agent stage.
 
 For each named stage:
 
-- Require a nonempty allowed model/effort map.
-- Resolve a singleton pair automatically.
-- Require task creation to select a pair when multiple combinations are allowed.
-- Show live Codex catalog intersection when available; trust workflow policy when catalog loading fails during task editing.
-- Revalidate the exact model through the complete hidden/paginated catalog at dispatch.
-- Freeze the stage pair for the run.
+- Require a nonempty allowed `(backend, model, effort?)` policy; backend names must exist in `backends:`.
+- Resolve a singleton triple automatically.
+- Require task creation to select a triple when multiple combinations are allowed.
+- Show the live per-backend catalog intersection when available; trust workflow policy when catalog
+  loading fails during task editing. A backend without a configured catalog reports itself disabled
+  quietly instead of spawning failing probes.
+- Revalidate the exact model (and effort, when selected) against the backend's live catalog or
+  session configuration at dispatch.
+- Freeze the stage triple for the run.
 - Move immediately to Blocked on any catalog/start/pair failure; never retry or substitute.
 
 Other invariants:
@@ -197,15 +209,36 @@ Replace tracker polling with event-driven candidate dispatch plus periodic runti
 5. Atomically commit a run claim and any `on_claim` transition.
 6. Create/reuse the persistent task worktree and branch when preflight did not already do so.
 7. Run hooks.
-8. Resolve and validate the frozen stage model/effort.
-9. Render prompt/workpad and start Codex app-server in the worktree.
+8. Resolve and validate the frozen stage backend/model/effort selection.
+9. Render prompt/workpad and start the selected backend's session (Codex app-server or Kimi ACP) in
+   the worktree through the `AgentBackend` adapter.
 10. Run continuation turns without a count or elapsed-time limit, reusing the same session and workpad.
 11. Require an agent transition before the invocation ends.
 
-Apply the configured Codex sandbox mode to every turn. For local `workspace-write` runs, grant write
-access to both the managed task worktree and its shared Git common directory while keeping the
+Apply the configured Codex sandbox mode to every Codex turn. For local `workspace-write` runs, grant
+write access to both the managed task worktree and its shared Git common directory while keeping the
 source checkout's working tree read-only. A task worktree must be able to stage and commit without
 broad source-checkout write access.
+
+ACP backends have no sandbox concept. v1 adopts the trusted-local-process model:
+`allow_unsandboxed: true` means the user accepts that the ACP agent runs with the same OS-user
+authority as Symphony itself. The session `cwd` (the task worktree) controls only the initial working
+directory; it is not confinement, and the configured permission mode only auto-handles permission
+prompts. The run-scoped MCP token and per-scope registration prevent accidental cross-run routing
+through the configured endpoint but are not a security boundary against a malicious same-user
+process: such a process could potentially reach the loopback `/mcp` endpoint or read runtime files.
+Running untrusted agents requires future OS/container isolation plus protection of the global MCP
+endpoint and runtime secrets.
+
+ACP sessions are local-only and speak the Agent Client Protocol over stdio. The adapter negotiates
+the protocol version, verifies HTTP MCP capability, authenticates with the backend's documented
+method, applies the selected model first, consumes the complete returned session configuration
+state, then validates and applies the thinking effort only when the selected model supports it, and
+applies the configured permission mode. stdout carries only JSON-RPC; stderr is captured separately.
+A stopped ACP run is cancelled with `session/cancel` before its process is terminated. There is no
+ACP resume in v1: a transport failure fails the run like any other invocation failure. ACP runs
+record `stats.token_usage` as `null`; the ACP `usage_update` notification reports context occupancy,
+not Codex-equivalent billed tokens, and is not interpreted as usage accounting.
 
 Outcomes:
 
@@ -227,12 +260,20 @@ Outcomes:
 - There is no agent retry queue.
 - On restart, any durable run without a live process is considered failed and moved to Blocked.
 - Human movement of a running card initiates graceful stop, then forced termination if needed; show the desired column separately from observed `stopping` runtime state.
-- Every completed, stopped, or failed run records `stats.duration_ms`, `stats.turn_count`, and `stats.token_usage`. Measure from `started_at` to `finished_at`, falling back to `claimed_at` when Codex never starts. Token usage contains cumulative input, cached-input, output, and total counts, or `null` when Codex supplied no authoritative total.
+- Every completed, stopped, or failed run records `stats.duration_ms`, `stats.turn_count`, and `stats.token_usage`. Measure from `started_at` to `finished_at`, falling back to `claimed_at` when the agent never starts. Token usage contains cumulative input, cached-input, output, and total counts, or `null` when the backend supplied no authoritative total (always the case for ACP backends in v1).
 - Terminal cleanup is idempotent and never rolls back the task when cleanup fails. For a marker-proven managed worktree, remove the worktree first and then delete only its local task branch; retain the marker for retry when branch deletion fails. Terminal cleanup never deletes a remote source branch or switches/touches the source checkout to make deletion succeed.
 
 Preserve SSH workers through a worktree backend:
 
-- Local execution uses the source repository’s object store.
+- Local execution uses the source repository’s object store. With no SSH hosts, local execution is
+  always enabled; `agent.local_worker: true` adds a local worker pool alongside configured SSH hosts,
+  counted in global capacity with its own load accounting.
+- The dispatch backend is resolved from the task's stage selection before any preflight or worker
+  choice. ACP backends are eligible only for the local worker. When the selected backend has no
+  eligible worker pool at all, dispatch moves the task to Blocked with a stable reason instead of
+  queuing it silently, and later eligible candidates still dispatch; a remote claim for an ACP
+  backend is rejected at claim validation. Transient worker unavailability (full or unhealthy pools)
+  keeps the existing gate-and-retry behavior.
 - Each SSH worker maintains a per-project bare source mirror and task worktrees, synchronized through the configured source remote.
 - Probe SSH worker health asynchronously under supervision, without an elapsed-time or inactivity
   deadline. Unknown and probing workers are not selectable. Explicit success records current healthy
@@ -246,9 +287,9 @@ Preserve SSH workers through a worktree backend:
   worktree reconciliation classify that transport failure as merge-pending rather than invariant
   failure. Do not add a timeout.
 
-### Run-scoped Codex tools
+### Run-scoped agent tools
 
-Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
+Remove `linear_graphql`. Advertise strict, task-scoped tools to every agent backend:
 
 - `symphony_task_context`
 - `symphony_workpad_read`
@@ -259,7 +300,13 @@ Remove `linear_graphql`. Advertise strict, task-scoped dynamic tools:
 - `symphony_task_create`
 - `symphony_job_run` when the active run's frozen bundle defines jobs
 
-Pass app-server call metadata to the executor and combine the active run ID with the call ID for mutation idempotency. This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task. Return only the event type, task revision/current column, and run status when the command returns a run; never echo task/run identity, runtime state, active-run identity, or canonical payloads.
+Codex receives them as app-server dynamic tools. ACP backends receive them as an HTTP MCP server
+scoped per `{run_id, invocation}`: each scope owns an isolated MCP session table behind
+`POST|GET|DELETE /mcp/runs/:run_id/:invocation`, authenticated by a bearer token HMAC-signed over a
+local-only secret (never committed) with the invocation inside the signed material. Tool execution
+delegates to the same executor, so semantics are identical on both channels.
+
+Pass call metadata to the executor and combine the active run ID with the call ID for mutation idempotency (the MCP bridge namespaces per-session request IDs with a session nonce). This preserves retransmission safety within a run while allowing app-server call IDs to restart in later runs without replaying an earlier run's result. Mutations are scoped to the current task/run except execution-ready follow-up creation, which always creates a Backlog task. Return only the event type, task revision/current column, and run status when the command returns a run; never echo task/run identity, runtime state, active-run identity, or canonical payloads.
 
 `symphony_review_complete` accepts a strict nested object containing the expected revision, exact
 reviewed head, `pass` or `rework` verdict, route, plan-policy status and summary, nonempty validation
@@ -416,12 +463,12 @@ Replace the read-only dashboard with a loopback-only LiveView application:
 - `/archive`: archived tasks.
 - Creation/edit forms enforce the complete task contract and only show selectors for stages with multiple allowed pairs.
 - Human moves are limited to configured transition edges; stopping/cancelling active work requires confirmation.
-- Header health covers workflow validity/pending activation, lease, board projection/history, remote sync, GitHub, per-task workpad publication failures, Codex catalog, and workers.
+- Header health covers workflow validity/pending activation, lease, board projection/history, remote sync, GitHub, per-task workpad publication failures, per-backend model catalogs, and workers.
 - Kanban cards show per-task token, agent-time, and turn summaries. Project and task totals include archived history and overlay active telemetry without changing canonical events.
 - Model and model-stage summaries reuse the same effective runs, combine effort levels, count distinct all-time and active thread IDs, and preserve missing dimensions as Unknown. The `/stats` HTML view additionally renders effort-level summaries beneath each model-stage row, while the internal stats snapshot remains model/stage-shaped. Completed-task participation counts distinct current or archived Done tasks per group only for runs with a canonical start time or an effective session ID, deduplicates within each model aggregate, and is intentionally non-additive across models and stages.
 - Sum reported input, cached-input, output, and total fields independently. Mark aggregates complete, partial, or unavailable; cached input is a subset of input, partial totals are lower bounds, and authoritative zero remains distinct from missing usage.
 - Agent time sums run durations and may exceed project age or current service uptime under concurrency. Project age begins at the earliest claim; uptime, safe latest activity, and per-worker rate limits reset with the orchestrator.
-- `/mcp`: Streamable HTTP MCP sharing the configured UI port and exposing only the three guarded task tools.
+- `/mcp`: Streamable HTTP MCP sharing the configured UI port and exposing only the three guarded task tools; `/mcp/runs/:run_id/:invocation`: token-authenticated run-scoped tool bridge for ACP backends.
 
 There is no REST JSON API. Former `/api/v1/state`, `/api/v1/tasks/:identifier`, and
 `/api/v1/refresh` paths fall through to the generic `404 not_found` response for every HTTP method.
@@ -510,7 +557,7 @@ Run targeted tests during implementation, then `mix specs.check` and the full `m
 ## Assumptions
 
 - One active Symphony instance owns one project.
-- The source repository is GitHub-hosted; Git, `gh`, and Codex are installed and authenticated where needed.
+- The source repository is GitHub-hosted; Git, `gh`, and Codex are installed and authenticated where needed. Kimi CLI is optional and required only when an ACP backend is configured; it must be installed and authenticated (`kimi login`) where used.
 - Board remotes are optional; local-only operation is fully supported.
 - Board UI/MCP bind only to loopback and require no authentication in v1.
 - Workpads are intentionally less durable than task/event history.

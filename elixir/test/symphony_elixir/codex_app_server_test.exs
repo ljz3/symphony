@@ -22,6 +22,7 @@ defmodule SymphonyElixir.CodexAppServerTest do
     File.write!(source.workflow, workflow)
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original_workflow)
@@ -54,6 +55,7 @@ defmodule SymphonyElixir.CodexAppServerTest do
     File.write!(source.workflow, workflow)
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original_workflow)
@@ -109,6 +111,7 @@ defmodule SymphonyElixir.CodexAppServerTest do
     File.write!(source.workflow, workflow)
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original_workflow)
@@ -174,6 +177,7 @@ defmodule SymphonyElixir.CodexAppServerTest do
     File.write!(source.workflow, workflow)
     Workflow.set_workflow_file_path(source.workflow)
     assert :ok = Workflow.Store.force_reload()
+    BoardFactory.await_activation()
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original_workflow)

@@ -4,6 +4,7 @@ defmodule SymphonyElixirWeb.StatsLive do
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixir.Board
+  alias SymphonyElixir.StageSelection
   alias SymphonyElixirWeb.TelemetryComponents, as: Telemetry
 
   @runtime_tick_ms 1_000
@@ -96,7 +97,7 @@ defmodule SymphonyElixirWeb.StatsLive do
             <tbody>
               <%= for model <- @metrics["models"] do %>
                 <tr class="model-summary-row">
-                  <th scope="row"><strong>{model_label(model["model"])}</strong><small>All stages · efforts combined</small></th>
+                  <th scope="row"><strong>{model_label(model["model"])}</strong><small>{backend_label(model["backend"])} · All stages · efforts combined</small></th>
                   <td class="numeric">{Telemetry.format_count(model["task_count"])}</td>
                   <td class="numeric">{Telemetry.format_count(model["completed_task_count"])}</td>
                   <td class="numeric"><span>{Telemetry.format_count(model["session_count"])}</span><small>{Telemetry.format_count(model["active_session_count"])} active</small></td>
@@ -156,10 +157,10 @@ defmodule SymphonyElixirWeb.StatsLive do
               <tr :for={run <- @metrics["active_runs"]}>
                 <td><a class="table-primary" href={"/tasks/#{run["task_identifier"]}"}>{run["task_identifier"]}</a><small>{run["stage_id"]}</small></td>
                 <td><span class="badge running">{run["status"]}</span></td>
-                <td><span>{run["model"]} · {run["effort"]}</span><small>{Telemetry.format_worker(run["worker_host"])}</small></td>
+                <td><span>{StageSelection.label({run["backend"] || "codex", run["model"], run["effort"]})}</span><small>{Telemetry.format_worker(run["worker_host"])}</small></td>
                 <td class="numeric"><span>{Telemetry.format_duration(active_run_time(run, @metrics, @now))}</span><small>{run["effective_stats"]["turn_count"]} turns</small></td>
                 <td class="numeric"><span>{Telemetry.format_token_total(run["effective_stats"]["token_usage"], if(run["effective_stats"]["token_usage"], do: "complete", else: "unavailable"))}</span><small>{Telemetry.format_usage_breakdown(run["effective_stats"]["token_usage"])}</small></td>
-                <td><span>{get_in(run, ["activity", "summary"]) || "Waiting for Codex activity"}</span><small>{get_in(run, ["activity", "at"]) || "—"}</small></td>
+                <td><span>{get_in(run, ["activity", "summary"]) || "Waiting for agent activity"}</span><small>{get_in(run, ["activity", "at"]) || "—"}</small></td>
                 <td>
                   <button
                     :if={run["session_id"]}
@@ -259,6 +260,8 @@ defmodule SymphonyElixirWeb.StatsLive do
 
   defp model_label(nil), do: "Unknown model"
   defp model_label(model), do: model
+  defp backend_label(nil), do: "Unknown backend"
+  defp backend_label(backend), do: backend
   defp stage_label(nil), do: "Unknown stage"
   defp stage_label(stage), do: stage
   defp effort_label(nil), do: "Unknown effort"

@@ -4,7 +4,7 @@ This guide defines stable, searchable logging conventions for the Git-backed Sym
 
 ## Goals
 
-- Correlate one project, task, run, Codex session, and worker without reconstructing state manually.
+- Correlate one project, task, run, backend, agent session, and worker without reconstructing state manually.
 - Capture enough lifecycle and event-history context to diagnose failures after restart.
 - Keep recurring messages stable enough for operational searches and alerts.
 - Avoid leaking prompts, workpads, credentials, or large protocol payloads.
@@ -18,7 +18,9 @@ Include these fields whenever they apply:
 - `task_identifier`: human identifier such as `SYM-42`.
 - `run_id`: durable stage-run UUID.
 - `stage_id`: named workflow stage.
-- `session_id`: Codex thread ID, or the established thread/turn correlation value.
+- `backend`: configured agent backend name (e.g. `codex`, `kimi`).
+- `session_id`: the backend's session identifier — a Codex thread ID, an ACP session ID, or the
+  established thread/turn correlation value.
 - `mcp_request_key`: non-sensitive hash used to correlate one MCP JSON-RPC request; creation also
   uses its session/request hash for idempotent replay.
 - `worker_host`: `local` or the selected SSH host.
@@ -53,7 +55,10 @@ For external effects, include the durable saga/effect identifier and PR number w
   worker exit, and terminal cleanup with task/run context.
 - `AgentRunner`: invocation start/completion/blocking with task/run/stage/worker context and
   `session_id` once known.
-- `Codex.AppServer`: session/turn lifecycle and protocol errors with task/run/session context.
+- `Codex.AppServer`: Codex session/turn lifecycle and protocol errors with task/run/session context.
+- `Backend.KimiACP` and `ACP.Client`: ACP session lifecycle, config-option application, cancellation,
+  and protocol/framing errors with task/run/session context; stderr stays in the per-run log file
+  and only its bounded tail is quoted on startup failures.
 - `MCP.Handler`: guarded completion/failure for the three external task tools with MCP
   session/request correlation; never log tool arguments, task content, task briefs, workpads, or
   raw lookup/list results. Creation retains its hashed session/request idempotency key.

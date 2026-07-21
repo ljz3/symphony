@@ -558,9 +558,9 @@ defmodule SymphonyElixir.GitHub do
     #{run_stats_marker(run["id"])}
     ### Symphony run stats · #{humanize_stage(run["stage_id"])}
 
-    | Status | Model | Effort | Runtime | Turns | Input | Cached input | Output | Total |
-    | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-    | #{markdown_cell(run["status"])} | #{markdown_cell(run["model"])} | #{markdown_cell(run["effort"])} | #{format_duration(stats["duration_ms"])} | #{stats["turn_count"]} | #{token_cells.input} | #{token_cells.cached} | #{token_cells.output} | #{token_cells.total} |
+    | Status | Backend | Model | Effort | Runtime | Turns | Input | Cached input | Output | Total |
+    | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | #{markdown_cell(run["status"])} | #{markdown_cell(run["backend"] || "codex")} | #{markdown_cell(run["model"])} | #{markdown_cell(run["effort"])} | #{format_duration(stats["duration_ms"])} | #{stats["turn_count"]} | #{token_cells.input} | #{token_cells.cached} | #{token_cells.output} | #{token_cells.total} |
     """
     |> String.trim()
   end

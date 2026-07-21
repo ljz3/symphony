@@ -393,6 +393,7 @@ defmodule SymphonyElixir.MCP.Handler do
         "id",
         "status",
         "stage_id",
+        "backend",
         "model",
         "effort",
         "worker_host",
@@ -476,8 +477,8 @@ defmodule SymphonyElixir.MCP.Handler do
     {"stage_selection_required", "An explicit model and effort selection is required for stage #{stage_id}."}
   end
 
-  defp safe_error({:stage_selection_not_permitted, stage_id, _model, _effort}) do
-    {"stage_selection_not_permitted", "The supplied model and effort are not permitted for stage #{stage_id}."}
+  defp safe_error({:stage_selection_not_permitted, stage_id, _backend, _model, _effort}) do
+    {"stage_selection_not_permitted", "The supplied backend, model, and effort are not permitted for stage #{stage_id}."}
   end
 
   defp safe_error({:invalid_stage_selection, stage_id}) do

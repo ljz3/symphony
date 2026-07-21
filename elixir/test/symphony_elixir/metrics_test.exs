@@ -199,6 +199,42 @@ defmodule SymphonyElixir.MetricsTest do
     assert hd(unknown["stages"])["active_session_count"] == 1
   end
 
+  test "groups the same model id separately per backend" do
+    now = ~U[2026-07-13 12:00:00Z]
+    codex_task = task("backend-codex", "SYM-30", "done")
+    kimi_task = task("backend-kimi", "SYM-31", "done")
+
+    codex_run =
+      run("codex-run", codex_task, "shared-model", "implementation", "thread-codex", usage(80, 40, 20, 100))
+
+    kimi_run =
+      run("kimi-run", kimi_task, "shared-model", "implementation", "acp-session-1", nil)
+      |> Map.put("backend", "kimi")
+
+    build =
+      Metrics.build(
+        [codex_task, kimi_task],
+        [codex_run, kimi_run],
+        %{},
+        %{online: false, running: []},
+        %{blocked: "blocked", done: "done"},
+        now
+      )
+
+    assert Enum.map(build.snapshot["models"], &{&1["backend"], &1["model"]}) == [
+             {"codex", "shared-model"},
+             {"kimi", "shared-model"}
+           ]
+
+    codex_group = Enum.find(build.snapshot["models"], &(&1["backend"] == "codex"))
+    assert codex_group["token_usage"] == usage(80, 40, 20, 100)
+
+    kimi_group = Enum.find(build.snapshot["models"], &(&1["backend"] == "kimi"))
+    assert kimi_group["run_count"] == 1
+    assert kimi_group["token_usage"] == nil
+    assert kimi_group["token_usage_state"] == "unavailable"
+  end
+
   test "separates efforts under each model stage without changing the public snapshot" do
     now = ~U[2026-07-13 12:00:00Z]
     completed_task = task("effort-completed", "SYM-25", "done")

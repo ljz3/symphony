@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Config.Schema do
     :source,
     :board,
     :agent,
+    :backends,
     :codex,
     :hooks,
     :jobs,
@@ -25,7 +26,8 @@ defmodule SymphonyElixir.Config.Schema do
           source: map(),
           board: map(),
           agent: map(),
-          codex: map(),
+          backends: %{required(String.t()) => map()},
+          codex: map() | nil,
           hooks: map(),
           jobs: map(),
           dispatch: map(),
@@ -45,7 +47,8 @@ defmodule SymphonyElixir.Config.Schema do
       source: bundle.source,
       board: bundle.board,
       agent: bundle.agent,
-      codex: Map.put(bundle.codex, :turn_sandbox_policy, nil),
+      backends: bundle.backends,
+      codex: codex_settings(bundle.backends["codex"]),
       hooks: bundle.hooks,
       jobs: bundle.jobs,
       dispatch: bundle.dispatch,
@@ -53,7 +56,8 @@ defmodule SymphonyElixir.Config.Schema do
       workspace: %{root: workspace_root},
       worker: %{
         ssh_hosts: bundle.agent.ssh_hosts,
-        max_concurrent_agents_per_host: bundle.agent.max_concurrent_agents_per_host
+        max_concurrent_agents_per_host: bundle.agent.max_concurrent_agents_per_host,
+        local_worker: bundle.agent.local_worker
       },
       server: %{host: "127.0.0.1", port: nil}
     }
@@ -62,6 +66,14 @@ defmodule SymphonyElixir.Config.Schema do
   @spec resolve_runtime_turn_sandbox_policy(t(), Path.t() | nil, keyword()) ::
           {:ok, map()} | {:error, term()}
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
+    if is_nil(settings.codex) do
+      {:error, :codex_backend_not_configured}
+    else
+      do_resolve_runtime_turn_sandbox_policy(settings, workspace, opts)
+    end
+  end
+
+  defp do_resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
     case settings.codex.thread_sandbox do
       "danger-full-access" ->
         {:ok, %{"type" => "dangerFullAccess"}}
@@ -80,6 +92,9 @@ defmodule SymphonyElixir.Config.Schema do
         {:error, {:unsupported_turn_sandbox, sandbox}}
     end
   end
+
+  defp codex_settings(nil), do: nil
+  defp codex_settings(codex) when is_map(codex), do: Map.put(codex, :turn_sandbox_policy, nil)
 
   defp resolve_workspace_write_policy(settings, workspace, opts) do
     root = workspace || settings.workspace.root

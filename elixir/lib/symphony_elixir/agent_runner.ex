@@ -5,9 +5,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
 
+  alias SymphonyElixir.AgentBackend
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.{Commands, Projection}
-  alias SymphonyElixir.Codex.{AppServer, DynamicTool, RunStats}
+  alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{Config, GitHub, PromptBuilder, Task, Worktree}
 
   @github_retry_initial_ms 1_000
@@ -41,26 +42,45 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_session(task, run, worktree, worker_host, recipient, opts) do
-    case AppServer.start_session(worktree,
-           worker_host: worker_host,
-           model: run["model"],
-           effort: run["effort"],
-           environment: managed_environment(task, run),
-           dynamic_tool_specs: DynamicTool.tool_specs(run)
-         ) do
+    backend = run["backend"] || "codex"
+    backend_module = AgentBackend.module_for!(backend)
+
+    case backend_module.start_session(worktree, session_opts(task, run, worker_host, backend, opts)) do
       {:ok, session} ->
         try do
           with :ok <- notify_session(recipient, task, run, session, worktree),
-               :ok <- mark_run_started(task.id, run["id"], session.thread_id, worktree) do
-            run_turns(session, task.id, run["id"], worktree, recipient, opts)
+               :ok <- mark_run_started(task.id, run["id"], AgentBackend.session_id(backend, session), worktree) do
+            run_turns(session, backend_module, task.id, run["id"], worktree, recipient, opts)
           end
         after
-          AppServer.stop_session(session)
+          backend_module.stop_session(session)
         end
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp session_opts(task, run, worker_host, "codex", _opts) do
+    [
+      worker_host: worker_host,
+      model: run["model"],
+      effort: run["effort"],
+      environment: managed_environment(task, run),
+      dynamic_tool_specs: DynamicTool.tool_specs(run)
+    ]
+  end
+
+  defp session_opts(task, run, worker_host, backend, opts) do
+    [
+      worker_host: worker_host,
+      model: run["model"],
+      effort: run["effort"],
+      environment: managed_environment(task, run),
+      backend: backend,
+      run_id: run["id"],
+      invocation: Keyword.get(opts, :invocation, 1)
+    ]
   end
 
   @spec reconcile_source(String.t(), String.t(), Path.t(), String.t() | nil) ::
@@ -79,8 +99,9 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp run_turns(session, task_id, run_id, worktree, recipient, opts) do
+  defp run_turns(session, backend_module, task_id, run_id, worktree, recipient, opts) do
     context = %{
+      backend_module: backend_module,
       task_id: task_id,
       run_id: run_id,
       worktree: worktree,
@@ -99,7 +120,7 @@ defmodule SymphonyElixir.AgentRunner do
          :ok <- validate_scope(task, run),
          prompt <- turn_prompt(task, run, turn, context.opts),
          {:ok, %{session: active_session}} <-
-           AppServer.run_turn(session, prompt, task,
+           context.backend_module.prompt(session, prompt, task,
              on_message:
                message_handler(
                  context.recipient,
@@ -187,7 +208,7 @@ defmodule SymphonyElixir.AgentRunner do
              task_id: task.id,
              run_id: run_id,
              outcome: outcome,
-             stats: RunStats.summary(Projection.run_telemetry(run_id))
+             stats: run_stats(run_id)
            },
            actor: %{type: :system, identity: "orchestrator"},
            expected_revision: task.revision,
@@ -196,6 +217,16 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, _result} -> :ok
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp run_stats(run_id) do
+    backend =
+      case Board.run(run_id) do
+        {:ok, run} -> run["backend"] || "codex"
+        {:error, _reason} -> "codex"
+      end
+
+    AgentBackend.stats(backend, run_id)
   end
 
   defp reconcile_github(task_id, run_id, worktree, backoff_ms) do

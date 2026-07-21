@@ -129,7 +129,8 @@ defmodule SymphonyElixir.Board.Validator do
          :dispatch <- column.role,
          :ok <- conflict_claim_allowed(task, column, bundle),
          :ok <- dependencies_satisfied(task, bundle),
-         {:ok, selection} <- fetch_stage_selection(task, column.stage_id, bundle) do
+         {:ok, selection} <- fetch_stage_selection(task, column.stage_id, bundle),
+         :ok <- validate_backend_worker(selection, command.worker_host, bundle) do
       claim_run(task, column, selection, command.worker_host, bundle)
     else
       true -> {:error, :task_not_dispatchable}
@@ -618,6 +619,7 @@ defmodule SymphonyElixir.Board.Validator do
       "start_column_id" => claimed_column.id,
       "claimed_from_column_id" => column.id,
       "status" => "starting",
+      "backend" => selection["backend"],
       "model" => selection["model"],
       "effort" => selection["effort"],
       "worker_host" => worker_host,
@@ -647,7 +649,7 @@ defmodule SymphonyElixir.Board.Validator do
       "prompt" => stage.prompt,
       "workpad_template_path" => stage.workpad_template_path,
       "workpad_template" => stage.workpad_template,
-      "allowed_model_efforts" => stage.allowed_model_efforts
+      "allowed" => Enum.map(stage.allowed, fn {backend, model, effort} -> [backend, model, effort] end)
     }
   end
 
@@ -1274,13 +1276,30 @@ defmodule SymphonyElixir.Board.Validator do
     stage = Map.fetch!(bundle.stages, stage_id)
 
     case Map.get(task.stage_selections, stage_id) do
-      %{"model" => model, "effort" => effort} = selection ->
-        if AgentStage.permits?(stage, model, effort),
-          do: {:ok, selection},
-          else: {:error, :stage_selection_incompatible}
+      %{"model" => model} = selection ->
+        backend = selection["backend"] || "codex"
+        effort = selection["effort"]
+
+        if AgentStage.permits?(stage, backend, model, effort) do
+          {:ok, %{"backend" => backend, "model" => model, "effort" => effort}}
+        else
+          {:error, :stage_selection_incompatible}
+        end
 
       _ ->
         {:error, :missing_stage_selection}
+    end
+  end
+
+  defp validate_backend_worker(selection, worker_host, bundle) do
+    backend = selection["backend"] || "codex"
+
+    case Map.get(bundle.backends, backend) do
+      %{protocol: "acp"} when is_binary(worker_host) ->
+        {:error, {:backend_remote_unsupported, backend}}
+
+      _ ->
+        :ok
     end
   end
 
@@ -1303,16 +1322,19 @@ defmodule SymphonyElixir.Board.Validator do
 
   defp resolve_selection(stage, nil) do
     case AgentStage.singleton_pair(stage) do
-      {:ok, {model, effort}} -> {:ok, %{"model" => model, "effort" => effort}}
+      {:ok, {backend, model, effort}} -> {:ok, %{"backend" => backend, "model" => model, "effort" => effort}}
       :multiple -> {:error, {:stage_selection_required, stage.id}}
     end
   end
 
-  defp resolve_selection(stage, %{"model" => model, "effort" => effort}) do
-    if AgentStage.permits?(stage, model, effort) do
-      {:ok, %{"model" => model, "effort" => effort}}
+  defp resolve_selection(stage, %{"model" => model} = selection) do
+    backend = selection["backend"] || "codex"
+    effort = selection["effort"]
+
+    if AgentStage.permits?(stage, backend, model, effort) do
+      {:ok, %{"backend" => backend, "model" => model, "effort" => effort}}
     else
-      {:error, {:stage_selection_not_permitted, stage.id, model, effort}}
+      {:error, {:stage_selection_not_permitted, stage.id, backend, model, effort}}
     end
   end
 

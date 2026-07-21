@@ -14,7 +14,7 @@ defmodule SymphonyElixir.WorkflowTest do
     assert bundle.columns |> Enum.map(& &1.name) |> Enum.take(5) ==
              ["Backlog", "Todo", "In Progress", "Automated Review", "Human Review"]
 
-    assert {:ok, {"gpt-5.5", "xhigh"}} = AgentStage.singleton_pair(bundle.stages["implementation"])
+    assert {:ok, {"codex", "gpt-5.5", "xhigh"}} = AgentStage.singleton_pair(bundle.stages["implementation"])
     assert Workflow.Bundle.initial_column(bundle).id == "backlog"
     assert Workflow.Bundle.blocked_column(bundle).id == "blocked"
     assert Workflow.Bundle.done_column(bundle).id == "done"
@@ -327,10 +327,156 @@ defmodule SymphonyElixir.WorkflowTest do
              Workflow.load(source.workflow)
   end
 
+  test "parses explicit backends and structured allowed_models" do
+    source = BoardFactory.workflow_source()
+
+    workflow =
+      source.workflow
+      |> File.read!()
+      |> replace_codex_section("""
+      backends:
+        codex:
+          protocol: app_server
+          command: codex app-server
+        kimi:
+          protocol: acp
+          command: kimi acp
+          allow_unsandboxed: true
+      """)
+      |> replace_first_stage_policy("""
+          allowed_models:
+            - {backend: codex, model: gpt-5.5, efforts: [xhigh]}
+            - {backend: kimi, model: kimi-code/k3, efforts: [max]}
+            - {backend: kimi, model: kimi-for-coding}
+      """)
+
+    File.write!(source.workflow, workflow)
+
+    assert {:ok, bundle} = Workflow.load(source.workflow)
+    assert bundle.backends["codex"][:protocol] == "app_server"
+    assert bundle.backends["codex"][:command] == "codex app-server"
+    assert bundle.backends["kimi"][:protocol] == "acp"
+    assert bundle.backends["kimi"][:permission_mode] == "auto"
+    assert bundle.codex[:command] == "codex app-server"
+
+    assert bundle.stages["implementation"].allowed == [
+             {"codex", "gpt-5.5", "xhigh"},
+             {"kimi", "kimi-code/k3", "max"},
+             {"kimi", "kimi-for-coding", nil}
+           ]
+
+    # Stages still using the legacy flat policy bind to the codex backend.
+    assert bundle.stages["rework"].allowed == [{"codex", "gpt-5.5", "xhigh"}]
+  end
+
+  test "a kimi-only configuration is valid without any codex backend" do
+    source = BoardFactory.workflow_source()
+
+    workflow =
+      source.workflow
+      |> File.read!()
+      |> replace_codex_section("""
+      backends:
+        kimi:
+          protocol: acp
+          command: kimi acp
+          allow_unsandboxed: true
+      """)
+      |> replace_all_stage_policies("""
+          allowed_models:
+            - {backend: kimi, model: kimi-code/k3, efforts: [max]}
+      """)
+
+    File.write!(source.workflow, workflow)
+
+    assert {:ok, bundle} = Workflow.load(source.workflow)
+    assert bundle.codex == nil
+    assert Map.keys(bundle.backends) == ["kimi"]
+    assert bundle.stages["implementation"].allowed == [{"kimi", "kimi-code/k3", "max"}]
+  end
+
+  test "rejects invalid backend and stage-policy combinations" do
+    source = BoardFactory.workflow_source()
+    original = File.read!(source.workflow)
+
+    acp_backend = """
+    backends:
+      kimi:
+        protocol: acp
+        command: kimi acp
+        allow_unsandboxed: true
+    """
+
+    cases = [
+      {{:duplicate_backend_definition, "codex"},
+       original <>
+         """
+
+         backends:
+           codex:
+             protocol: app_server
+         """},
+      {{:unknown_backend_protocol, "foo", "other"}, replace_codex_section(original, "backends:\n  foo:\n    protocol: other\n    command: foo run\n")},
+      {{:app_server_protocol_requires_codex_name, "claude"}, replace_codex_section(original, "backends:\n  claude:\n    protocol: app_server\n    command: claude run\n")},
+      {{:acp_unsandboxed_not_acknowledged, "kimi"}, replace_codex_section(original, "backends:\n  kimi:\n    protocol: acp\n    command: kimi acp\n")},
+      {:missing_backends, replace_codex_section(original, "backends: {}\n")},
+      {{:legacy_model_policy_requires_codex, "automated_review"}, replace_codex_section(original, acp_backend)},
+      {{:conflicting_model_policy_keys, "implementation"},
+       replace_first_stage_policy(original, """
+           allowed_model_efforts:
+             gpt-5.5: [xhigh]
+           allowed_models:
+             - {backend: codex, model: gpt-5.5, efforts: [xhigh]}
+       """)},
+      {{:unknown_backend_in_stage_policy, "implementation", "ghost"},
+       replace_first_stage_policy(original, """
+           allowed_models:
+             - {backend: ghost, model: gpt-5.5, efforts: [xhigh]}
+       """)},
+      {{:duplicate_model_effort, "implementation", "codex", "gpt-5.5", "xhigh"},
+       replace_first_stage_policy(original, """
+           allowed_models:
+             - {backend: codex, model: gpt-5.5, efforts: [xhigh]}
+             - {backend: codex, model: gpt-5.5, efforts: [xhigh]}
+       """)}
+    ]
+
+    Enum.each(cases, fn {expected, yaml} ->
+      File.write!(source.workflow, yaml)
+      assert {:error, ^expected} = Workflow.load(source.workflow)
+    end)
+  end
+
+  test "parses the local_worker agent flag with a false default" do
+    source = BoardFactory.workflow_source()
+
+    assert {:ok, bundle} = Workflow.load(source.workflow)
+    assert bundle.agent.local_worker == false
+
+    File.write!(source.workflow, insert_under(File.read!(source.workflow), "agent:", "  local_worker: true"))
+
+    assert {:ok, bundle} = Workflow.load(source.workflow)
+    assert bundle.agent.local_worker == true
+  end
+
   defp insert_under(yaml, heading, line) do
     String.replace(yaml, heading <> "\n", heading <> "\n" <> line <> "\n", global: false)
   end
 
   defp strip_jobs(yaml), do: Regex.replace(~r/\njobs:\n(?:  .+\n)+(?=\nstages:\n)/, yaml, "")
   defp strip_merge(yaml), do: Regex.replace(~r/\nmerge:\n(?:  .+\n)+(?=\nhooks:\n)/, yaml, "")
+
+  defp replace_codex_section(yaml, replacement) do
+    Regex.replace(~r/codex:\n(?:  .+\n)+(?=\nprompts:)/, yaml, replacement)
+  end
+
+  defp legacy_policy_text, do: "    allowed_model_efforts:\n      gpt-5.5: [xhigh]\n"
+
+  defp replace_first_stage_policy(yaml, replacement) do
+    String.replace(yaml, legacy_policy_text(), replacement, global: false)
+  end
+
+  defp replace_all_stage_policies(yaml, replacement) do
+    String.replace(yaml, legacy_policy_text(), replacement)
+  end
 end

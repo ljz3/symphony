@@ -23,29 +23,57 @@ defmodule SymphonyElixir.TaskAndStageTest do
     assert Task.archived?(%{task | archived_at: "now"})
   end
 
-  test "terminal state follows the active workflow roles" do
-    bundle = Config.bundle!()
-    refute Task.terminal?(task_fixture(), bundle)
-    assert Task.terminal?(%{task_fixture() | column_id: "done"}, bundle)
-  end
-
-  test "agent stage enumerates, resolves, and validates model effort pairs" do
+  test "stage encodes allowed triples as JSON arrays" do
     stage = %AgentStage{
       id: "review",
       prompt_path: "prompt.md",
       prompt: "prompt",
       workpad_template_path: "workpad.md",
       workpad_template: "workpad",
-      allowed_model_efforts: %{"b" => ["low", "high"], "a" => ["medium"]}
+      allowed: [{"kimi", "m", nil}, {"codex", "g", "high"}]
     }
 
-    assert AgentStage.pairs(stage) == [{"a", "medium"}, {"b", "low"}, {"b", "high"}]
-    assert AgentStage.singleton_pair(stage) == :multiple
-    assert AgentStage.permits?(stage, "b", "high")
-    refute AgentStage.permits?(stage, "b", "medium")
+    assert Jason.decode!(Jason.encode!(stage))["allowed"] == [["kimi", "m", nil], ["codex", "g", "high"]]
+  end
 
-    singleton = %{stage | allowed_model_efforts: %{"a" => ["medium"]}}
-    assert AgentStage.singleton_pair(singleton) == {:ok, {"a", "medium"}}
+  test "legacy selections without a backend decode as codex" do
+    map =
+      task_fixture()
+      |> Task.to_map()
+      |> Map.put("stage_selections", %{
+        "implementation" => %{"model" => "gpt-5.5", "effort" => "xhigh"}
+      })
+
+    task = Task.from_map(map)
+
+    assert task.stage_selections["implementation"] == %{"backend" => "codex", "model" => "gpt-5.5", "effort" => "xhigh"}
+  end
+
+  test "terminal state follows the active workflow roles" do
+    bundle = Config.bundle!()
+    refute Task.terminal?(task_fixture(), bundle)
+    assert Task.terminal?(%{task_fixture() | column_id: "done"}, bundle)
+  end
+
+  test "agent stage enumerates, resolves, and validates backend model effort triples" do
+    stage = %AgentStage{
+      id: "review",
+      prompt_path: "prompt.md",
+      prompt: "prompt",
+      workpad_template_path: "workpad.md",
+      workpad_template: "workpad",
+      allowed: [{"codex", "b", "low"}, {"codex", "b", "high"}, {"kimi", "a", nil}, {"codex", "a", "medium"}]
+    }
+
+    assert AgentStage.pairs(stage) == [{"codex", "a", "medium"}, {"codex", "b", "high"}, {"codex", "b", "low"}, {"kimi", "a", nil}]
+    assert AgentStage.singleton_pair(stage) == :multiple
+    assert AgentStage.permits?(stage, "codex", "b", "high")
+    assert AgentStage.permits?(stage, "kimi", "a", nil)
+    refute AgentStage.permits?(stage, "codex", "b", "medium")
+    refute AgentStage.permits?(stage, "codex", "a", nil)
+
+    singleton = %{stage | allowed: [{"kimi", "a", "max"}]}
+    assert AgentStage.singleton_pair(singleton) == {:ok, {"kimi", "a", "max"}}
   end
 
   defp task_fixture do

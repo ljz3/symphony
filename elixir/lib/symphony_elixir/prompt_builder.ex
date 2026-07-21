@@ -10,7 +10,7 @@ defmodule SymphonyElixir.PromptBuilder do
   # Symphony runner contract
 
   - Work only in the task worktree supplied as the current working directory.
-  - Never read from, write to, or run a Codex turn in the source repository checkout.
+  - Never read from, write to, or run an agent turn in the source repository checkout.
   - Use only the run-scoped Symphony tools advertised for this task and run.
   - This execution is non-interactive; do not request human input.
   - Keep the stage workpad current with decisions, validation, and handoff evidence.
@@ -47,7 +47,7 @@ defmodule SymphonyElixir.PromptBuilder do
   def continuation_prompt(turn_number) when is_integer(turn_number) and turn_number > 1 do
     """
     Continue the current stage from the existing worktree and shared workpad.
-    This is continuation turn #{turn_number} in the same run and Codex session.
+    This is continuation turn #{turn_number} in the same run and agent session.
     Do not restart completed investigation. Finish the remaining work and make a
     required task transition before this invocation ends.
     """

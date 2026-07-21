@@ -50,6 +50,7 @@ defmodule SymphonyElixir.CLI.StartupError do
     SymphonyElixir.Board.WorkpadStore => "Workpad store",
     SymphonyElixir.Board.Writer => "Board event writer",
     SymphonyElixir.Codex.Catalog => "Codex model catalog",
+    SymphonyElixir.Backend.KimiACP.Catalog => "Kimi model catalog",
     SymphonyElixir.HttpServer => "HTTP server",
     SymphonyElixir.JobManager => "Project job store",
     SymphonyElixir.JobSupervisor => "Project job supervisor",
