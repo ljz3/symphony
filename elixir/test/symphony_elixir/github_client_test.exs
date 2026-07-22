@@ -276,13 +276,19 @@ defmodule SymphonyElixir.GitHubClientTest do
     refute second.feedback_fingerprint == first.feedback_fingerprint
   end
 
-  test "review snapshot accepts only GitHub's aggregate approved decision" do
+  test "review snapshot observes requested changes without requiring aggregate approval" do
     source = BoardFactory.workflow_source()
     task = task_fixture("TEST", github: %{"number" => 42})
 
-    for {decision, expected} <- [{"", false}, {"CHANGES_REQUESTED", false}, {"APPROVED", true}] do
+    for {decision, expected_approved, expected_no_requested_changes} <- [
+          {"", false, true},
+          {"CHANGES_REQUESTED", false, false},
+          {"APPROVED", true, true}
+        ] do
       System.put_env("FAKE_GH_REVIEW_DECISION", decision)
-      assert {:ok, %{approved: ^expected}} = GitHub.review_snapshot(task, source.root)
+
+      assert {:ok, %{approved: ^expected_approved, no_requested_changes: ^expected_no_requested_changes}} =
+               GitHub.review_snapshot(task, source.root)
     end
   end
 
@@ -296,7 +302,7 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert File.read!(Path.join(root, "last_pr_view_args")) =~ "isDraft"
 
     assert Map.keys(first) |> Enum.sort() ==
-             ~w(approved checks_fingerprint draft feedback_fingerprint head_sha merge_sha mergeable number observed_at required_checks_green source_head_sha state unresolved_review_threads url)a
+             ~w(approved checks_fingerprint draft feedback_fingerprint head_sha merge_sha mergeable no_requested_changes number observed_at required_checks_green source_head_sha state unresolved_review_threads url)a
 
     System.put_env("FAKE_GH_DRAFT_VALUE", "false")
     assert {:ok, second} = GitHub.review_snapshot(task, source.root)

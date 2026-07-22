@@ -217,6 +217,7 @@ defmodule SymphonyElixir.GitHub do
          head_sha: pr["headRefOid"],
          source_head_sha: source_head,
          approved: pr["reviewDecision"] == "APPROVED",
+         no_requested_changes: pr["reviewDecision"] != "CHANGES_REQUESTED",
          mergeable: pr["mergeable"],
          merge_sha: get_in(pr, ["mergeCommit", "oid"]),
          unresolved_review_threads: Enum.count(threads, &(&1["is_resolved"] != true)),

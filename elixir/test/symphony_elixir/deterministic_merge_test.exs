@@ -167,7 +167,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     assert current_task().metadata["blocked_reason"] =~ "Repeated merge conflict"
   end
 
-  test "stale head, changed feedback, absent or changes-requested approval, and failed checks return to review", %{
+  test "stale head, changed feedback, requested changes, and failed checks return to review", %{
     task: task,
     bundle: bundle
   } do
@@ -175,8 +175,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       {:stale_head, %{source_head: @updated}},
       {:feedback, %{snapshot: %{feedback_fingerprint: "changed"}}},
       {:check_fingerprint, %{snapshot: %{checks_fingerprint: "changed"}}},
-      {:approval_absent, %{snapshot: %{approved: false, review_decision: ""}}},
-      {:changes_requested, %{snapshot: %{approved: false, review_decision: "CHANGES_REQUESTED"}}},
+      {:changes_requested, %{snapshot: %{approved: false, no_requested_changes: false, review_decision: "CHANGES_REQUESTED"}}},
       {:draft, %{snapshot: %{draft: true}}},
       {:checks, %{snapshot: %{required_checks_green: false}}}
     ]
@@ -192,6 +191,14 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       assert count_call(:readiness) == 0
       assert count_call(:guarded_squash) == 0
     end)
+  end
+
+  test "ready reviewed head does not require aggregate GitHub approval", %{task: task, bundle: bundle} do
+    scenario(%{snapshot: %{approved: false, no_requested_changes: true, review_decision: ""}})
+
+    assert {:ok, :completed} = run(task, bundle)
+    assert current_task().column_id == "done"
+    assert count_call(:guarded_squash) == 1
   end
 
   test "transient provider failure remains merge-pending while a missing pull request blocks", %{
@@ -392,7 +399,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
   } do
     review_cases = [
       %{snapshot: %{draft: true}},
-      %{snapshot: %{approved: false}},
+      %{snapshot: %{no_requested_changes: false}},
       %{snapshot: %{unresolved_review_threads: 1}},
       %{snapshot: %{required_checks_green: false}},
       %{snapshot: %{feedback_fingerprint: "changed"}},
@@ -536,12 +543,12 @@ defmodule SymphonyElixir.DeterministicMergeTest do
     cases = [
       {%{review_snapshot: {:error, :pull_request_not_linked}}, {:ok, :review_required}},
       {%{snapshot: %{head_sha: "invalid"}}, {:ok, :blocked}},
-      {%{snapshot: %{approved: false}}, {:ok, :review_required}},
+      {%{snapshot: %{no_requested_changes: false}}, {:ok, :review_required}},
       {%{task_loader: invalid_task_loader}, {:ok, :review_required}},
       {%{snapshot: %{state: "CLOSED"}}, {:ok, :blocked}},
       {%{snapshot: %{number: 8}}, {:ok, :review_required}},
       {
-        %{source_head: @updated, snapshot: %{source_head_sha: @updated, approved: false}},
+        %{source_head: @updated, snapshot: %{source_head_sha: @updated, no_requested_changes: false}},
         {:ok, :review_required}
       }
     ]
@@ -608,7 +615,11 @@ defmodule SymphonyElixir.DeterministicMergeTest do
       {%{review_snapshot: third_snapshot({:error, :pull_request_not_linked})}, {:ok, :review_required}, "automated_review"},
       {%{review_snapshot: third_snapshot({:error, :worktree_not_clean})}, {:ok, :blocked}, "blocked"},
       {%{review_snapshot: third_snapshot({:ok, snapshot(%{draft: true})})}, {:ok, :review_required}, "automated_review"},
-      {%{review_snapshot: third_snapshot({:ok, snapshot(%{approved: false})})}, {:ok, :review_required}, "automated_review"},
+      {
+        %{review_snapshot: third_snapshot({:ok, snapshot(%{no_requested_changes: false})})},
+        {:ok, :review_required},
+        "automated_review"
+      },
       {%{review_snapshot: third_snapshot({:ok, snapshot(%{state: "MERGED", merge_sha: @merge})})}, {:ok, :completed}, "done"},
       {%{review_snapshot: third_snapshot({:ok, snapshot(%{state: "CLOSED"})})}, {:ok, :blocked}, "blocked"}
     ]
@@ -918,6 +929,7 @@ defmodule SymphonyElixir.DeterministicMergeTest do
         head_sha: @head,
         source_head_sha: @head,
         approved: true,
+        no_requested_changes: true,
         mergeable: "MERGEABLE",
         merge_sha: nil,
         unresolved_review_threads: 0,

@@ -1373,6 +1373,7 @@ defmodule SymphonyElixir.OrchestratorTest do
          head_sha: @head,
          source_head_sha: @head,
          approved: true,
+         no_requested_changes: true,
          required_checks_green: true,
          unresolved_review_threads: 0,
          feedback_fingerprint: "feedback-v1",

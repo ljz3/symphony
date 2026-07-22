@@ -76,11 +76,13 @@ defmodule SymphonyElixir.ReviewAttestationTest do
     assert replayed.review_attestation == attested.review_attestation
   end
 
-  test "a pass requires an explicit provider-ready non-draft snapshot" do
+  test "a pass requires an explicit provider-ready non-draft snapshot without requested changes" do
     cases = [
       {:draft, Map.put(provider_snapshot(), :draft, true), "passing_review_not_merge_ready"},
       {:missing, Map.delete(provider_snapshot(), :draft), "invalid_review_provider_snapshot"},
-      {:malformed, Map.put(provider_snapshot(), :draft, "false"), "invalid_review_provider_snapshot"}
+      {:malformed, Map.put(provider_snapshot(), :draft, "false"), "invalid_review_provider_snapshot"},
+      {:requested_changes, Map.put(provider_snapshot(), :no_requested_changes, false), "passing_review_not_merge_ready"},
+      {:missing_requested_changes, Map.delete(provider_snapshot(), :no_requested_changes), "invalid_review_provider_snapshot"}
     ]
 
     Enum.each(cases, fn {name, snapshot, expected_reason} ->
@@ -740,7 +742,8 @@ defmodule SymphonyElixir.ReviewAttestationTest do
       draft: false,
       head_sha: @head,
       source_head_sha: @head,
-      approved: true,
+      approved: false,
+      no_requested_changes: true,
       required_checks_green: true,
       unresolved_review_threads: 0,
       feedback_fingerprint: "feedback-v1",

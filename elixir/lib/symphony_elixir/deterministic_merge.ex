@@ -94,7 +94,7 @@ defmodule SymphonyElixir.DeterministicMerge do
       {changed_criteria?(task), "acceptance criteria or evidence changed after review"},
       {not criteria_complete?(task), "acceptance criteria or evidence changed after review"},
       {snapshot_value(snapshot, :draft) != false, "pull request is draft or otherwise not ready"},
-      {snapshot_value(snapshot, :approved) != true, "pull-request approval is missing or changed"},
+      {snapshot_value(snapshot, :no_requested_changes) != true, "pull-request has requested changes"},
       {snapshot_value(snapshot, :unresolved_review_threads) != 0, "pull-request review threads are unresolved"},
       {snapshot_value(snapshot, :required_checks_green) != true, "required checks are not green"}
     ]
@@ -691,7 +691,7 @@ defmodule SymphonyElixir.DeterministicMerge do
       {changed_checks?(task, snapshot), "required check contexts changed after review"},
       {not criteria_complete?(task), "acceptance criteria or evidence changed after review"},
       {snapshot_value(snapshot, :draft) != false, "pull request is draft or otherwise not ready"},
-      {snapshot_value(snapshot, :approved) != true, "pull-request approval is missing or changed"},
+      {snapshot_value(snapshot, :no_requested_changes) != true, "pull-request has requested changes"},
       {snapshot_value(snapshot, :unresolved_review_threads) != 0, "pull-request review threads are unresolved"},
       {snapshot_value(snapshot, :required_checks_green) != true, "required checks are not green"}
     ]

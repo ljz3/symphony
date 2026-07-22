@@ -29,7 +29,8 @@ Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merg
 
 Draft or otherwise non-ready pull requests leave Automated Review without a verdict and enter Human
 Review, the publish-and-ready pause path. A human returns the ready PR to Automated Review for a
-fresh structured review; only that explicit non-draft snapshot may pass to Merging. Human Review →
+fresh structured review; only that explicit non-draft snapshot may pass to Merging, and no GitHub
+aggregate approval is required. Human Review →
 Rework requires feedback submitted through the board (the task page's review-feedback box);
 feedback-less human transitions on that edge are rejected. The submission is recorded
 canonically, rendered into the rework prompt, and stays pending until a rework run completes

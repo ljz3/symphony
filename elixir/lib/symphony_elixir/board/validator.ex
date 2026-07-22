@@ -1042,6 +1042,8 @@ defmodule SymphonyElixir.Board.Validator do
          true <- value(snapshot, :source_head_sha) == reviewed_head,
          state when state in ["OPEN", "open"] <- value(snapshot, :state),
          draft when is_boolean(draft) <- value(snapshot, :draft),
+         no_requested_changes when is_boolean(no_requested_changes) <-
+           value(snapshot, :no_requested_changes),
          fingerprint when is_binary(fingerprint) and fingerprint != "" <- value(snapshot, :feedback_fingerprint),
          checks when is_binary(checks) and checks != "" <- value(snapshot, :checks_fingerprint) do
       :ok
@@ -1060,7 +1062,7 @@ defmodule SymphonyElixir.Board.Validator do
          true <- value(command.plan_policy, :status) in ["not_required", "followed"],
          true <- no_open_findings?(command.findings),
          true <- value(command.provider_snapshot, :draft) == false,
-         true <- value(command.provider_snapshot, :approved) == true,
+         true <- value(command.provider_snapshot, :no_requested_changes) == true,
          true <- value(command.provider_snapshot, :required_checks_green) == true,
          true <- value(command.provider_snapshot, :unresolved_review_threads) == 0,
          true <- merge.review_column == task.column_id do

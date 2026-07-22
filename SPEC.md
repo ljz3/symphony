@@ -317,7 +317,7 @@ Pass call metadata to the executor and combine the active run ID with the call I
 `symphony_review_complete` accepts a strict nested object containing the expected revision, exact
 reviewed head, `pass` or `rework` verdict, route, plan-policy status and summary, nonempty validation
 evidence, and structured findings. The service, not the model, reads the current clean worktree,
-source head, PR head/state, aggregate review decision, every paginated review thread and comment,
+source head, PR head/state, requested-change review state, every paginated review thread and comment,
 the bounded boolean PR draft state, and every required check context. The draft state participates
 in the feedback fingerprint. It stores the reviewer/run identity, observation time, PR number,
 and deterministic feedback/check fingerprints plus a canonical fingerprint of the exact acceptance-
@@ -325,9 +325,10 @@ criterion multiset and its current evidence in a canonical review-attestation ev
 projection exposes only the explicit nested attestation allowlist, never raw provider payloads.
 
 A passing attestation requires the exact source/task/PR head, completed criteria with evidence, a
-non-deviating plan policy, no blocker/high findings, aggregate GitHub `APPROVED`, no unresolved
-threads, green required checks, and an explicitly non-draft PR, and routes only to the unique system
-merge column. A missing or non-boolean provider draft field invalidates the snapshot. A rework
+non-deviating plan policy, no blocker/high findings, no requested changes, no unresolved threads,
+green required checks, and an explicitly non-draft PR, and routes only to the unique system merge
+column. A GitHub aggregate `APPROVED` review is not required after Human Review readiness. A missing
+or non-boolean provider draft or requested-change field invalidates the snapshot. A rework
 attestation requires findings and routes only along a configured agent edge to a non-review dispatch
 column or Blocked. Direct agent movement into the merge column is rejected. A later canonical source
 or PR-head change, linked PR identity change, or acceptance-criterion/evidence change clears a
@@ -418,8 +419,8 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
   readiness alone cannot reuse or create a passing attestation.
 - Cancelled closes any open PR with a reason.
 - Reconcile at most one system merge worker at a time, separately from agent capacity and
-  `AgentRunner`. Revalidate the exact reviewed source/PR head, feedback fingerprint, aggregate
-  approval, boolean non-draft state, all review threads/comments, all required checks, and acceptance
+  `AgentRunner`. Revalidate the exact reviewed source/PR head, feedback fingerprint, no-requested-
+  changes state, boolean non-draft state, all review threads/comments, all required checks, and acceptance
   evidence before any merge effect. Initial, post-readiness, clean-update, and guarded-squash gates
   all require `draft: false`. A draft PR or valid failed/pending check payload returns to review;
   provider transport, authentication, or process failure leaves the task merge-pending for
@@ -432,7 +433,7 @@ Use a service-owned `gh` CLI client, not a Codex connector or new HTTP SDK.
 - Run the configured merge-readiness command to natural process exit without an elapsed-time,
   inactivity, or output deadline only after a freshly reviewed head contains the fetched target.
   After readiness exits, reload the canonical task, re-observe the clean local source and provider PR
-  identity/head/approval/threads/checks/fingerprints, fetch the target again, and compare it again.
+  identity/head/requested-changes/threads/checks/fingerprints, fetch the target again, and compare it again.
   Target movement synchronizes through the normal clean-update/conflict path and returns to exact-head
   review; even a changed target already contained by the task head invalidates the attestation instead
   of squashing under readiness evidence for another target. Repeat the source/provider observation
@@ -535,7 +536,8 @@ Add targeted coverage for:
   claim/on-claim behavior, stage handoffs, no-retry blocking, orphan recovery, human stop,
   GitHub-wait exception, capacity, and dependency gating.
 - Cumulative-only token extraction, camel/snake-case token fields, cached tokens, high-water behavior, unique turns, telemetry migration/recovery/cleanup, terminal stats for completion/stop/failure, and `null` unavailable usage.
-- Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, aggregate approval,
+- Fake-`gh` GitHub zero/green/failed/pending/malformed/failure check handling, requested-change state
+  without aggregate approval,
   complete thread/comment pagination beyond 100 comments, meaningful-diff draft PR creation including
   documentation-only and zero-diff cases, publication markers, readiness prerequisites,
   rework-to-draft, cancellation, and guarded merge validation.

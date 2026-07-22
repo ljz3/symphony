@@ -130,6 +130,7 @@ defmodule SymphonyElixir.IntegrationFixRegressionTest do
                     head_sha: task_head,
                     source_head_sha: task_head,
                     approved: true,
+                    no_requested_changes: true,
                     required_checks_green: true,
                     unresolved_review_threads: 0,
                     feedback_fingerprint: "feedback-real",

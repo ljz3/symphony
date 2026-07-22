@@ -46,10 +46,10 @@ Backlog -> Todo -> In Progress -> Automated Review --passing attestation--> Merg
 Human Review, Blocked, and Cancelled are explicit side paths. A draft or otherwise non-ready pull
 request moves from Automated Review to Human Review, where it is published and marked ready. A human
 then returns it to Automated Review for a fresh structured review; only that ready, non-draft review
-may pass into Merging. Human Review → Rework requires feedback submitted from the task page's
-review-feedback box (feedback-less human transitions on that edge are rejected); the submission is
-recorded canonically and rendered into the rework prompt, and the
-transition returns the pull request to draft and repeats the same
+may pass into Merging, and no GitHub aggregate approval is required. Human Review → Rework requires
+feedback submitted from the task page's review-feedback box (feedback-less human transitions on that
+edge are rejected); the submission is recorded canonically and rendered into the rework prompt, and
+the transition returns the pull request to draft and repeats the same
 ready/re-review cycle. A verified merge conflict receives a constrained repair run. It commits the
 recorded-path-only merge, validates that exact committed
 source once through the frozen full-validation job, pushes the same head, and then returns atomically
