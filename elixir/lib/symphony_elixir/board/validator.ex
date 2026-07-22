@@ -13,6 +13,8 @@ defmodule SymphonyElixir.Board.Validator do
 
   @rank_gap 1_024
   @active_runtime_states ["starting", "running", "stopping"]
+  @human_review_column_id "human_review"
+  @rework_column_id "rework"
 
   @type mutation :: %{
           required(:event_type) => String.t(),
@@ -43,6 +45,33 @@ defmodule SymphonyElixir.Board.Validator do
     with {:ok, task} <- Projection.get_task(command.task_id),
          {:ok, target} <- fetch_column(bundle, command.column_id) do
       move_task(task, target, command, actor, bundle)
+    end
+  end
+
+  def validate(%Commands.SubmitFeedback{task_id: task_id, feedback: feedback}, actor, bundle) do
+    with :ok <- human_actor(actor),
+         {:ok, task} <- Projection.get_task(task_id),
+         {:ok, feedback} <- nonempty(feedback, :feedback),
+         %Column{} = target <- Bundle.column(bundle, @rework_column_id),
+         :ok <- feedback_source(task),
+         :ok <- check_transition(task, target, false, actor, bundle) do
+      entry = %{"text" => feedback, "at" => now(), "actor" => actor.identity}
+
+      task =
+        bump(
+          task,
+          target
+          |> transition_attrs()
+          |> Map.put(
+            :metadata,
+            Map.update(task.metadata, "human_feedback_pending", [entry], &(&1 ++ [entry]))
+          )
+        )
+
+      mutation("human_feedback_submitted", task, nil, %{"feedback" => entry})
+    else
+      nil -> {:error, :rework_column_not_configured}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -526,10 +555,8 @@ defmodule SymphonyElixir.Board.Validator do
   end
 
   defp move_task(task, target, command, actor, bundle) do
-    with false <- Task.archived?(task),
-         :ok <- move_permission(task, target, command.force, actor, bundle),
-         :ok <- done_prerequisites(task, target),
-         :ok <- ready_prerequisites(task, target) do
+    with :ok <- feedback_move_allowed(task, target, actor),
+         :ok <- check_transition(task, target, command.force, actor, bundle) do
       cond do
         active?(task) and actor.type == :human and not command.force ->
           task = bump(task, %{desired_column_id: target.id, runtime_state: "stopping"})
@@ -539,21 +566,58 @@ defmodule SymphonyElixir.Board.Validator do
           block_task(task, command.reason || "Moved to Blocked", bundle, nil)
 
         true ->
-          rank = command.rank || Projection.max_rank(target.id) + @rank_gap
+          attrs = transition_attrs(target)
+          rank = command.rank || attrs.rank
 
-          task =
-            bump(task, %{
-              column_id: target.id,
-              rank: rank,
-              blocked_from_column_id: nil,
-              desired_column_id: nil
-            })
+          task = bump(task, %{attrs | rank: rank})
 
           mutation("task_transitioned", task, nil)
       end
+    end
+  end
+
+  # The Human Review → Rework human edge requires feedback: humans must use
+  # SubmitFeedback. A plain MoveTask on that edge is rejected regardless of
+  # client-side UI guards; system moves retain the recovery escape hatch.
+  defp feedback_move_allowed(%{column_id: @human_review_column_id}, %{id: @rework_column_id}, %{type: :human}),
+    do: {:error, :feedback_required}
+
+  defp feedback_move_allowed(_task, _target, _actor), do: :ok
+
+  defp check_transition(task, target, force, actor, bundle) do
+    with false <- Task.archived?(task),
+         :ok <- move_permission(task, target, force, actor, bundle),
+         :ok <- done_prerequisites(task, target),
+         :ok <- ready_prerequisites(task, target) do
+      :ok
     else
       true -> {:error, :task_archived}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp transition_attrs(target) do
+    %{
+      column_id: target.id,
+      rank: Projection.max_rank(target.id) + @rank_gap,
+      blocked_from_column_id: nil,
+      desired_column_id: nil
+    }
+  end
+
+  defp feedback_source(task) do
+    cond do
+      Task.archived?(task) ->
+        {:error, :task_archived}
+
+      task.column_id != @human_review_column_id ->
+        {:error, {:invalid_feedback_source, task.column_id}}
+
+      active?(task) ->
+        {:error, :task_active}
+
+      true ->
+        :ok
     end
   end
 
@@ -705,8 +769,24 @@ defmodule SymphonyElixir.Board.Validator do
 
       true ->
         finished = completed_run(run, outcome, "completed", stats)
-        task = bump(task, %{active_run_id: nil, runtime_state: nil, desired_column_id: nil})
+
+        task =
+          task
+          |> consume_feedback_after_rework(run, bundle)
+          |> bump(%{active_run_id: nil, runtime_state: nil, desired_column_id: nil})
+
         mutation("run_finished", task, finished)
+    end
+  end
+
+  # Pending human-review feedback is consumed only by a rework run that finishes
+  # with the task outside Blocked; failed, blocked, and stopped rework retains
+  # it for the next rework prompt.
+  defp consume_feedback_after_rework(task, run, bundle) do
+    if run["stage_id"] == @rework_column_id and task.column_id != Bundle.blocked_column(bundle).id do
+      %{task | metadata: Map.delete(task.metadata, "human_feedback_pending")}
+    else
+      task
     end
   end
 

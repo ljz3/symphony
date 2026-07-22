@@ -62,6 +62,7 @@ defmodule SymphonyElixir.WorkflowTest do
     {% if preflight %}preflight={{ preflight.status }}:{{ preflight.phase }}:{{ preflight.fingerprint }}:{{ preflight.reason }}:{{ preflight.started_at }}:{{ preflight.last_activity_at }}:{{ preflight.completed_at }}:{{ preflight.next_retry_at }}{% endif %}
     {% if job %}job={{ job.job_id }}:{{ job.job }}:{{ job.status }}:{{ job.started_at }}:{{ job.finished_at }}:{{ job.elapsed_ms }}:{{ job.source_fingerprint }}{% endif %}
     {% if latest_workpad %}latest={{ latest_workpad.run_id }}:{{ latest_workpad.stage_id }}:{{ latest_workpad.status }}:{{ latest_workpad.finished_at }}:{{ latest_workpad.invocation }}:{{ latest_workpad.updated_at }}:{{ latest_workpad.content }}{% endif %}
+    {% if human_feedback.size > 0 %}{% for item in human_feedback %}feedback={{ item.text }}:{{ item.actor }}:{{ item.at }}{% endfor %}{% endif %}
     stage={{ stage.id }} workpad={{ workpad }} turn={{ turn_number }}
     """)
 

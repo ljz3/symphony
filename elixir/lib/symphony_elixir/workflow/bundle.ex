@@ -1027,7 +1027,14 @@ defmodule SymphonyElixir.Workflow.Bundle do
         "source_fingerprint" => String.duplicate("e", 64)
       },
       "workpad" => "workpad",
-      "turn_number" => 1
+      "turn_number" => 1,
+      "human_feedback" => [
+        %{
+          "text" => "Tighten the parser",
+          "at" => "2000-01-01T00:00:00Z",
+          "actor" => "board-ui"
+        }
+      ]
     }
 
     first_run =
@@ -1038,6 +1045,7 @@ defmodule SymphonyElixir.Workflow.Bundle do
       |> Map.put("github", %{})
       |> Map.put("dependencies", [])
       |> Map.put("latest_workpad", nil)
+      |> Map.put("human_feedback", [])
       |> Map.delete("preflight")
       |> Map.delete("job")
 

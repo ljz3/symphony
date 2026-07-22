@@ -25,6 +25,28 @@ defmodule SymphonyElixir.WorkflowReloadPolicyTest do
     assert WorkflowReloadPolicy.incompatible_tasks([task("in_progress", "running")], changed_bundle) == []
   end
 
+  test "preserves custom blocked and terminal columns and flags selections for removed stages" do
+    {:ok, bundle} = Workflow.load(Path.expand("../../WORKFLOW.yml", __DIR__))
+
+    custom =
+      Enum.map([:blocked, :terminal], fn role ->
+        %Workflow.Bundle.Column{id: "custom_#{role}", name: "Custom #{role}", role: role, position: 99}
+      end)
+
+    bundle = %{bundle | columns: bundle.columns ++ custom}
+    preserved = [task("custom_blocked"), task("custom_terminal")]
+
+    assert WorkflowReloadPolicy.incompatible_tasks(preserved, incompatible_bundle(bundle)) == []
+
+    removed_stage = %{
+      task("in_progress")
+      | stage_selections: %{"removed_stage" => %{"model" => "gpt-5.5", "effort" => "xhigh"}}
+    }
+
+    assert WorkflowReloadPolicy.incompatible_tasks([removed_stage], bundle)
+           |> Enum.map(& &1.column_id) == ["in_progress"]
+  end
+
   defp incompatible_bundle(bundle) do
     stage = %{bundle.stages["implementation"] | allowed: [{"codex", "reload-incompatible", "xhigh"}]}
     %{bundle | stages: Map.put(bundle.stages, "implementation", stage)}

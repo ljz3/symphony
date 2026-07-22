@@ -10,8 +10,8 @@ defmodule SymphonyElixir.Board do
     Metrics,
     Projection,
     Sync,
-    WorkpadStore,
     WorkflowReloadPolicy,
+    WorkpadStore,
     Writer
   }
 

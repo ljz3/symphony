@@ -251,6 +251,106 @@ defmodule SymphonyElixir.PromptBuilderTest do
     refute after_history =~ "HISTORICAL-SENTINEL"
   end
 
+  test "rework prompts render only the feedback pending for the current review cycle" do
+    {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback cycle")})
+    human_review = BoardFactory.advance_to_human_review(created)
+
+    assert {:ok, %{"task" => rework_one}} =
+             Board.execute(
+               %Commands.SubmitFeedback{task_id: human_review["id"], feedback: "First-cycle feedback"},
+               actor: %{type: :human, identity: "board-ui"},
+               expected_revision: human_review["revision"],
+               idempotency_key: BoardFactory.unique("feedback-one")
+             )
+
+    assert {:ok, %{"task" => claimed_one, "run" => run_one}} = claim_task(rework_one)
+    assert run_one["stage_id"] == "rework"
+
+    {:ok, task_one} = Board.task(claimed_one["id"])
+    prompt_one = PromptBuilder.build_prompt(task_one, run_one)
+    assert prompt_one =~ "Human review feedback pending for this rework"
+    assert prompt_one =~ "First-cycle feedback"
+
+    assert {:ok, %{"task" => reviewed_one}} =
+             Board.execute(%Commands.MoveTask{task_id: claimed_one["id"], column_id: "automated_review"},
+               actor: %{type: :agent, identity: run_one["id"]},
+               expected_revision: claimed_one["revision"],
+               idempotency_key: BoardFactory.unique("cycle-one-review")
+             )
+
+    assert {:ok, %{"task" => finished_one}} = finish_run(reviewed_one, run_one)
+    assert finished_one["metadata"]["human_feedback_pending"] == nil
+
+    # Second review cycle: claim the automated review column and return to Human Review.
+    assert {:ok, %{"task" => claimed_two, "run" => run_two}} = claim_task(finished_one)
+
+    assert {:ok, %{"task" => human_review_two}} =
+             Board.execute(%Commands.MoveTask{task_id: claimed_two["id"], column_id: "human_review"},
+               actor: %{type: :agent, identity: run_two["id"]},
+               expected_revision: claimed_two["revision"],
+               idempotency_key: BoardFactory.unique("cycle-two-human-review")
+             )
+
+    assert {:ok, %{"task" => finished_two}} = finish_run(human_review_two, run_two)
+
+    assert {:ok, %{"task" => rework_two}} =
+             Board.execute(
+               %Commands.SubmitFeedback{task_id: finished_two["id"], feedback: "Second-cycle feedback"},
+               actor: %{type: :human, identity: "board-ui"},
+               expected_revision: finished_two["revision"],
+               idempotency_key: BoardFactory.unique("feedback-two")
+             )
+
+    assert {:ok, %{"task" => claimed_three, "run" => run_three}} = claim_task(rework_two)
+
+    {:ok, task_three} = Board.task(claimed_three["id"])
+    prompt_three = PromptBuilder.build_prompt(task_three, run_three)
+    assert prompt_three =~ "Second-cycle feedback"
+    refute prompt_three =~ "First-cycle feedback"
+
+    cleanup_active_run(claimed_three["id"], run_three["id"])
+  end
+
+  test "rework prompt renders cleanly without pending human feedback" do
+    {created, _} = BoardFactory.create_task(%{title: BoardFactory.unique("No feedback rework")})
+    human_review = BoardFactory.advance_to_human_review(created)
+
+    # Rework can legitimately lack human feedback (agent-routed or
+    # system-forced moves); the prompt must render safely regardless.
+    assert {:ok, %{"task" => rework}} =
+             Board.execute(%Commands.MoveTask{task_id: human_review["id"], column_id: "rework", force: true},
+               actor: :system,
+               expected_revision: human_review["revision"],
+               idempotency_key: BoardFactory.unique("force-rework")
+             )
+
+    assert {:ok, %{"task" => claimed, "run" => run}} = claim_task(rework)
+
+    {:ok, task} = Board.task(claimed["id"])
+    prompt = PromptBuilder.build_prompt(task, run)
+    assert prompt =~ "Treat reviewer feedback as a fresh implementation pass"
+    refute prompt =~ "Human review feedback pending"
+
+    cleanup_active_run(claimed["id"], run["id"])
+  end
+
+  defp claim_task(task) do
+    Board.execute(%Commands.ClaimRun{task_id: task["id"]},
+      actor: :system,
+      expected_revision: task["revision"],
+      idempotency_key: BoardFactory.unique("claim")
+    )
+  end
+
+  defp finish_run(task, run) do
+    Board.execute(
+      %Commands.RunFinished{task_id: task["id"], run_id: run["id"], outcome: %{}, stats: nil},
+      actor: :system,
+      expected_revision: task["revision"],
+      idempotency_key: BoardFactory.unique("finish")
+    )
+  end
+
   defp index(string, pattern), do: :binary.match(string, pattern) |> elem(0)
 
   defp cleanup_active_run(task_id, run_id) do

@@ -6,12 +6,10 @@ defmodule SymphonyElixirWeb.TaskLive do
   alias SymphonyElixir.AgentStage
   alias SymphonyElixir.Board
   alias SymphonyElixir.Board.Commands
-  alias SymphonyElixir.GitHub
   alias SymphonyElixir.ModelCatalog
   alias SymphonyElixir.StageSelection
   alias SymphonyElixir.Task
   alias SymphonyElixir.Workflow
-  alias SymphonyElixir.Worktree
   alias SymphonyElixirWeb.TelemetryComponents, as: Telemetry
 
   @runtime_tick_ms 1_000
@@ -57,13 +55,14 @@ defmodule SymphonyElixirWeb.TaskLive do
 
   def handle_event("transition", %{"column_id" => column_id}, socket) do
     task = socket.assigns.task
+    command = %Commands.MoveTask{task_id: task.id, column_id: column_id, reason: "Human transition"}
+    command_result(socket, command, task.revision, "Transition requested")
+  end
 
-    with :ok <- maybe_prepare_rework(task, column_id),
-         command <- %Commands.MoveTask{task_id: task.id, column_id: column_id, reason: "Human transition"} do
-      command_result(socket, command, task.revision, "Transition requested")
-    else
-      {:error, reason} -> {:noreply, put_flash(socket, :error, format_error(reason))}
-    end
+  def handle_event("submit_feedback", %{"feedback" => feedback}, socket) do
+    task = socket.assigns.task
+    command = %Commands.SubmitFeedback{task_id: task.id, feedback: feedback}
+    command_result(socket, command, task.revision, "Feedback sent to Rework")
   end
 
   def handle_event("resume", _params, socket) do
@@ -246,6 +245,20 @@ defmodule SymphonyElixirWeb.TaskLive do
             <button :if={@task.column_id == @blocked_column.id} phx-click="resume" class="transition-button">Resume to {column_name(@bundle, @task.blocked_from_column_id)}</button>
             <button :if={Task.terminal?(@task, @bundle) and !Task.archived?(@task)} phx-click="archive" class="transition-button danger" data-confirm="Archive this task? Its event history remains canonical.">Archive</button>
 
+            <div :if={@task.column_id == "human_review" and @rework_allowed?} class="review-feedback">
+              <h3>Review feedback</h3>
+              <form phx-submit="submit_feedback" class="task-form">
+                <label>Feedback for the rework agent
+                  <textarea name="feedback" rows="5" required placeholder="Describe what must change…"></textarea>
+                </label>
+                <button type="submit">Send feedback to Rework</button>
+              </form>
+              <article :for={entry <- @feedback_history} class="feedback-entry">
+                <pre>{entry["text"]}</pre>
+                <p><small>{entry["actor"]} · {entry["at"]}</small></p>
+              </article>
+            </div>
+
             <dl class="task-facts">
               <dt>Branch</dt><dd><code>{@task.branch}</code></dd>
               <dt>Rank</dt><dd>{@task.rank}</dd>
@@ -268,6 +281,8 @@ defmodule SymphonyElixirWeb.TaskLive do
         {:ok, bundle} = Workflow.current()
         {:ok, task_metrics} = Board.task_metrics(task.id)
         runs = task_metrics["runs"]
+        events = Board.events(task.id)
+        targets = human_targets(bundle, task)
 
         socket
         |> assign(:task, task)
@@ -275,11 +290,13 @@ defmodule SymphonyElixirWeb.TaskLive do
         |> assign(:runs, runs)
         |> assign(:task_stats, task_metrics["stats"])
         |> assign(:metrics_generated_at, task_metrics["generated_at"])
-        |> assign(:events, Board.events(task.id))
+        |> assign(:events, events)
         |> assign(:workpads, load_workpads(runs))
         |> assign(:dependency_options, Enum.reject(Board.tasks(), &(&1.id == task.id)))
         |> assign(:blocked_column, Workflow.Bundle.blocked_column(bundle))
-        |> assign(:human_targets, human_targets(bundle, task))
+        |> assign(:human_targets, visible_targets(targets, task))
+        |> assign(:rework_allowed?, Enum.any?(targets, &(&1.id == "rework")))
+        |> assign(:feedback_history, feedback_history(events))
         |> assign(:multi_pair_stages, Enum.filter(Map.values(bundle.stages), &(length(AgentStage.pairs(&1)) > 1)))
 
       {:error, :not_found} ->
@@ -352,24 +369,23 @@ defmodule SymphonyElixirWeb.TaskLive do
     end)
   end
 
-  defp maybe_prepare_rework(%{column_id: "human_review", github: %{"number" => _number}} = task, "rework") do
-    case Board.runs(task.id) do
-      [%{"workspace_path" => path, "worker_host" => worker_host} | _] when is_binary(path) ->
-        GitHub.convert_to_draft(task, path, worker_host: worker_host)
-
-      [%{"worker_host" => worker_host} | _] ->
-        GitHub.convert_to_draft(task, Worktree.path(task), worker_host: worker_host)
-
-      _ ->
-        GitHub.convert_to_draft(task, Worktree.path(task))
-    end
-  end
-
-  defp maybe_prepare_rework(_task, _column_id), do: :ok
-
   defp human_targets(bundle, task) do
     ids = Map.get(bundle.human_transitions, task.column_id, [])
     Enum.filter(bundle.columns, &(&1.id in ids))
+  end
+
+  # Rework from Human Review must go through the feedback form, not the generic
+  # transition button.
+  defp visible_targets(targets, %Task{column_id: "human_review"}),
+    do: Enum.reject(targets, &(&1.id == "rework"))
+
+  defp visible_targets(targets, _task), do: targets
+
+  defp feedback_history(events) do
+    events
+    |> Enum.filter(&(&1["type"] == "human_feedback_submitted"))
+    |> Enum.map(& &1["payload"]["feedback"])
+    |> Enum.reject(&is_nil/1)
   end
 
   defp load_workpads(runs) do
@@ -415,6 +431,9 @@ defmodule SymphonyElixirWeb.TaskLive do
       run["effective_stats"]["duration_ms"]
     end
   end
+
+  defp format_error(:feedback_required),
+    do: "Review feedback is required before Rework — use the feedback box below."
 
   defp format_error(reason), do: "Board command rejected: #{inspect(reason)}"
   defp schedule_runtime_tick, do: Process.send_after(self(), :metrics_tick, @runtime_tick_ms)

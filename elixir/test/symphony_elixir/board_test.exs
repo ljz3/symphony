@@ -484,4 +484,234 @@ defmodule SymphonyElixir.BoardTest do
     assert published_creator["stats_publication"]["publication_id"] ==
              "creator-recovery-test-cleanup"
   end
+
+  describe "SubmitFeedback" do
+    test "records feedback canonically, transitions to Rework atomically, and survives replay" do
+      {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback")})
+      human_review = BoardFactory.advance_to_human_review(created)
+
+      assert {:ok, %{"task" => rework}} =
+               Board.execute(
+                 %Commands.SubmitFeedback{
+                   task_id: human_review["id"],
+                   feedback: "  Fix the parser edge case\nAdd tests  "
+                 },
+                 actor: %{type: :human, identity: "board-ui"},
+                 expected_revision: human_review["revision"],
+                 idempotency_key: BoardFactory.unique("feedback")
+               )
+
+      assert rework["column_id"] == "rework"
+      assert rework["revision"] == human_review["revision"] + 1
+
+      assert [entry] = rework["metadata"]["human_feedback_pending"]
+      assert entry["text"] == "Fix the parser edge case\nAdd tests"
+      assert entry["actor"] == "board-ui"
+      assert is_binary(entry["at"])
+
+      assert Enum.any?(Board.events(rework["id"]), fn event ->
+               event["type"] == "human_feedback_submitted" and
+                 event["payload"]["feedback"] == entry
+             end)
+
+      assert {:ok, events} = History.events("symphony")
+      assert :ok = Projection.rebuild(events)
+      assert {:ok, replayed} = Board.task(rework["id"])
+      assert replayed.metadata["human_feedback_pending"] == [entry]
+
+      assert Enum.any?(Board.events(rework["id"]), fn event ->
+               event["type"] == "human_feedback_submitted" and
+                 event["payload"]["feedback"] == entry
+             end)
+    end
+
+    test "rejects invalid source, archived, active, blank, non-human, and stale submissions" do
+      {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback rejections")})
+      {todo, _} = BoardFactory.move(created, "todo")
+
+      assert {:error, {:invalid_feedback_source, "todo"}} =
+               Board.execute(%Commands.SubmitFeedback{task_id: todo["id"], feedback: "Please fix"},
+                 actor: :human,
+                 expected_revision: todo["revision"],
+                 idempotency_key: BoardFactory.unique("feedback-source")
+               )
+
+      {archive_source, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback archived")})
+      {cancelled, _} = BoardFactory.move(archive_source, "cancelled")
+
+      assert {:ok, %{"task" => archived}} =
+               Board.execute(%Commands.ArchiveTask{task_id: cancelled["id"]},
+                 actor: :human,
+                 expected_revision: cancelled["revision"],
+                 idempotency_key: BoardFactory.unique("archive")
+               )
+
+      assert {:error, :task_archived} =
+               Board.execute(%Commands.SubmitFeedback{task_id: archived["id"], feedback: "Please fix"},
+                 actor: :human,
+                 expected_revision: archived["revision"],
+                 idempotency_key: BoardFactory.unique("feedback-archived")
+               )
+
+      {active_source, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback active")})
+      {active_review, active_run} = BoardFactory.advance_to_human_review(active_source, false)
+
+      assert {:error, :task_active} =
+               Board.execute(%Commands.SubmitFeedback{task_id: active_review["id"], feedback: "Please fix"},
+                 actor: :human,
+                 expected_revision: active_review["revision"],
+                 idempotency_key: BoardFactory.unique("feedback-active")
+               )
+
+      assert {:error, {:human_actor_required, _actor}} =
+               Board.execute(%Commands.SubmitFeedback{task_id: active_review["id"], feedback: "Please fix"},
+                 actor: :system,
+                 expected_revision: active_review["revision"],
+                 idempotency_key: BoardFactory.unique("feedback-system")
+               )
+
+      assert {:error, {:required_text, :feedback}} =
+               Board.execute(%Commands.SubmitFeedback{task_id: active_review["id"], feedback: "   "},
+                 actor: :human,
+                 expected_revision: active_review["revision"],
+                 idempotency_key: BoardFactory.unique("feedback-blank")
+               )
+
+      assert {:error, {:stale_task_revision, _, _, _}} =
+               Board.execute(%Commands.SubmitFeedback{task_id: active_review["id"], feedback: "Please fix"},
+                 actor: :human,
+                 expected_revision: active_review["revision"] + 1,
+                 idempotency_key: BoardFactory.unique("feedback-stale")
+               )
+
+      assert {:ok, _cleanup} =
+               Board.execute(
+                 %Commands.RunFailed{task_id: active_review["id"], run_id: active_run["id"], reason: :test_cleanup},
+                 actor: :system,
+                 expected_revision: active_review["revision"],
+                 idempotency_key: BoardFactory.unique("cleanup")
+               )
+    end
+
+    test "rejects a plain human MoveTask from Human Review to Rework" do
+      {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback bypass")})
+      human_review = BoardFactory.advance_to_human_review(created)
+
+      assert {:error, :feedback_required} =
+               Board.execute(%Commands.MoveTask{task_id: human_review["id"], column_id: "rework"},
+                 actor: :human,
+                 expected_revision: human_review["revision"],
+                 idempotency_key: BoardFactory.unique("bypass")
+               )
+
+      # System force moves remain available as a recovery escape hatch.
+      assert {:ok, %{"task" => forced}} =
+               Board.execute(%Commands.MoveTask{task_id: human_review["id"], column_id: "rework", force: true},
+                 actor: :system,
+                 expected_revision: human_review["revision"],
+                 idempotency_key: BoardFactory.unique("force-bypass")
+               )
+
+      assert forced["column_id"] == "rework"
+      assert forced["metadata"]["human_feedback_pending"] == nil
+    end
+
+    test "pending feedback survives failed and blocked rework and is consumed by a successful one" do
+      {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback lifecycle")})
+      human_review = BoardFactory.advance_to_human_review(created)
+
+      assert {:ok, %{"task" => rework}} = submit_feedback(human_review, "Keep the cache bounded")
+      assert length(pending_feedback(rework["id"])) == 1
+
+      # A failed rework run retains the pending feedback.
+      assert {:ok, %{"task" => claimed, "run" => run}} = claim_run(rework)
+
+      assert {:ok, %{"task" => blocked}} =
+               Board.execute(
+                 %Commands.RunFailed{task_id: claimed["id"], run_id: run["id"], reason: :boom},
+                 actor: :system,
+                 expected_revision: claimed["revision"],
+                 idempotency_key: BoardFactory.unique("fail")
+               )
+
+      assert blocked["column_id"] == "blocked"
+      assert length(pending_feedback(blocked["id"])) == 1
+
+      assert {:ok, %{"task" => resumed}} = resume_task(blocked)
+      assert resumed["column_id"] == "rework"
+
+      # A rework run finishing outside Blocked consumes the pending feedback.
+      assert {:ok, %{"task" => reclaimed, "run" => second_run}} = claim_run(resumed)
+
+      assert {:ok, %{"task" => reviewed}} =
+               Board.execute(%Commands.MoveTask{task_id: reclaimed["id"], column_id: "automated_review"},
+                 actor: %{type: :agent, identity: second_run["id"]},
+                 expected_revision: reclaimed["revision"],
+                 idempotency_key: BoardFactory.unique("review")
+               )
+
+      assert {:ok, %{"task" => finished}} = finish_run(reviewed, second_run)
+      assert finished["column_id"] == "automated_review"
+      assert pending_feedback(finished["id"]) == nil
+    end
+
+    test "pending feedback survives a stopped rework run" do
+      {created, _key} = BoardFactory.create_task(%{title: BoardFactory.unique("Feedback stopped")})
+      human_review = BoardFactory.advance_to_human_review(created)
+
+      assert {:ok, %{"task" => rework}} = submit_feedback(human_review, "Document the trade-off")
+      assert {:ok, %{"task" => claimed, "run" => run}} = claim_run(rework)
+
+      assert {:ok, %{"task" => stopping}} =
+               Board.execute(%Commands.MoveTask{task_id: claimed["id"], column_id: "cancelled"},
+                 actor: :human,
+                 expected_revision: claimed["revision"],
+                 idempotency_key: BoardFactory.unique("stop")
+               )
+
+      assert stopping["runtime_state"] == "stopping"
+
+      assert {:ok, %{"task" => cancelled}} = finish_run(stopping, run)
+      assert cancelled["column_id"] == "cancelled"
+      assert length(pending_feedback(cancelled["id"])) == 1
+    end
+  end
+
+  defp submit_feedback(task, feedback) do
+    Board.execute(%Commands.SubmitFeedback{task_id: task["id"], feedback: feedback},
+      actor: %{type: :human, identity: "board-ui"},
+      expected_revision: task["revision"],
+      idempotency_key: BoardFactory.unique("feedback")
+    )
+  end
+
+  defp claim_run(task) do
+    Board.execute(%Commands.ClaimRun{task_id: task["id"]},
+      actor: :system,
+      expected_revision: task["revision"],
+      idempotency_key: BoardFactory.unique("claim")
+    )
+  end
+
+  defp finish_run(task, run) do
+    Board.execute(
+      %Commands.RunFinished{task_id: task["id"], run_id: run["id"], outcome: %{}, stats: nil},
+      actor: :system,
+      expected_revision: task["revision"],
+      idempotency_key: BoardFactory.unique("finish")
+    )
+  end
+
+  defp resume_task(task) do
+    Board.execute(%Commands.ResumeTask{task_id: task["id"]},
+      actor: :human,
+      expected_revision: task["revision"],
+      idempotency_key: BoardFactory.unique("resume")
+    )
+  end
+
+  defp pending_feedback(task_id) do
+    {:ok, task} = Board.task(task_id)
+    task.metadata["human_feedback_pending"]
+  end
 end

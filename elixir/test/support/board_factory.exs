@@ -41,6 +41,61 @@ defmodule SymphonyElixir.BoardFactory do
     {updated, result}
   end
 
+  @doc """
+  Drive a freshly created task through implementation and automated review into
+  Human Review, returning the inactive human_review task map. The optional
+  `finish` flag controls whether the final run is finished; pass `false` to
+  leave the task active in Human Review.
+  """
+  def advance_to_human_review(task, finish \\ true) do
+    {todo, _result} = move(task, "todo")
+
+    {:ok, %{"task" => claimed, "run" => run}} =
+      Board.execute(%Commands.ClaimRun{task_id: todo["id"]},
+        actor: :system,
+        expected_revision: todo["revision"],
+        idempotency_key: unique("claim")
+      )
+
+    agent = %{type: :agent, identity: run["id"]}
+
+    {:ok, %{"task" => ready}} =
+      Board.execute(
+        %Commands.RecordGitHubOutcome{task_id: claimed["id"], kind: "ready", attrs: %{completed: true}},
+        actor: agent,
+        expected_revision: claimed["revision"],
+        idempotency_key: unique("ready")
+      )
+
+    {:ok, %{"task" => review}} =
+      Board.execute(%Commands.MoveTask{task_id: ready["id"], column_id: "automated_review"},
+        actor: agent,
+        expected_revision: ready["revision"],
+        idempotency_key: unique("review")
+      )
+
+    {:ok, %{"task" => human_review}} =
+      Board.execute(%Commands.MoveTask{task_id: review["id"], column_id: "human_review"},
+        actor: agent,
+        expected_revision: review["revision"],
+        idempotency_key: unique("human-review")
+      )
+
+    if finish do
+      {:ok, %{"task" => finished}} =
+        Board.execute(
+          %Commands.RunFinished{task_id: human_review["id"], run_id: run["id"], outcome: %{}, stats: nil},
+          actor: :system,
+          expected_revision: human_review["revision"],
+          idempotency_key: unique("finish")
+        )
+
+      finished
+    else
+      {human_review, run}
+    end
+  end
+
   def workflow_source do
     root = Path.join(System.tmp_dir!(), unique("symphony-workflow"))
     remote = root <> "-remote.git"
