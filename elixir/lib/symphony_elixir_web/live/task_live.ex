@@ -127,6 +127,20 @@ defmodule SymphonyElixirWeb.TaskLive do
 
       <div class="detail-grid">
         <main class="detail-main">
+          <dl class="properties" aria-label="Task properties">
+            <div class="property-row"><dt>State</dt><dd><span class={"state-pill state-#{@task.column_id}"}>{column_name(@bundle, @task.column_id)}</span></dd></div>
+            <div class="property-row"><dt>Priority</dt><dd><span class={"tag tag-priority-#{@task.priority}"}>{display_priority(@task.priority)}</span></dd></div>
+            <div class="property-row"><dt>Type</dt><dd>{display_type(@task.type)}</dd></div>
+            <div class="property-row"><dt>Branch</dt><dd><code>{@task.branch}</code></dd></div>
+            <div class="property-row"><dt>Rank</dt><dd>{@task.rank}</dd></div>
+            <div class="property-row"><dt>Dependencies</dt><dd>{length(@task.dependencies)}</dd></div>
+            <div class="property-row"><dt>PR</dt><dd>{if @task.github["number"], do: "##{@task.github["number"]}", else: "Not created"}</dd></div>
+            <div class="property-row"><dt>Tokens</dt><dd class="numeric">{Telemetry.format_token_total(@task_stats)}</dd></div>
+            <div class="property-row"><dt>Agent time</dt><dd class="numeric">{Telemetry.format_duration(task_agent_time(@task_stats, @metrics_generated_at, @now))}</dd></div>
+            <div class="property-row"><dt>Turns</dt><dd class="numeric">{@task_stats["turn_count"]}</dd></div>
+            <div class="property-row"><dt>Revision</dt><dd>{@task.revision}</dd></div>
+          </dl>
+
           <section class="detail-card">
             <div class="section-heading"><div><p class="eyebrow">Contract</p><h2>Task details</h2></div><span class="revision">revision {@task.revision}</span></div>
             <form phx-submit="update_task" class="task-form">
@@ -258,16 +272,6 @@ defmodule SymphonyElixirWeb.TaskLive do
                 <p><small>{entry["actor"]} · {entry["at"]}</small></p>
               </article>
             </div>
-
-            <dl class="task-facts">
-              <dt>Branch</dt><dd><code>{@task.branch}</code></dd>
-              <dt>Rank</dt><dd>{@task.rank}</dd>
-              <dt>Dependencies</dt><dd>{length(@task.dependencies)}</dd>
-              <dt>PR</dt><dd>{if @task.github["number"], do: "##{@task.github["number"]}", else: "Not created"}</dd>
-              <dt>Tokens</dt><dd class="numeric">{Telemetry.format_token_total(@task_stats)}</dd>
-              <dt>Agent time</dt><dd class="numeric">{Telemetry.format_duration(task_agent_time(@task_stats, @metrics_generated_at, @now))}</dd>
-              <dt>Turns</dt><dd class="numeric">{@task_stats["turn_count"]}</dd>
-            </dl>
           </section>
         </aside>
       </div>
@@ -411,6 +415,7 @@ defmodule SymphonyElixirWeb.TaskLive do
   defp display_type(:feature), do: "Feature"
   defp display_type(:bug_fix), do: "Bug Fix"
   defp display_type(:chore), do: "Chore"
+  defp display_priority(priority), do: priority |> Atom.to_string() |> String.capitalize()
 
   defp transition_confirmation(task, column) do
     cond do

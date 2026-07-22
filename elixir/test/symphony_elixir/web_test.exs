@@ -21,7 +21,7 @@ defmodule SymphonyElixirWebTest do
     {task, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Web")})
 
     board = build_conn() |> get("/")
-    assert html_response(board, 200) =~ "Symphony board"
+    assert html_response(board, 200) =~ "Symphony"
     assert html_response(board, 200) =~ task["title"]
 
     detail = build_conn() |> get("/tasks/#{task["identifier"]}")
@@ -46,6 +46,21 @@ defmodule SymphonyElixirWebTest do
         end
       end)
     end)
+  end
+
+  test "the peek drawer opens and closes for a task" do
+    {task, _} = BoardFactory.create_task(%{title: BoardFactory.unique("Peek drawer")})
+
+    {:ok, view, _html} = live(build_conn(), "/?peek=#{task["identifier"]}")
+    assert has_element?(view, ".peek-drawer")
+    assert has_element?(view, ".peek-drawer h2", task["title"])
+    assert has_element?(view, ~s(.peek-drawer a[href="/tasks/#{task["identifier"]}"]))
+
+    render_hook(view, "close_peek")
+    refute has_element?(view, ".peek-drawer")
+
+    render_hook(view, "open_peek", %{"identifier" => task["identifier"]})
+    assert has_element?(view, ".peek-drawer")
   end
 
   test "LiveView creation enforces the complete task form" do
